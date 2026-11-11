@@ -91,13 +91,26 @@ def test_transpositions_are_one_node_and_calls_are_cached():
 
 
 def test_pessimism_needs_the_engine_at_the_opponents_nodes():
-    eng = FakeEngine()
-    ex = Expander(FakeMoves(QUEENS_PAWN), eng, Params(eps_white=0.05, lam=0.2, min_reach=0.05),
-                  me_white=True, me_elo=2000, opp_elo=2000)
-    ex.grow(expand_reach=0.01, max_expansions=30)
-    assert any(not n.me_to_move and n.engine is not None for n in ex.graph.nodes)
-    assert all(n.engine is not None for n in ex.graph.nodes if n.expanded and not n.me_to_move)
-    Game(ex.graph, ex.params).evaluate({})
+    """Per node: at every expanded opponent node. Per opponent: only on the best-reply
+    spine, where the engine type can still be."""
+    calls = {}
+    for mode in ("node", "opponent"):
+        eng = FakeEngine()
+        params = Params(eps_white=0.05, min_reach=0.05, **({"lam_node": 0.2} if mode == "node" else {"lam": 0.2}))
+        ex = Expander(FakeMoves(QUEENS_PAWN), eng, params,
+                      me_white=True, me_elo=2000, opp_elo=2000)
+        ex.grow(expand_reach=0.01, max_expansions=30)
+        opp_expanded = [n for n in ex.graph.nodes if n.expanded and not n.me_to_move]
+        if mode == "node":
+            assert all(n.engine is not None for n in opp_expanded)
+        else:
+            game = Game(ex.graph, ex.params)
+            spine = [n for n in opp_expanded if game.beta.get(n.id, 0) > 0]
+            assert spine and len(spine) < len(opp_expanded)
+            assert all(n.engine is not None for n in spine)
+        calls[mode] = sum(1 for n in opp_expanded if n.engine is not None)
+        Game(ex.graph, ex.params).evaluate({})
+    assert calls["opponent"] < calls["node"]
 
 
 def test_end_to_end_black_after_e4_gives_a_pgn_with_the_learned_moves():

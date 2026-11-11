@@ -9,11 +9,11 @@ What each node costs:
 - created (as a child of an expanded node): one move-model call, which gives its
   frontier value (the value head) and, if it is expanded later, its distribution;
 - expanded where budget may be spent (reach bound >= `min_reach`): one engine
-  call if I am to move (which moves are sound), and one at the opponent's nodes
-  only when `lam > 0` (his best move, for pessimism). Expanded below `min_reach`
-  (the expectation margin): no engine call at my nodes, which cannot be learned
-  there; the opponent's nodes still need one when `lam > 0`, since pessimism
-  shapes the expectation everywhere.
+  call if I am to move (which moves are sound). Below `min_reach` (the
+  expectation margin) my nodes get none and cannot be learned there;
+- an opponent's node needs the engine (his best move) only for pessimism: with
+  `lam` only on the best-reply spine, the nodes that some path reaches with him
+  playing the best move every time; with `lam_node` at every expanded one.
 
 So a run costs about (nodes expanded x legal moves) move-model calls and
 (my nodes expanded in the budget zone) engine calls, less what transpositions
@@ -38,7 +38,8 @@ import chess.polyglot
 import numpy as np
 
 from tnh.builder.counts import CountSource, NoCounts
-from tnh.builder.game import Game, Graph, Learned, Node, Params, opponent_dist
+from tnh.builder.game import (Game, Graph, Learned, Node, Params, best_index, model_type_dist, opponent_dist,
+                             posterior_step)
 from tnh.models.base import MoveModel, Query, ValueModel
 
 
@@ -78,6 +79,9 @@ class Expander:
         self.root_moves = tuple(root_moves)
         root = self._make([(board, self.root_moves)])[0]
         self.graph.root = root.id
+        self.beta: dict[int, float] = {}
+        if params.lam > 0:
+            self.beta[root.id] = params.lam
         self.bound[root.id] = 1.0
 
     # -- model calls ----------------------------------------------------------------
@@ -157,14 +161,18 @@ class Expander:
     def in_budget_zone(self, node: Node) -> bool:
         return self.bound.get(node.id, 0.0) >= self.params.min_reach
 
+    def needs_best(self, node: Node) -> bool:
+        """The opponent's best move is needed for pessimism: everywhere with `lam_node`,
+        and with `lam` only where the engine type can be (posterior > 0)."""
+        if node.me_to_move:
+            return False
+        return self.params.lam_node > 0 or self.beta.get(node.id, 0.0) > 0
+
     def expand(self, node: Node) -> list[Node]:
         if node.children is not None or not node.moves:
             return []
-        if self.in_budget_zone(node):
+        if (node.me_to_move and self.in_budget_zone(node)) or self.needs_best(node):
             self.ensure_engine(node)
-        if not node.me_to_move and self.params.lam > 0 and node.engine is None:
-            # outside the budget zone pessimism still shapes the expectation
-            node.engine = self._engine_values(node)
         b = self.boards[node.id]
         items = []
         for m in node.moves:
@@ -178,7 +186,7 @@ class Expander:
         return kids
 
     def ensure_engine(self, node: Node) -> None:
-        if node.engine is None and (node.me_to_move or self.params.lam > 0):
+        if node.engine is None and node.moves:
             node.engine = 1.0 * self._engine_values(node)
 
     def _factor(self, node: Node) -> np.ndarray:
@@ -190,25 +198,44 @@ class Expander:
                     ok = node.engine >= np.nanmax(node.engine) - eps - 1e-12
                     f[ok] = np.maximum(f[ok], self.explore)
             return f
-        return opponent_dist(node, self.params)
+        return opponent_dist(node, self.params, self.beta.get(node.id, 0.0))
+
+    def _child_beta(self, node: Node) -> np.ndarray:
+        b = self.beta.get(node.id, 0.0)
+        out = np.zeros(len(node.moves))
+        if b == 0:
+            return out
+        if node.me_to_move:
+            return out + b
+        q = model_type_dist(node, self.params)
+        j = best_index(node.engine, node)
+        out[j] = posterior_step(b, q[j])
+        return out
 
     def _propagate(self, node: Node) -> None:
-        """Push reach bounds down from `node`; a node that enters the budget zone after it
-        was expanded gets its engine call now."""
+        """Push reach bounds and engine-type posteriors down from `node`. A node that
+        enters the budget zone, or the best-reply spine, after it was expanded gets its
+        engine call now."""
         stack = [node]
         while stack:
             n = stack.pop()
             if n.children is None:
                 continue
             f = self._factor(n) * self.bound[n.id]
-            for c, x in zip(n.children, f):
+            cb = self._child_beta(n)
+            for c, x, bb in zip(n.children, f, cb):
+                changed = False
                 if x > self.bound.get(c, 0.0) + 1e-15:
                     self.bound[c] = float(x)
-                    cn = self.graph.nodes[c]
-                    if cn.children is not None:
-                        if self.in_budget_zone(cn):
-                            self.ensure_engine(cn)
-                        stack.append(cn)
+                    changed = True
+                if bb > self.beta.get(c, 0.0) + 1e-15:
+                    self.beta[c] = float(bb)
+                    changed = True
+                cn = self.graph.nodes[c]
+                if changed and cn.children is not None:
+                    if (cn.me_to_move and self.in_budget_zone(cn)) or self.needs_best(cn):
+                        self.ensure_engine(cn)
+                    stack.append(cn)
 
     # -- growth --------------------------------------------------------------------------
 

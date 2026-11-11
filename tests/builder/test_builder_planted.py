@@ -159,7 +159,7 @@ def test_learning_an_ancestor_to_steer_into_a_good_position():
     assert sols[1].learned == {"E": "fine"}
 
 
-def test_per_node_pessimism_is_weaker_than_per_opponent_on_long_lines():
+def test_per_node_pessimism_is_milder_than_per_opponent_on_long_lines():
     # Five only-moves in a row for the opponent, each found half the time by the model.
     # A miss gives me 1.0, finding them all 0.5.
     node = me(("end", 1.0, 0.5, leaf(0.5)), key="end")
@@ -169,8 +169,41 @@ def test_per_node_pessimism_is_weaker_than_per_opponent_on_long_lines():
     g = build(node)
     from tnh.builder.game import mixture_value
     lam = 0.2
-    per_node = Game(g, Params(lam=lam, eps_white=0.1)).evaluate({})
+    per_node = Game(g, Params(lam_node=lam, eps_white=0.1)).evaluate({})
     per_opp = mixture_value(g, Params(lam=lam, eps_white=0.1))
+    # the per-opponent game computes the same number its own way, both forms
+    game = Game(g, Params(lam=lam, eps_white=0.1))
+    assert game.evaluate({}) == pytest.approx(per_opp)
+    assert game.values({})[g.root] == pytest.approx(per_opp)
     assert per_node == pytest.approx(0.6**5 * 0.5 + (1 - 0.6**5))
     assert per_opp == pytest.approx(lam * 0.5 + (1 - lam) * (0.5**5 * 0.5 + (1 - 0.5**5)))
     assert per_node - per_opp > 0.07
+
+
+def long_line_or_trap():
+    """Five only-moves found half the time (a miss gives me 0.8) against one trap found
+    20 % of the time (a miss gives 0.95). Against the engine both are 0.5."""
+    node = me(("end", 1.0, 0.5, leaf(0.5)), key="Lend")
+    for i in reversed(range(5)):
+        node = opp(("best", 0.5, 0.5, node), ("miss", 0.5, 1.0, leaf(0.8)), key=f"L{i}")
+        node = me(("go", 1.0, 0.5, node), key=f"LM{i}")
+    trap = opp(("best", 0.2, 0.5, leaf(0.5)), ("miss", 0.8, 0.95, leaf(0.95)), key="T")
+    return build(me(("long", 0.5, 0.5, opp(("x", 1.0, 0.5, node), key="Lx")), ("trap", 0.5, 0.5, trap),
+                    key="root"))
+
+
+def test_the_two_pessimisms_choose_differently_between_a_long_line_and_a_trap():
+    # Per node, each of his five nodes is insured separately, which favours the long
+    # line; per opponent, a prepared opponent refutes both, so the better line against
+    # the model wins, which is the trap.
+    g = long_line_or_trap()
+    pick = lambda **kw: solve(Game(g, Params(eps_white=0.1, **kw)), 1)[1][1].learned["root"]
+    assert pick(lam=0.0) == "trap"
+    assert pick(lam_node=0.3) == "long"
+    assert pick(lam=0.3) == "trap"
+    # both at once: the combination is exact too
+    from tnh.builder.game import mixture_value
+    game = Game(g, Params(eps_white=0.1, lam=0.3, lam_node=0.3))
+    for learned in ({}, {"root": "long"}, {"root": "trap"}):
+        assert game.evaluate(learned) == pytest.approx(mixture_value(g, game.params, learned))
+        assert game.values(learned)[g.root] == pytest.approx(game.evaluate(learned))

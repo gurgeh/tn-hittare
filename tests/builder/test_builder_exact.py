@@ -40,6 +40,7 @@ def test_dp_is_exact_on_trees(seed):
         g = random_game(rng, depth=int(rng.integers(3, 6)), branching=(2, 3), me_first=bool(seed % 2))
     random_counts(g, rng)
     params = Params(kappa=float(rng.choice([1.0, 20.0, np.inf])), lam=float(rng.choice([0.0, 0.2])),
+                    lam_node=float(rng.choice([0.0, 0.1])),
                     eps_white=float(rng.choice([0.03, 0.1, 1.0])),
                     cost=random_cost(seed) if seed % 2 == 0 else Params().cost)
     game = Game(g, params)
@@ -97,7 +98,7 @@ def test_evaluate_matches_simulation_on_a_dag():
     for n in g.nodes:
         if n.moves and not n.me_to_move:
             n.counts = rng.integers(0, 30, len(n.moves)).astype(float)
-    game = Game(g, Params(kappa=10, lam=0.3, eps_white=0.1))
+    game = Game(g, Params(kappa=10, lam_node=0.3, eps_white=0.1))
     cand = candidates(game)
     learned = {k: v[0] for k, v in list(cand.items())[:3]}
     exact = game.evaluate(learned)
@@ -148,3 +149,41 @@ def test_unsound_learned_move_is_refused():
     bad = next(m for j, m in enumerate(root.moves) if j not in s)
     with pytest.raises(ValueError, match="not sound"):
         game.evaluate({root.key: bad})
+
+
+@pytest.mark.parametrize("seed", range(25))
+def test_per_opponent_pessimism_dp_is_exact_on_trees(seed):
+    """The DP with per-node posteriors against enumeration under the obvious definition:
+    (1 - lam) x value against the model + lam x value against the engine."""
+    from tnh.builder.game import mixture_value
+    rng = np.random.default_rng(500 + seed)
+    g = random_game(rng, depth=int(rng.integers(3, 5)), branching=(2, 3), me_first=bool(seed % 2))
+    lam = float(rng.choice([0.1, 0.3, 0.6]))
+    params = Params(lam=lam, lam_node=float(rng.choice([0.0, 0.2])), eps_white=0.1)
+    game = Game(g, params)
+    _, sols = solve(game, 3)
+    for N in range(4):
+        bf, best = brute_force(game, N)
+        assert sols[N].dp_value == pytest.approx(bf, abs=1e-12)
+        assert mixture_value(g, params, sols[N].learned) == pytest.approx(bf, abs=1e-12)
+        assert mixture_value(g, params, best) == pytest.approx(bf, abs=1e-12)
+
+
+def test_per_opponent_on_dags_is_feasible_and_near_optimal():
+    """On a DAG the posteriors are approximate in the DP, the reported value is exact."""
+    from tnh.builder.game import mixture_value
+    shares = []
+    for seed in range(30):
+        rng = np.random.default_rng(2000 + seed)
+        g = random_game(rng, depth=5, branching=(2, 3), dag=True, pool=int(rng.integers(3, 6)))
+        params = Params(lam=0.3, eps_white=0.05)
+        game = Game(g, params)
+        e0 = game.evaluate({})
+        _, sols = solve(game, 3)
+        for N in (1, 2, 3):
+            bf, _ = brute_force(game, N)
+            assert sols[N].value == pytest.approx(mixture_value(g, params, sols[N].learned), abs=1e-12)
+            assert sols[N].value <= bf + 1e-12
+            if bf - e0 > 1e-9:
+                shares.append((sols[N].value - e0) / (bf - e0))
+    assert np.mean(shares) > 0.99 and min(shares) > 0.75   # measured 0.997 and 0.797
