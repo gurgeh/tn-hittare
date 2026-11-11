@@ -25,6 +25,8 @@ corpus/games.parquet
 corpus/games_extra.parquet        per-source detail behind the parsing decisions; not an input to anything downstream
 corpus/parse_stats.json           what was dropped and why
 corpus/positions.parquet
+corpus/edges.parquet               position statistics, see below
+corpus/pos_index.parquet
 corpus/book_exit.parquet           per game, the ply at which it leaves book for book_count 2, 5, 20 and 100
 corpus/samples/<name>.parquet     fixed subsets of positions.parquet with extra columns; what features are computed on
 corpus/samples/<name>.window.parquet   the same sample, window rows only
@@ -156,6 +158,83 @@ game over all of the game's rows.
 between players rated 1800 to 2500: 1.7 % of the moves at plies 30-39 are
 made with under ten minutes left, 9.3 % at plies 40-49 and 25.1 % at plies
 50-59.
+
+## Position statistics: `corpus/edges.parquet`
+
+What the database view, the trends, the opponent prior in the repertoire
+builder and the "share of games that chose this move" feature all read. Built
+by `tnh.data.edges` from `games.parquet`: every kept game, every tempo, plies
+below 80.
+
+A position is identified by `pos_hash`, the 64-bit Zobrist hash that
+`chess.polyglot.zobrist_hash` gives: pieces, side to move, castling rights,
+and the en passant square only when a capture there is legal. Transpositions
+share a hash.
+
+One row per (position, move, year, rating band, tempo):
+
+| column | type | meaning |
+|---|---|---|
+| `pos_hash` | u64 | The position before the move |
+| `move` | str | UCI |
+| `child_hash` | u64 | The position after the move |
+| `year` | i16 | 0 when unknown |
+| `elo_band` | i16 | Mean rating of the two players, floored to 200; 0 when a rating is missing |
+| `tempo` | str | As in games |
+| `n` | u32 | Games |
+| `white_wins`, `draws`, `black_wins` | u32 | Results of those games |
+| `sum_mover_elo`, `sum_opp_elo` | u64 | Over the games where both ratings are known |
+| `n_rated` | u32 | How many those are |
+
+A row is kept only when its position was reached by at least two games; the
+rest of a game past that point is in `games.parquet`.
+
+`corpus/pos_index.parquet`, one row per position with at least two games:
+`pos_hash`, `epd` (one representative), `n`, and the results. It is the
+lookup for a position's total and for the count of any child.
+
+Hash collisions: with a few hundred million positions the chance of one
+anywhere is about one in a thousand. Accepted.
+
+## The repertoire builder: `tnh.builder`
+
+The game it optimises: I play the memorised move in the positions I have
+learned and like a model of myself everywhere else; the opponent always plays
+like a model of the opponent. The task is to choose which N positions to
+learn, and which move in each, to maximise my expected score.
+
+- **Opponent's move distribution:** the database counts for the position
+  laid over the model, `(count + kappa * p_model) / (n + kappa)`. `kappa` is
+  a parameter, later a function of rating.
+- **My move distribution** where nothing is learned: a `MoveModel` at my
+  rating.
+- **Sound moves:** in a learned position only moves within `eps` of the
+  engine's best may be chosen, by a `ValueModel`.
+- **Value where the budget runs out:** the expected score from a value
+  function of the position and both ratings, read after a few plies of plain
+  expectation over both models.
+- **Search:** a knapsack on the tree by dynamic programming, the value of a
+  subtree given k positions to spend in it, with subtrees pruned below a
+  reach probability.
+- **Output:** the learned positions with their move, reach probability and
+  what learning each is worth; the curve of expected score against N; the
+  engine value of each line if the opponent plays the best moves.
+
+Every model enters through the interfaces above, so the builder can be tested
+on synthetic models where the best repertoire is planted and known.
+
+## The interface: `tnh.web`
+
+A local web application on 127.0.0.1. A board, and beside it, for the
+position shown:
+
+- the database view from `edges.parquet`: each move with its games, score,
+  ratings and performance, filtered on years, rating band and tempo;
+- trending moves: the change in a move's share over the years;
+- what the models say: Maia-3's move probabilities and win, draw and loss at
+  two chosen ratings, and the engine's evaluation;
+- later, the statistics under best play with shrinkage, and the repertoire
+  button, which calls `tnh.builder` from the position shown.
 
 ## Model interface
 

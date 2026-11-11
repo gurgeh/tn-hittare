@@ -16,6 +16,9 @@ dependencies = [
     "maia3",
     "matplotlib>=3.11.2",
     "lightgbm>=4.7.0",
+    "fastapi>=0.162.2",
+    "uvicorn>=0.54.0",
+    "duckdb>=2.0.0",
 ]
 
 [dependency-groups]
