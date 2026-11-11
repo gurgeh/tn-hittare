@@ -376,14 +376,22 @@ def sec_theory(w, r, figdir, rel):
       f"Per cell: the offset with the lowest raw log loss (variants {', '.join('`' + v + '`' for v in r['variants'])}"
       f"; parabola vertex, bootstrap interval over tournaments) and the log loss there. Cells with fewer than "
       f"{r['min_rows']} rows show only their count.\n\n"
-      "Reading it: within one ply band (a row), if the best offset rises with `pos_count`, people play above their "
-      "strength in the positions that are known. Theory ends at the count where the best offset has come down to "
-      "its value in the rare positions of the same band. Two caveats: `pos_count` counts games between players "
-      "rated 1800 and up in the whole corpus, grandmasters included, and the game itself (1 means no other game), "
-      "so it measures what is known to someone, not at the mover's level; and Maia-3 memorised openings from its "
-      "own training games, so in a common position the model is also better informed, whatever the player knows. "
-      "The pooled table mixes rating groups in proportions that differ from cell to cell, and the best offset "
-      "depends on rating, so read the per-rating tables where their cells are filled.\n\n")
+      "Reading it: describe the curve of the best offset against `pos_count` in each ply band (a row) and rating "
+      "group as it is. No shape is assumed: it may rise where players know the position and fall again in the very "
+      "most common ones, where a deliberately second-rate move takes the opponent out of theory. The two "
+      "continuation columns speak to that without an engine, over the other games that reached the position (the "
+      "row's own game taken out, so `pos_count` 1 has none): the share of played moves that are those games' most "
+      "common continuation (1/k when k moves tie), and the mean share of those games that chose the played move "
+      "(child counts include transpositions). A deliberate sideline shows as a low share in a very common "
+      "position. **Where theory ends** is read from the low end only: the smallest `pos_count` band whose best "
+      "offset differs from that of the rarest filled band of the same ply band (paired bootstrap difference, 95 % "
+      "interval excluding 0).\n\n"
+      "Caveats: `pos_count` counts games between players rated 1800 and up in the whole corpus, grandmasters "
+      "included, and the game itself (1 means no other game), so it measures what is known to someone, not at the "
+      "mover's level; Maia-3 memorised openings from its own training games, so in a common position the model is "
+      "also better informed, whatever the player knows; and the pooled tables mix rating groups in proportions that "
+      "differ from cell to cell while the best offset depends on rating, so the per-rating tables are the ones to "
+      "read where their cells are filled.\n\n")
     pcs, plys = r["pos_count_bands"], r["ply_bands"]
 
     def grid(cells, val):
@@ -402,6 +410,24 @@ def sec_theory(w, r, figdir, rel):
                                                                f"{c['best']['hi']:+.0f}]{' edge' if c['best']['at_edge'] else ''} ({c['rows']})")))
     w("\n**Log loss at the best offset** [interval]:\n\n")
     w(table(["ply \\ pos_count"] + pcs, grid(r["cells"], lambda c: f(c["loss_at_best"], 3))))
+    w("\n**Share of played moves that are the most common continuation** [interval]:\n\n")
+    w(table(["ply \\ pos_count"] + pcs, grid(r["cells"], lambda c: f(c["most_common_share"], 3))))
+    w("\n**Mean share of continuing games that chose the played move** [interval]:\n\n")
+    w(table(["ply \\ pos_count"] + pcs, grid(r["cells"], lambda c: f(c["chosen_share"], 3))))
+    w("\n**Where theory ends**, from the low end: per ply band, the rarest filled `pos_count` band and the "
+      "smallest band whose best offset differs from it (difference [interval]):\n\n")
+    rows = []
+    for g, ends in r["theory_end"].items():
+        for e in ends:
+            if e.get("ends_at"):
+                x = e["ends_at"]
+                ans = f"{x['pos_count']}: {x['est']:+.0f} [{x['lo']:+.0f}, {x['hi']:+.0f}]"
+            else:
+                ans = e.get("note", "")
+            diffs = "; ".join(f"{d['pos_count']} {d['est']:+.0f} [{d['lo']:+.0f}, {d['hi']:+.0f}]"
+                              for d in e.get("differences", []))
+            rows.append([g, e["ply"], e["rarest"] or "", ans, diffs])
+    w(table(["rating group", "plies", "rarest band", "theory ends at", "all differences from the rarest"], rows))
     for g, cells in r["by_rating"].items():
         w(f"\n**Best offset, movers rated {g}**:\n\n")
         w(table(["ply \\ pos_count"] + pcs, grid(cells, lambda c: f"{c['best']['est']:+.0f} [{c['best']['lo']:+.0f}, "

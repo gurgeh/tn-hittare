@@ -31,11 +31,21 @@ def make(tmp, split, n, rng, offset_true=100):
         pl.Series("pos_count", rng.choice([0, 1, 3, 10, 50, 500, 5000], n)),
         pl.Series("exit_ply_5", rng.integers(5, 21, n)),
         pl.Series("ply_band", rng.choice(["0-7", "12-15", "24-29"], n)),
-        pl.Series("pos_count_band", rng.choice(["1", "5-19", "1000+"], n)),
+        pl.Series("pos_count_band", rng.choice(["1", "5-19", "1000-9999"], n)),
         pl.Series("rating_group", rng.choice(["1800-2149", "2150-2500"], n)),
+        pl.Series("max_child_count", rng.integers(5, 50, n)),
+        pl.Series("n_max_children", np.ones(n, dtype=np.int64)),
+        pl.lit(False).alias("played_ends_game"),
+        pl.lit(0, dtype=pl.Int64).alias("n_other_at_max"),
+        pl.Series("children_count_sum", rng.integers(60, 100, n)),
         pl.lit("window").alias("part"),
         pl.Series("result_mover", res),
     )
+    df = df.with_columns(pl.when(pl.Series(rng.random(n) < 0.5)).then(pl.col("max_child_count"))
+                         .otherwise(pl.col("max_child_count") // 2).alias("played_child_count"))
+    df = df.with_columns(pl.when(pl.col("played_child_count") == pl.col("max_child_count"))
+                         .then(pl.col("max_child_count") // 2).otherwise(pl.col("max_child_count") - 1)
+                         .alias("max_other_child_count"))
     # some rows outside the window, as a real sample has
     df = df.with_columns((pl.col("clock_mover_s") >= 600).alias("in_window"))
     wdl = rng.dirichlet([2, 2, 2], n)
@@ -92,6 +102,8 @@ def test_all_commands_and_the_report(tmp_path):
                  "--min-rows", "50"])
     th = json.loads((R / "theory.json").read_text())
     assert all(abs(c["best"]["est"] - 100) < 80 for c in th["cells"] if "best" in c and c["rows"] > 300)
+    assert all(abs(c["most_common_share"]["est"] - 0.5) < 0.1 for c in th["cells"] if "best" in c and c["rows"] > 300)
+    assert "all" in th["theory_end"]
     value.main(["--model", M[1], str(feats / "sf/nodes100")] + C)
     out = tmp_path / "step1.md"
     report.main(["--results", str(R), "--out", str(out), "--note", "synthetic"])

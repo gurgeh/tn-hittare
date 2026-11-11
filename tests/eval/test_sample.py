@@ -116,3 +116,27 @@ def test_theory_sample_is_stratified_on_ply_and_pos_count():
                         & (pl.col("rating_group") == st["rating_group"]))
         assert rows.height == st["sampled"]
         assert np.allclose(rows.get_column("weight").to_numpy(), st["population"] / st["sampled"])
+
+
+def test_continuation_counts(tmp_path):
+    import chess
+    from tnh.data.positions import pos_key
+    from tnh.eval.theory import with_continuations
+
+    start = chess.Board()
+    counts = {}
+    for uci, n in (("e2e4", 500), ("d2d4", 500), ("c2c4", 100), ("g1f3", 50)):
+        b = start.copy(); b.push_uci(uci); counts[pos_key(b)] = n
+    pd = pl.DataFrame({"pos_key": list(counts), "pos_count": list(counts.values()),
+                       "game_id": ["a", "b", "x", "y"], "ply": [1, 1, 5, 5]})
+    pd.write_parquet(tmp_path / "positions.parquet")
+    s = pl.DataFrame({"fen": [start.fen()] * 3, "played_uci": ["e2e4", "c2c4", "a2a3"],
+                      "game_id": ["a", "b", "c"], "ply": [0, 0, 0]})
+    out = with_continuations(s, tmp_path / "positions.parquet")
+    assert out.get_column("played_child_count").to_list() == [500, 100, 0]
+    assert out.get_column("max_child_count").to_list() == [500] * 3
+    assert out.get_column("n_max_children").to_list() == [2] * 3     # e4 and d4 tie
+    assert out.get_column("children_count_sum").to_list() == [1150] * 3
+    assert out.get_column("played_ends_game").to_list() == [False, False, True]   # game c has no ply 1
+    assert out.get_column("max_other_child_count").to_list() == [500, 500, 500]
+    assert out.get_column("n_other_at_max").to_list() == [1, 2, 2]
