@@ -22,7 +22,9 @@ it. The owner is a 2200 FIDE player and a senior programmer.
   service with a hard memory cap. The machine has 30 GB and is the owner's
   laptop. On 2026-11-11 a sampler reached 25 GB inside the terminal's cgroup
   and systemd-oomd killed the whole terminal tab, the agents included. Under
-  `tnh-run` a job that passes its cap is killed alone and says so in its log.
+  `tnh-run` a job that passes its cap is stopped alone, with exit code 99 and
+  a line in its log. A stop at the cap is a reason to stop and think, not to
+  run again: find where the memory goes by instrumenting a run that fits.
   Rules of thumb: give a job the cap you expect it to need plus a margin, at
   most 12 GB for one job, and never let the caps of the jobs running at the
   same time add up to more than 20 GB. Measure before you scale: run on a

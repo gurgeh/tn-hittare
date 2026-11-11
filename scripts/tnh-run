@@ -1,20 +1,27 @@
 #!/bin/sh
 # tnh-run NAME MEM_GB CMD...
 #
-# Run CMD as a transient systemd user service with a hard memory cap.
+# Run CMD as a transient systemd user service with a memory cap.
 #
 # Why: a job that runs inside the terminal shares the terminal's cgroup. When
 # it eats the machine's memory, systemd-oomd kills that whole cgroup: the
 # terminal tab, the agent and every other job in it. That happened on
 # 2026-11-11 (25 GB peak in a sampler). As its own service a job that passes
-# its cap is killed alone, and it keeps running if the terminal goes away.
+# its cap is stopped alone, and it keeps running if the terminal goes away.
+#
+# Two limits. This script watches the service's memory five times a second
+# and stops it cleanly when it passes MEM_GB; that ends with exit 99 and a
+# line in the log, and raises no desktop alert. Behind it the kernel enforces
+# MEM_GB plus a quarter, for a job that grows faster than the watch or whose
+# caller has died; that one is an OOM kill, and the desktop shows an alert.
 #
 # - Output goes to $TNH_DATA/logs/NAME.log (default ~/out/tn-hittare/logs).
-# - Blocks until CMD ends and returns non-zero if it failed or was killed.
+# - Blocks until CMD ends. Exit code: CMD's own, 99 when stopped at the cap.
 # - Holds an idle/sleep inhibitor while CMD runs.
 # - The working directory is the repository root.
 # - Stop a job:  systemctl --user stop tnh-NAME
 # - List jobs:   systemctl --user list-units 'tnh-*'
+# - Peak memory: journalctl --user -u tnh-NAME | grep "memory peak"
 set -eu
 [ $# -ge 3 ] || { echo "usage: tnh-run NAME MEM_GB CMD..." >&2; exit 2; }
 NAME=$1; MEM=$2; shift 2
@@ -22,11 +29,33 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DATA=${TNH_DATA:-$HOME/out/tn-hittare}
 LOG=$DATA/logs/$NAME.log
 mkdir -p "$DATA/logs"
-echo "tnh-run: unit tnh-$NAME, cap ${MEM}G, log $LOG" >&2
-exec systemd-run --user --quiet --collect --wait \
+CAP_MB=$((MEM * 1024))
+HARD_MB=$((CAP_MB + CAP_MB / 4))
+CG=/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/app.slice/tnh-$NAME.service
+echo "tnh-run: unit tnh-$NAME, cap ${MEM}G (kernel limit ${HARD_MB}M), log $LOG" >&2
+
+systemd-run --user --quiet --collect --wait \
   --unit="tnh-$NAME" \
   --working-directory="$ROOT" \
-  -p MemoryMax="${MEM}G" -p MemorySwapMax=0 \
+  -p MemoryMax="${HARD_MB}M" -p MemorySwapMax=0 -p TimeoutStopSec=5 \
   -p StandardOutput="append:$LOG" -p StandardError="append:$LOG" \
   -E PATH="$PATH" -E HOME="$HOME" -E TNH_DATA="$DATA" ${TNH_LC0:+-E TNH_LC0="$TNH_LC0"} \
-  systemd-inhibit --what=idle:sleep --why="tn-hittare: $NAME" "$@"
+  systemd-inhibit --what=idle:sleep --why="tn-hittare: $NAME" "$@" &
+RUN=$!
+
+OVER=0
+while kill -0 "$RUN" 2>/dev/null; do
+  if [ -r "$CG/memory.current" ]; then
+    CUR=$(cat "$CG/memory.current" 2>/dev/null || echo 0)
+    if [ "$((CUR / 1048576))" -gt "$CAP_MB" ]; then
+      OVER=1
+      echo "tnh-run: stopped tnh-$NAME at $((CUR / 1048576)) MB, over its cap of ${MEM} GB" | tee -a "$LOG" >&2
+      systemctl --user stop "tnh-$NAME" 2>/dev/null || true
+      break
+    fi
+  fi
+  sleep 0.2
+done
+RC=0; wait "$RUN" || RC=$?
+[ "$OVER" -eq 1 ] && exit 99
+exit "$RC"
