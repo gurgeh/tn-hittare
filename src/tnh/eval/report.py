@@ -371,11 +371,15 @@ def sec_value(w, r, figdir, rel):
     w(f"One window row per game (`--pick {r['pick']}`; median ply {r['ply_quartiles_test'][1]:.0f}), "
       f"result from the mover's side. Test {r['games']['test']} games, draw rate {r['draw_rate']['test']:.3f}; "
       f"fitting {r['games']['fit']} games, draw rate {r['draw_rate']['fit']:.3f}. A model that only knows the "
-      f"fitting sample's outcome frequencies scores {r['base_rate']['test_logloss']:.4f}. Recalibration: "
-      f"`logit_c = t log p_c + b_c + [draw] k (mean rating - 2200)/100`, `b_loss = 0`, fitted on the fitting "
-      f"sample.\n\n")
-    w(table(["model", "raw", "recalibrated", "recal - raw", "P(draw) raw", "P(draw) recal", "t, b_win, b_draw, k"],
-            [[f"`{m['label']}`", f(m["raw"]), f(m["recalibrated"]), f(m["recal_minus_raw"]),
+      f"fitting sample's outcome frequencies scores {r['base_rate']['test_logloss']:.4f}. `raw + eps`: the WDL mixed "
+      f"with a uniform 1/3 by a fitted `eps` (needed where a WDL puts exactly 0 on the outcome that happened). "
+      f"Recalibrated: `q = (1-eps) softmax(t log p_c + b_c + [draw] k (mean rating - 2200)/100) + eps/3`, "
+      f"`b_loss = 0`, five parameters fitted on the fitting sample.\n\n")
+    w(table(["model", "raw", "games with p=0", "raw + eps (eps)", "recalibrated", "recal - (raw + eps)",
+             "P(draw) raw", "P(draw) recal", "t, b_win, b_draw, k, eps"],
+            [[f"`{m['label']}`", f(m["raw"]) if m["raw"]["est"] != float("inf") else "inf",
+              m["games_with_zero_probability_on_the_result"], f"{f(m['raw_plus_eps'])} ({m['eps_only']:.3f})",
+              f(m["recalibrated"]), f(m["recal_minus_raw_plus_eps"]),
               f"{m['mean_p_draw_raw']:.3f}", f"{m['mean_p_draw_recal']:.3f}",
               ", ".join(f"{v:.3f}" for v in m["recal"].values())] for m in r["models"]]))
     w("\nCalibration by bucket of the mover's rating (test):\n\n")

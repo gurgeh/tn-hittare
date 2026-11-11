@@ -172,7 +172,7 @@ class MoveScores:
     """What a move model says about the played move, per sample row."""
     lp: np.ndarray        # log probability of the played move
     n: np.ndarray         # legal moves
-    top1: np.ndarray      # 1.0 where the played move has the highest probability
+    top1: np.ndarray      # 1 where the played move has the highest probability (1/k when k moves tie)
     entropy: np.ndarray   # of the model's distribution, nats
     wdl: np.ndarray | None  # rows x 3, or None
 
@@ -188,8 +188,10 @@ def move_scores(sample: pl.DataFrame, d: Path) -> tuple[MoveScores, pl.DataFrame
     wdl = None
     if "wdl" in j.columns and j.get_column("wdl").null_count() == 0:
         wdl = np.stack(j.get_column("wdl").to_numpy()).astype(np.float64)
-    return MoveScores(lp, j.get_column("n_legal").to_numpy().astype(np.float64), (lp >= mx).astype(np.float64),
-                      ent, wdl), j
+    # top-1 with ties shared: a played move tied with k-1 others for the highest probability scores 1/k
+    n_max = segment_sum(r, (r.values == np.repeat(mx, r.lengths)).astype(np.float64))
+    top1 = np.where(lp >= mx, 1.0 / n_max, 0.0)
+    return MoveScores(lp, j.get_column("n_legal").to_numpy().astype(np.float64), top1, ent, wdl), j
 
 
 def _columns(d: Path) -> list[str]:
@@ -216,7 +218,8 @@ def fit_eps(lp: np.ndarray, n: np.ndarray, w: np.ndarray | None = None, tol: flo
     u = 1.0 / n
 
     def deriv(e: float) -> float:
-        return -float(np.sum(w * (u - p) / ((1 - e) * p + e * u)) / np.sum(w))
+        with np.errstate(divide="ignore", invalid="ignore"):   # p = 0 at e = 0: the slope is -inf, eps > 0
+            return -float(np.sum(w * (u - p) / ((1 - e) * p + e * u)) / np.sum(w))
 
     if deriv(0.0) >= 0:
         return 0.0

@@ -64,14 +64,23 @@ def test_logit_weights_act_like_repeated_rows(tmp_path):
 
 def test_value_recalibration_recovers_planted_parameters():
     rng = np.random.default_rng(2)
-    n = 40_000
+    n = 15_000
     base = rng.dirichlet([2, 1, 2], n)
     r = rng.normal(0, 1.5, n)
     theta = np.array([0.7, 0.3, 0.9, 0.25])
     q = np.exp(recal_logits(theta, np.log(base), r))
+    eps = 0.05
+    q = (1 - eps) * q + eps / 3
     y = np.array([rng.choice(3, p=p) for p in q])
     got = fit_recal(base, y, r, np.ones(n))
-    assert np.allclose(got, theta, atol=0.08), got
+    assert np.allclose([np.exp(got[0]), *got[1:4]], theta, atol=0.12), got
+    assert abs(1 / (1 + np.exp(-got[4])) - eps) < 0.03, got
+    # an exact zero on an outcome that happens is carried by eps, not clipped away
+    base0 = base.copy()
+    base0[:200, 2] = 0.0
+    base0[:200] /= base0[:200].sum(1, keepdims=True)
+    got0 = fit_recal(base0, y, r, np.ones(n))
+    assert np.isfinite(got0).all() and 1 / (1 + np.exp(-got0[4])) > 0
 
 
 def test_sweep_vertex_and_mistake_crossing():

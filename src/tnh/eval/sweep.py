@@ -17,7 +17,8 @@ What it computes:
    At an edge of the grid the edge is reported and flagged.
 3. The map: the same per-bucket best offsets on the *fitting* sample, turned into
    the Elo Maia-3 should get (bucket midpoint + offset), and a weighted straight
-   line ``maia_elo = a + b * fide`` through them (weights: rows per bucket),
+   line ``maia_elo = a + b * fide`` through them (weights: square root of the rows
+   per bucket; buckets whose minimum is at the edge of the grid are left out),
    bootstrapped over the fitting sample's tournaments.
 4. Leakage-free comparisons on the test sample, each against the best single offset
    chosen on the fitting sample: per-bucket offsets chosen on the fitting sample,
@@ -89,8 +90,10 @@ def best_per_bucket(L: np.ndarray, w: np.ndarray, cl: np.ndarray, counts: np.nda
     return pt[:, 0], pt[:, 1].astype(bool), boot, means
 
 
-def fit_map(mid: np.ndarray, best: np.ndarray, rows: np.ndarray) -> tuple[float, float]:
-    ok = ~np.isnan(best)
+def fit_map(mid: np.ndarray, best: np.ndarray, rows: np.ndarray, edge: np.ndarray | None = None) -> tuple[float, float]:
+    """Weighted line through the per-bucket best Elo. Buckets whose minimum is at the grid's edge are
+    censored (the best offset is beyond the grid) and left out."""
+    ok = ~np.isnan(best) if edge is None else ~np.isnan(best) & ~edge
     if ok.sum() < 2:
         return float("nan"), float("nan")
     b, a = np.polyfit(mid[ok], mid[ok] + best[ok], 1, w=np.sqrt(rows[ok]))
@@ -151,8 +154,10 @@ def main(argv=None) -> None:
     pf, edge_f, boot_f, _ = best_per_bucket(Lf, wf, cf, counts_f, gf, len(ub_f), offs)
     mid = ub_f + BUCKET / 2
     rows_f = np.array([(gf == k).sum() for k in range(len(ub_f))], dtype=float)
-    a0, b0 = fit_map(mid, pf, rows_f)
-    ab_boot = np.array([fit_map(mid, boot_f[r], rows_f) for r in range(boot_f.shape[0])])
+    a0, b0 = fit_map(mid, pf, rows_f, edge_f)
+    lo_off, hi_off = offs.min(), offs.max()
+    ab_boot = np.array([fit_map(mid, boot_f[r], rows_f, (boot_f[r] <= lo_off) | (boot_f[r] >= hi_off))
+                        for r in range(boot_f.shape[0])])
     map_ = {"a": a0, "b": b0, "a_ci": np.nanquantile(ab_boot[:, 0], [0.025, 0.975]).tolist(),
             "b_ci": np.nanquantile(ab_boot[:, 1], [0.025, 0.975]).tolist(),
             "fit_points": [{"bucket": int(b), "best_offset": float(pf[k]), "at_edge": bool(edge_f[k]),
