@@ -19,19 +19,25 @@ What counts, per game:
   is the position's ``n``;
 - every (position, move) at plies below 80, once per game.
 
+Three tables: ``edges``, ``pos_index``, and ``parents`` (child_hash,
+pos_hash, move, n; the edges summed over years, bands and tempi, sorted by
+the child, for the positions leading into a position).
+
 Two ways to build:
 
 - ``tables_from_games(games)`` builds both tables in memory from a small frame
   of games. For test fixtures in other modules; it is the same aggregation
   as the full build, on one batch.
-- ``build(...)`` (the command) works through ``games.parquet`` in batches.
-  Each batch is aggregated and written to disk split into 64 buckets on the
-  top six bits of the position hash; each bucket is then merged across
-  batches and filtered on the merged position counts. Memory is set by the
-  batch size and the size of one bucket, not by the corpus. The
-  representative EPD of each kept position is filled in by a last pass that
-  replays only the games and plies needed. Bucket order is hash order, so
-  the outputs are sorted by ``pos_hash``, which the readers' lookups rely on.
+- ``build(...)`` (the command) works through ``games.parquet`` in batches,
+  twice. Pass A counts how many games reach each position, written in 64
+  buckets on the top six bits of the hash, and merges the counts per bucket
+  into the set of positions with at least two games. Pass B replays the
+  games again and aggregates edges, totals and EPDs for those positions only,
+  again in buckets, which are then merged. Memory is set by the batch size and
+  one bucket, not by the corpus; disk by the kept rows, since almost every
+  position past the opening is reached by one game and never written in pass
+  B. Bucket order is hash order, so the outputs are sorted by ``pos_hash``
+  (``parents.parquet`` by ``child_hash``), which the readers' lookups rely on.
 
 Reading: ``EdgeDB`` (moves from a position under filters, a position's total,
 the counts of its children).
@@ -40,12 +46,11 @@ the counts of its children).
 from __future__ import annotations
 
 import argparse
-import json
 import multiprocessing
 import os
 import shutil
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterator
 from pathlib import Path
 
 import chess
@@ -126,16 +131,20 @@ _CODE_TO_UCI = [
 
 
 def game_events(
-    moves_uci: str, max_ply: int = MAX_PLY
+    moves_uci: str, max_ply: int = MAX_PLY, epds: dict[int, str] | None = None, wanted=None
 ) -> tuple[dict[int, int], list[int], list[int], list[int], list[bool]]:
     """One game -> ({reached position: first ply}, edge positions, move codes, child positions, white to move).
 
     Each position and each (position, move) once per game; plies below max_ply.
+    With ``epds``, the EPD of every position reached that is not in it yet (and
+    for which ``wanted(hash)`` is true, when given) is added to it.
     """
     board = chess.Board()
     pieces = _HASHER.hash_board(board)
     h = pieces ^ _rest_key(board)
     reached = {h: 0}
+    if epds is not None and h not in epds and (wanted is None or wanted(h)):
+        epds[h] = board.epd()
     seen_edges: set[tuple[int, int]] = set()
     e_pos: list[int] = []
     e_move: list[int] = []
@@ -173,7 +182,10 @@ def game_events(
             e_move.append(code)
             e_child.append(child)
             e_white.append(mover == chess.WHITE)
-        reached.setdefault(child, ply + 1)
+        if child not in reached:
+            reached[child] = ply + 1
+            if epds is not None and child not in epds and (wanted is None or wanted(child)):
+                epds[child] = board.epd()
         h = child
     return reached, e_pos, e_move, e_child, e_white
 
@@ -187,16 +199,30 @@ def _band(w: int | None, b: int | None) -> int:
     return int((w + b) / 2 // 200 * 200)
 
 
-def batch_events(games: dict[str, list], row0: int = 0, max_ply: int = MAX_PLY) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """Columns of a batch of games -> (edge events, position events), one row per event.
+def _in_sorted(sorted_arr: np.ndarray, values: np.ndarray) -> np.ndarray:
+    """Membership of ``values`` in a sorted uint64 array."""
+    if len(sorted_arr) == 0:
+        return np.zeros(len(values), bool)
+    pos = np.minimum(np.searchsorted(sorted_arr, values), len(sorted_arr) - 1)
+    return sorted_arr[pos] == values
+
+
+def batch_events(
+    games: dict[str, list], rows: np.ndarray | None = None, max_ply: int = MAX_PLY, kept: np.ndarray | None = None
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Columns of a batch of games -> (edge events, position events with EPDs).
 
     Kept compact: numpy arrays filled per game, not Python objects per event.
-    ``rep`` is (row of the game in the input) * 256 + ply, for picking a
-    representative game for each position's EPD.
+    ``rows`` are the games' rows in games.parquet (default 0, 1, ...); ``rep``
+    is row * 256 + ply, so the smallest ``rep`` of a position is the first game
+    to reach it, whose board gives the position's EPD. With ``kept`` (sorted
+    hashes), only events of those positions are returned; EPDs are taken only
+    for them.
     """
     e_cols = {k: [] for k in ("pos", "move", "child", "white", "g")}
     p_cols = {k: [] for k in ("pos", "g", "rep")}
     n = len(games["moves_uci"])
+    rows = np.arange(n, dtype=np.uint64) if rows is None else np.asarray(rows, np.uint64)
     year = np.zeros(n, np.int16)
     band = np.zeros(n, np.int16)
     tempo = np.zeros(n, np.uint8)
@@ -204,6 +230,12 @@ def batch_events(games: dict[str, list], row0: int = 0, max_ply: int = MAX_PLY) 
     welo = np.zeros(n, np.uint16)
     belo = np.zeros(n, np.uint16)
     rated = np.zeros(n, bool)
+    epds: dict[int, str] = {}
+    wanted = None
+    if kept is not None:
+        def wanted(h: int) -> bool:
+            i = np.searchsorted(kept, np.uint64(h))
+            return i < len(kept) and int(kept[i]) == h
     for i in range(n):
         w, b = games["white_elo"][i], games["black_elo"][i]
         year[i] = games["year"][i] or 0
@@ -212,7 +244,7 @@ def batch_events(games: dict[str, list], row0: int = 0, max_ply: int = MAX_PLY) 
         res[i] = RESULT_CODE[games["result"][i]]
         rated[i] = w is not None and b is not None
         welo[i], belo[i] = (w, b) if rated[i] else (0, 0)
-        reached, ep, em, ec, ew = game_events(games["moves_uci"][i], max_ply)
+        reached, ep, em, ec, ew = game_events(games["moves_uci"][i], max_ply, epds, wanted)
         e_cols["pos"].append(np.fromiter(ep, np.uint64, len(ep)))
         e_cols["move"].append(np.fromiter(em, np.uint16, len(em)))
         e_cols["child"].append(np.fromiter(ec, np.uint64, len(ec)))
@@ -220,8 +252,14 @@ def batch_events(games: dict[str, list], row0: int = 0, max_ply: int = MAX_PLY) 
         e_cols["g"].append(np.full(len(ep), i, np.uint32))
         p_cols["pos"].append(np.fromiter(reached.keys(), np.uint64, len(reached)))
         p_cols["g"].append(np.full(len(reached), i, np.uint32))
-        p_cols["rep"].append((row0 + i) * 256 + np.fromiter(reached.values(), np.uint64, len(reached)))
-    cat = {k: (np.concatenate(v) if v else np.empty(0)) for k, v in e_cols.items()}
+        p_cols["rep"].append(rows[i] * np.uint64(256) + np.fromiter(reached.values(), np.uint64, len(reached)))
+    cat = {k: (np.concatenate(v) if v else np.empty(0, np.uint64)) for k, v in e_cols.items()}
+    pc = {k: (np.concatenate(v) if v else np.empty(0, np.uint64)) for k, v in p_cols.items()}
+    if kept is not None:
+        em_ = _in_sorted(kept, cat["pos"].astype(np.uint64))
+        cat = {k: v[em_] for k, v in cat.items()}
+        pm_ = _in_sorted(kept, pc["pos"].astype(np.uint64))
+        pc = {k: v[pm_] for k, v in pc.items()}
     g = cat["g"].astype(np.int64)
     edges = pl.DataFrame({
         "pos_hash": cat["pos"].astype(np.uint64),
@@ -230,9 +268,11 @@ def batch_events(games: dict[str, list], row0: int = 0, max_ply: int = MAX_PLY) 
         "year": year[g], "elo_band": band[g], "tempo": tempo[g], "res": res[g],
         "welo": welo[g], "belo": belo[g], "rated": rated[g], "mover_white": cat["white"].astype(bool),
     })
-    pc = {k: (np.concatenate(v) if v else np.empty(0)) for k, v in p_cols.items()}
     pg = pc["g"].astype(np.int64)
     positions = pl.DataFrame({"pos_hash": pc["pos"].astype(np.uint64), "res": res[pg], "rep": pc["rep"].astype(np.uint64)})
+    epd = pl.DataFrame({"pos_hash": np.fromiter(epds.keys(), np.uint64, len(epds)), "epd": list(epds.values())},
+                       schema={"pos_hash": pl.UInt64, "epd": pl.String})
+    positions = positions.join(epd, on="pos_hash", how="left")
     return edges, positions
 
 
@@ -263,7 +303,10 @@ def aggregate_positions(events: pl.DataFrame) -> pl.DataFrame:
             black_wins=(pl.col("res") == 2).cast(pl.UInt32),
         )
     return events.group_by("pos_hash").agg(
-        pl.col("n", "white_wins", "draws", "black_wins").sum(), pl.col("rep").min()
+        pl.col("n", "white_wins", "draws", "black_wins").sum(),
+        pl.col("rep").min(),
+        # the EPD of the first game to reach the position (smallest rep)
+        pl.col("epd").sort_by("rep").first(),
     )
 
 
@@ -282,24 +325,6 @@ def finish_edges(edges: pl.DataFrame, kept_positions: pl.DataFrame) -> pl.DataFr
         "pos_hash", "move", "year", "elo_band", "tempo")
 
 
-def epds_from_reps(reps: Iterable[int], moves_of_row) -> dict[int, str]:
-    """{rep: epd} for reps (row * 256 + ply), replaying each needed game once."""
-    by_row: dict[int, list[int]] = {}
-    for rep in reps:
-        by_row.setdefault(rep >> 8, []).append(rep & 255)
-    out: dict[int, str] = {}
-    for row, plies in by_row.items():
-        wanted = set(plies)
-        board = chess.Board()
-        moves = moves_of_row(row).split()
-        for ply in range(max(wanted) + 1):
-            if ply in wanted:
-                out[(row << 8) | ply] = board.epd()
-            if ply < len(moves):
-                board.push_uci(moves[ply])
-    return out
-
-
 def tables_from_games(
     games: pl.DataFrame, *, max_ply: int = MAX_PLY, min_games: int = MIN_GAMES
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
@@ -313,20 +338,17 @@ def tables_from_games(
     every event in memory.
     """
     cols = {c: games[c].to_list() for c in GAME_COLUMNS}
-    ev, pv = batch_events(cols, 0, max_ply)
+    ev, pv = batch_events(cols, None, max_ply)
     edges = aggregate_edges(ev)
     positions = aggregate_positions(pv)
     kept = positions.filter(pl.col("n") >= min_games)
-    edges = finish_edges(edges, kept)
-    epd = epds_from_reps(kept["rep"].to_list(), lambda row: cols["moves_uci"][row])
-    pos_index = finish_pos_index(kept, epd)
-    return edges, pos_index
+    return finish_edges(edges, kept), finish_pos_index(kept)
 
 
-def finish_pos_index(kept: pl.DataFrame, epd: dict[int, str]) -> pl.DataFrame:
-    reps = kept["rep"].to_list()
-    out = kept.with_columns(epd=pl.Series([epd[r] for r in reps], dtype=pl.String))
-    return out.select([pl.col(c).cast(t) for c, t in POS_INDEX_SCHEMA.items()]).sort("pos_hash")
+def finish_pos_index(kept: pl.DataFrame) -> pl.DataFrame:
+    if kept["epd"].null_count():
+        raise RuntimeError(f"{kept['epd'].null_count()} kept positions without an EPD")
+    return kept.select([pl.col(c).cast(t) for c, t in POS_INDEX_SCHEMA.items()]).sort("pos_hash")
 
 
 # --- reading -----------------------------------------------------------------------
@@ -630,17 +652,52 @@ def _peak_mb() -> int:
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
 
 
+def count_batch(args: tuple[int, dict, str, int]) -> tuple[int, int, int, int]:
+    """Worker, pass A: how many games of the batch reach each position, written in buckets.
+
+    Returns (batch, games, distinct positions, this process's peak MB).
+    """
+    k, cols, work, max_ply = args
+    hashes = np.concatenate([
+        np.fromiter(game_events(m, max_ply)[0].keys(), np.uint64) for m in cols["moves_uci"]
+    ]) if cols["moves_uci"] else np.empty(0, np.uint64)
+    keys, counts = np.unique(hashes, return_counts=True)
+    del hashes
+    df = pl.DataFrame({"pos_hash": keys, "n": counts.astype(np.uint32)})
+    df = df.with_columns(_b=_bucket(df))
+    for (b,), part in df.partition_by("_b", as_dict=True).items():
+        d = Path(work) / "counts" / f"b{b:02d}"
+        d.mkdir(parents=True, exist_ok=True)
+        _write(part.drop("_b"), d / f"k{k:05d}.parquet", compression="lz4")
+    return k, len(cols["moves_uci"]), len(keys), _peak_mb()
+
+
+def merge_counts(args: tuple[int, str, int]) -> tuple[int, dict]:
+    """Worker, merge A: the positions of one bucket reached by at least ``min_games`` games."""
+    b, work, min_games = args
+    w = Path(work)
+    d = w / "counts" / f"b{b:02d}"
+    hist = {"ge2": 0, "ge10": 0, "ge100": 0, "ge1000": 0}
+    kept = np.empty(0, np.uint64)
+    if d.exists():
+        n = pl.read_parquet(d / "*.parquet").group_by("pos_hash").agg(pl.col("n").sum())
+        hist = {f"ge{t}": int((n["n"] >= t).sum()) for t in (2, 10, 100, 1000)}
+        kept = np.sort(n.filter(pl.col("n") >= min_games)["pos_hash"].to_numpy())
+        del n
+        shutil.rmtree(d)
+    np.save(w / "kept" / f"b{b:02d}.npy", kept)
+    return b, hist
+
+
 def process_batch(args: tuple[int, dict, str, int]) -> tuple[int, int, int, int, int]:
-    """Worker, pass 1: aggregate one batch and write it split into buckets.
+    """Worker, pass B: edges and position totals of the batch, for kept positions only, in buckets.
 
     Returns (batch, games, edge rows written, position rows written, this process's peak MB).
     """
     k, cols, work, max_ply = args
     rows = cols.pop("row")
-    ev, pv = batch_events(cols, 0, max_ply)
-    # reps refer to the row in games.parquet
-    row_arr = np.asarray(rows, np.uint64)
-    pv = pv.with_columns(rep=pl.Series(row_arr[(pv["rep"].to_numpy() >> 8).astype(np.int64)] * 256 + (pv["rep"].to_numpy() & 255)))
+    kept = np.load(Path(work) / "kept.npy", mmap_mode="r")
+    ev, pv = batch_events(cols, np.asarray(rows, np.uint64), max_ply, kept)
     edges = aggregate_edges(ev)
     del ev
     positions = aggregate_positions(pv)
@@ -654,115 +711,106 @@ def process_batch(args: tuple[int, dict, str, int]) -> tuple[int, int, int, int,
     return k, len(rows), edges.height, positions.height, _peak_mb()
 
 
-def merge_bucket(args: tuple[int, str, int]) -> tuple[int, int, int, int]:
-    """Worker, pass 2: merge one bucket across batches, filter on the merged position counts.
+def merge_bucket(args: tuple[int, str]) -> tuple[int, int, int]:
+    """Worker, merge B: one bucket across batches, in the final schemas.
 
-    Writes the bucket's edges (final schema) and its kept positions (with the
-    representative game, EPD still to come). Returns (bucket, distinct
-    positions, kept positions, kept edge rows).
+    Returns (bucket, kept positions, edge rows).
     """
-    b, work, min_games = args
+    b, work = args
     w = Path(work)
     (w / "merged").mkdir(exist_ok=True)
-    if not (w / "positions" / f"b{b:02d}").exists():  # a small build can leave a bucket empty
-        pl.DataFrame(schema=EDGES_SCHEMA).write_parquet(w / "merged" / f"edges_b{b:02d}.parquet")
-        pl.DataFrame(schema={"pos_hash": pl.UInt64, "n": pl.UInt32, "white_wins": pl.UInt32, "draws": pl.UInt32,
-                             "black_wins": pl.UInt32, "rep": pl.UInt64}).write_parquet(w / "merged" / f"pos_b{b:02d}.parquet")
-        (w / "merged" / f"hist_b{b:02d}.json").write_text(json.dumps({"ge2": 0, "ge10": 0, "ge100": 0, "ge1000": 0}))
-        return b, 0, 0, 0
-    positions = aggregate_positions(pl.read_parquet(w / "positions" / f"b{b:02d}" / "*.parquet"))
-    kept = positions.filter(pl.col("n") >= min_games)
-    hist = positions.select(
-        *[(pl.col("n") >= t).sum().alias(f"ge{t}") for t in (2, 10, 100, 1000)]
-    ).row(0, named=True)
-    del positions
-    if (w / "edges" / f"b{b:02d}").exists():
-        edges = finish_edges(aggregate_edges(pl.read_parquet(w / "edges" / f"b{b:02d}" / "*.parquet")), kept)
-        shutil.rmtree(w / "edges" / f"b{b:02d}")
-    else:  # only final positions fell in this bucket
+    pd, ed = w / "positions" / f"b{b:02d}", w / "edges" / f"b{b:02d}"
+    if pd.exists():
+        kept = finish_pos_index(aggregate_positions(pl.read_parquet(pd / "*.parquet")))
+        shutil.rmtree(pd)
+    else:
+        kept = pl.DataFrame(schema=POS_INDEX_SCHEMA)
+    if ed.exists():
+        edges = finish_edges(aggregate_edges(pl.read_parquet(ed / "*.parquet")), kept)
+        shutil.rmtree(ed)
+    else:  # only final positions fell in this bucket, or none
         edges = pl.DataFrame(schema=EDGES_SCHEMA)
     _write(edges, w / "merged" / f"edges_b{b:02d}.parquet")
-    _write(kept.sort("pos_hash"), w / "merged" / f"pos_b{b:02d}.parquet")
-    (w / "merged" / f"hist_b{b:02d}.json").write_text(json.dumps(hist))
-    shutil.rmtree(w / "positions" / f"b{b:02d}")
-    return b, hist["ge2"], kept.height, edges.height
+    _write(kept, w / "merged" / f"pos_b{b:02d}.parquet")
+    return b, kept.height, edges.height
 
 
 def build(*, name: str, out_dir: Path, fraction: float | None, since_year: int | None,
           batch_games: int, workers: int, max_ply: int = MAX_PLY, min_games: int = MIN_GAMES,
           polars_threads: int = 1) -> None:
+    """The full build: pass A counts positions, pass B aggregates the kept positions only.
+
+    Two replays of the games instead of one: the partial files of a single
+    pass hold every position and edge of every batch, almost all of them seen
+    by one game, about 9 GB for the full corpus; after pass A only the kept
+    positions' rows are written.
+    """
     t0 = time.time()
     games_path = CORPUS / "games.parquet"
     work = DATA_ROOT / "scratch" / "edges" / f"work_{name}"
     if work.exists():
         shutil.rmtree(work)
-    work.mkdir(parents=True)
+    (work / "kept").mkdir(parents=True)
     # Workers are spawned, so they read this before polars starts its thread pool. One thread
-    # each: the process count is the CPU budget, and every polars thread keeps its own arena,
-    # which at 16 threads was most of a worker's memory.
+    # each: the process count is the CPU budget, and every polars thread keeps its own arena.
     os.environ["POLARS_MAX_THREADS"] = str(polars_threads)
     ctx = multiprocessing.get_context("spawn")
+    peak_disk = 0
 
     def log(msg: str) -> None:
         print(f"[{time.time() - t0:7.0f} s] {msg}", flush=True)
 
-    log(f"pass 1: games in batches of {batch_games}, {workers} workers -> {work}")
-    n_games = 0
-    # a fresh process per batch: memory a worker keeps after a batch does not add up
-    with ctx.Pool(workers, maxtasksperchild=1) as pool:
-        pending = []
-        batches = iter_game_batches(games_path, batch_games, fraction, since_year)
-        done = False
-        while not done or pending:
-            # at most one batch waiting per worker, so batches are read as they are needed
-            while not done and len(pending) < workers + 1:
-                nxt = next(batches, None)
-                if nxt is None:
-                    done = True
-                    break
-                k, cols = nxt
-                pending.append(pool.apply_async(process_batch, ((k, cols, str(work), max_ply),)))
-            k, g, er, pr, peak = pending.pop(0).get()
-            n_games += g
-            log(f"  batch {k}: {g} games, {er:,} edge rows, {pr:,} position rows; {n_games:,} games so far; "
-                f"worker peak {peak} MB, main {_rss_mb()} MB")
-    partial_bytes = sum(f.stat().st_size for f in work.rglob("*.parquet"))
-    log(f"pass 1 done: {n_games:,} games, partials {partial_bytes / 1e9:.2f} GB")
+    def disk() -> int:
+        return sum(f.stat().st_size for f in work.rglob("*") if f.is_file())
 
-    log("pass 2: merge buckets")
+    def run_batches(fn, label: str) -> int:
+        nonlocal peak_disk
+        n_games = 0
+        # a fresh process per batch: memory a worker keeps after a batch does not add up
+        with ctx.Pool(workers, maxtasksperchild=1) as pool:
+            pending = []
+            batches = iter_game_batches(games_path, batch_games, fraction, since_year)
+            done = False
+            while not done or pending:
+                # at most one batch waiting per worker, so batches are read as they are needed
+                while not done and len(pending) < workers + 1:
+                    nxt = next(batches, None)
+                    if nxt is None:
+                        done = True
+                        break
+                    k, cols = nxt
+                    if fn is count_batch:
+                        cols.pop("row")
+                    pending.append(pool.apply_async(fn, ((k, cols, str(work), max_ply),)))
+                out = pending.pop(0).get()
+                n_games += out[1]
+                log(f"  {label} batch {out[0]}: {out[1]} games, rows {out[2:-1]}; {n_games:,} games so far; "
+                    f"worker peak {out[-1]} MB, main {_rss_mb()} MB")
+        peak_disk = max(peak_disk, disk())
+        return n_games
+
+    log(f"pass A: positions per batch of {batch_games} games, {workers} workers -> {work}")
+    n_games = run_batches(count_batch, "A")
+    hist = {"ge2": 0, "ge10": 0, "ge100": 0, "ge1000": 0}
+    with ctx.Pool(workers, maxtasksperchild=8) as pool:
+        for _, h in pool.imap_unordered(merge_counts, [(b, str(work), min_games) for b in range(N_BUCKETS)]):
+            for k2, v in h.items():
+                hist[k2] += v
+    np.save(work / "kept.npy", np.concatenate([np.load(work / "kept" / f"b{b:02d}.npy") for b in range(N_BUCKETS)]))
+    shutil.rmtree(work / "kept")
+    log(f"pass A done: {n_games:,} games; positions with at least 2 / 10 / 100 / 1000 games: "
+        f"{hist['ge2']:,} / {hist['ge10']:,} / {hist['ge100']:,} / {hist['ge1000']:,}")
+
+    log("pass B: edges and totals of the kept positions")
+    run_batches(process_batch, "B")
     kept_pos = kept_edges = 0
-    with ctx.Pool(workers, maxtasksperchild=4) as pool:
-        for b, _, kp, ke in pool.imap_unordered(merge_bucket, [(b, str(work), min_games) for b in range(N_BUCKETS)]):
+    with ctx.Pool(workers, maxtasksperchild=8) as pool:
+        for _, kp, ke in pool.imap_unordered(merge_bucket, [(b, str(work)) for b in range(N_BUCKETS)]):
             kept_pos += kp
             kept_edges += ke
-    log(f"pass 2 done: {kept_pos:,} positions with >= {min_games} games, {kept_edges:,} edge rows")
-
-    log("pass 3: representative EPDs")
-    # (rep, pos_hash) of every kept position, sorted by rep: 16 bytes a position
-    pos_files = sorted((work / "merged").glob("pos_b*.parquet"))
-    rp = pl.concat([pl.read_parquet(f, columns=["rep", "pos_hash"]) for f in pos_files]).sort("rep")
-    reps, hashes = rp["rep"].to_numpy(), rp["pos_hash"].to_numpy()
-    del rp
-    n_epd = 0
-    for k, cols in iter_game_batches(games_path, batch_games, fraction, since_year):
-        lo, hi = cols["row"][0] * 256, (cols["row"][-1] + 1) * 256
-        i0, i1 = np.searchsorted(reps, lo), np.searchsorted(reps, hi)
-        if i0 == i1:
-            continue
-        moves_of = dict(zip(cols["row"], cols["moves_uci"], strict=True))
-        epd = epds_from_reps(reps[i0:i1].tolist(), moves_of.__getitem__)
-        part = pl.DataFrame({"pos_hash": hashes[i0:i1], "epd": [epd[int(r)] for r in reps[i0:i1]]},
-                            schema={"pos_hash": pl.UInt64, "epd": pl.String})
-        part = part.with_columns(_b=_bucket(part))
-        for (bb,), sub in part.partition_by("_b", as_dict=True).items():
-            d = work / "epd" / f"b{bb:02d}"
-            d.mkdir(parents=True, exist_ok=True)
-            _write(sub.drop("_b"), d / f"k{k:05d}.parquet", compression="lz4")
-        n_epd += i1 - i0
-        log(f"  batch {k}: {i1 - i0:,} EPDs; main {_rss_mb()} MB")
-    del reps, hashes
-    if n_epd != kept_pos:
-        raise RuntimeError(f"{n_epd:,} EPDs for {kept_pos:,} kept positions")
+    if min_games == 2 and kept_pos != hist["ge2"]:
+        raise RuntimeError(f"pass B kept {kept_pos:,} positions, pass A counted {hist['ge2']:,}")
+    log(f"pass B done: {kept_pos:,} positions, {kept_edges:,} edge rows")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     suffix = "" if name == "full" else f"_{name}"
@@ -777,19 +825,9 @@ def build(*, name: str, out_dir: Path, fraction: float | None, since_year: int |
             writers[key] = pq.ParquetWriter(str(path) + ".tmp", t.schema, compression="zstd")
         writers[key].write_table(t, row_group_size=rows_per_group)
 
-    hist = {"ge2": 0, "ge10": 0, "ge100": 0, "ge1000": 0}
     for b in range(N_BUCKETS):
         e = pl.read_parquet(work / "merged" / f"edges_b{b:02d}.parquet")
         p = pl.read_parquet(work / "merged" / f"pos_b{b:02d}.parquet")
-        if p.height:
-            p = p.join(pl.read_parquet(work / "epd" / f"b{b:02d}" / "*.parquet"), on="pos_hash", how="left")
-        else:
-            p = p.with_columns(epd=pl.lit(None, pl.String))
-        if p["epd"].null_count():
-            raise RuntimeError(f"bucket {b}: {p['epd'].null_count()} positions without an EPD")
-        p = p.select([pl.col(c).cast(t) for c, t in POS_INDEX_SCHEMA.items()])
-        for k2, v in json.loads((work / "merged" / f"hist_b{b:02d}.json").read_text()).items():
-            hist[k2] += v
         append("edges", edges_out, e, ROWS_PER_GROUP["edges"])
         append("pos", pos_out, p, ROWS_PER_GROUP["pos_index"])
         # the parents table is sorted on child_hash: bucket it again on the child
@@ -805,6 +843,7 @@ def build(*, name: str, out_dir: Path, fraction: float | None, since_year: int |
         if d.exists():
             append("parents", par_out, pl.read_parquet(d / "*.parquet").sort("child_hash", "pos_hash", "move"),
                    ROWS_PER_GROUP["parents"])
+    peak_disk = max(peak_disk, disk())
     for key, path in (("edges", edges_out), ("pos", pos_out), ("parents", par_out)):
         writers[key].close()
         Path(str(path) + ".tmp").replace(path)
@@ -815,7 +854,7 @@ def build(*, name: str, out_dir: Path, fraction: float | None, since_year: int |
         f"{par_out} ({par_out.stat().st_size / 1e9:.3f} GB, {pq.ParquetFile(par_out).metadata.num_rows:,} rows)")
     log("positions with at least 2 / 10 / 100 / 1000 games: "
         f"{hist['ge2']:,} / {hist['ge10']:,} / {hist['ge100']:,} / {hist['ge1000']:,}; "
-        f"games {n_games:,}; partials peaked at {partial_bytes / 1e9:.2f} GB")
+        f"games {n_games:,}; work files peaked at {peak_disk / 1e9:.2f} GB")
 
 
 def main(argv: list[str] | None = None) -> None:
