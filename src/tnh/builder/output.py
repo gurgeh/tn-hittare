@@ -119,6 +119,12 @@ class Row:
     deep: dict | None = None                           # the deeper soundness check, when run
 
 
+def rel_path(node: Node) -> list[str]:
+    """The node's creation path from the graph's root (an expander's paths start at the
+    initial position, before the root moves)."""
+    return list(node.path[len(node.path) - node.ply:]) if node.ply else []
+
+
 def best_paths(game: Game, learned: Learned) -> dict[int, list[str]]:
     """For every node, the most likely path from the root under the repertoire."""
     g = game.graph
@@ -183,7 +189,7 @@ def rows(game: Game, sols: list[Solution], N: int, ensure: Callable[[Node], None
         j = n.moves.index(m)
         st = entry.get(k)
         line, lv, why = engine_line(game, sol.learned, i, ensure)
-        out.append(Row(k, i, paths.get(i, list(n.path)), m, float(sum(R[x] for x in ids)), losses[k],
+        out.append(Row(k, i, paths.get(i, rel_path(n)), m, float(sum(R[x] for x in ids)), losses[k],
                        st.marginal if st else 0.0, st.N if st else 0, (len(st.entered) - 1) if st else 0,
                        float(game.dist[i][j]), _mine(n, j), float(np.nanmax(n.engine)),
                        line, lv, why, (deep or {}).get(k)))

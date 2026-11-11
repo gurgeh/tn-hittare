@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 
 from tnh.builder.game import Game, Params
-from tnh.builder.output import curve_json, curve_text, pgn, rows, steps_text, table
+from tnh.builder.output import curve_json, curve_text, pgn, rel_path, rows, steps_text, table
 from tnh.builder.search import DP, brute_force, candidates, improve, is_tree, repair, solve
 from tnh.builder.synth import random_game
 
@@ -175,7 +175,7 @@ def cmd_chess(a) -> None:
                 g = Game(ex.graph, p)
                 _, vs = solve(g, a.N)
                 cmp[name] = {"value": vs[a.N].value, "v0": vs[0].value,
-                             "learned": {san(ex.graph.nodes[g.by_key[k][0]].path + (m,)): m
+                             "learned": {san(rel_path(ex.graph.nodes[g.by_key[k][0]]) + [m]): m
                                          for k, m in vs[a.N].learned.items()},
                              "keys": set(vs[a.N].learned.items())}
             base_keys = cmp[f"lam {a.compare:g} per opponent"]["keys"]
@@ -197,7 +197,7 @@ def cmd_chess(a) -> None:
         final_game = Game(ex.graph, params)
         if a.deep_nodes:
             with DeepChecker(a.deep_nodes) as dc:
-                check = lambda k, m: dc.check(list(root_moves) + list(ex.graph.nodes[final_game.by_key[k][0]].path), m,
+                check = lambda k, m: dc.check(list(root_moves) + rel_path(ex.graph.nodes[final_game.by_key[k][0]]), m,
                                               params.eps(me_white))
                 chk = check_repertoire(ex.graph, params, a.N, a.N, check)
             log += chk.log
@@ -205,7 +205,7 @@ def cmd_chess(a) -> None:
             sols = chk.sols
             final_game = Game(ex.graph, chk.params)
             deep = {k: d for (k, m), d in chk.results.items() if sols[a.N].learned.get(k) == m}
-            report["deep"] = [{"line": san(ex.graph.nodes[final_game.by_key[k][0]].path + (m,)), **d}
+            report["deep"] = [{"line": san(rel_path(ex.graph.nodes[final_game.by_key[k][0]]) + [m]), **d}
                               for (k, m), d in chk.results.items()]
         else:
             sols = _solve_report(final_game, a.N, "final solve", log)
@@ -216,7 +216,7 @@ def cmd_chess(a) -> None:
         sf_stats = dict(sf.stats)
 
     sol = sols[a.N]
-    names = {k: san(ex.graph.nodes[final_game.by_key[k][0]].path + (m,)) for s_ in sols for k, m in s_.learned.items()}
+    names = {k: san(rel_path(ex.graph.nodes[final_game.by_key[k][0]]) + [m]) for s_ in sols for k, m in s_.learned.items()}
     headers = {"Event": f"tnh.builder repertoire, N={a.N}", "White": f"{'me' if me_white else 'opponent'}",
                "Black": f"{'opponent' if me_white else 'me'}",
                "Annotator": f"maia3-{a.size} {a.elo} vs {a.opp_elo}, stockfish {a.sf_nodes} nodes/move, "
