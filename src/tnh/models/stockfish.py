@@ -38,40 +38,52 @@ class EngineError(RuntimeError):
 
 
 class _Engine:
+    """One Stockfish process. Output is read in raw chunks and only the end of each search
+    is split into lines: at 10k nodes Stockfish prints ~150 MultiPV lines per position,
+    and reading them one by one in Python capped a pool of 16 engines at ~650 positions/s."""
+
     def __init__(self, path: Path, hash_mb: int) -> None:
         self.proc = subprocess.Popen(
-            [str(path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, bufsize=1,
+            [str(path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
         )
+        self._fd = self.proc.stdout.fileno()
+        self._buf = b""
         self._send("uci")
-        lines = self._until("uciok")
+        lines = self._until(b"uciok").decode().splitlines()
         self.id = next((l[len("id name "):] for l in lines if l.startswith("id name ")), "?")
-        for name, value in [("Threads", 1), ("Hash", hash_mb), ("UCI_ShowWDL", "true"), ("MultiPV", MAX_MULTIPV)]:
-            self._send(f"setoption name {name} value {value}")
+        self._send(*(f"setoption name {name} value {value}" for name, value in
+                     [("Threads", 1), ("Hash", hash_mb), ("UCI_ShowWDL", "true"), ("MultiPV", MAX_MULTIPV)]))
         self._send("isready")
-        self._until("readyok")
+        self._until(b"readyok")
 
-    def _send(self, line: str) -> None:
-        self.proc.stdin.write(line + "\n")
-        self.proc.stdin.flush()
+    def _send(self, *lines: str) -> None:
+        self.proc.stdin.write(("\n".join(lines) + "\n").encode())
 
-    def _until(self, prefix: str) -> list[str]:
-        lines = []
-        for line in self.proc.stdout:
-            line = line.rstrip("\n")
-            lines.append(line)
-            if line.startswith(prefix):
-                return lines
-            if line.startswith("info string ERROR") or "Unknown command" in line:
-                raise EngineError(line)
-        raise EngineError(f"engine exited (code {self.proc.poll()}): {self.proc.stderr.read()[-2000:]}")
+    def _until(self, token: bytes) -> bytes:
+        """Everything up to and including the line that starts with `token`."""
+        marker = b"\n" + token
+        while True:
+            i = (b"\n" + self._buf).find(marker)
+            if i >= 0:
+                j = self._buf.find(b"\n", i)
+                if j >= 0:
+                    out, self._buf = self._buf[: j + 1], self._buf[j + 1 :]
+                    if b"Unknown command" in out or b"info string ERROR" in out:
+                        bad = next(l for l in out.decode().splitlines() if "Unknown command" in l or "ERROR" in l)
+                        raise EngineError(bad)
+                    return out
+            chunk = os.read(self._fd, 1 << 16)
+            if not chunk:
+                raise EngineError(f"engine exited (code {self.proc.wait()}): {self.proc.stderr.read()[-2000:]!r}")
+            self._buf += chunk
 
     def search(self, position: str, nodes: int, clear: bool = True) -> list[str]:
-        if clear:
-            self._send("ucinewgame")
-        self._send(position)
-        self._send(f"go nodes {nodes}")
-        return self._until("bestmove")
+        """The output lines from the last `multipv 1` report to `bestmove`."""
+        self._send(*(["ucinewgame"] if clear else []), position, f"go nodes {nodes}")
+        out = self._until(b"bestmove")
+        k = out.rfind(b" multipv 1 ")
+        start = out.rfind(b"\n", 0, k) + 1 if k >= 0 else out.rfind(b"\n", 0, len(out) - 1) + 1
+        return out[start:].decode().splitlines()
 
     def close(self) -> None:
         if self.proc.poll() is None:
