@@ -193,7 +193,7 @@ def run(a) -> None:
         from tnh.models.maia3 import Maia3
 
         elos = maia3_settings(a)
-        model = Maia3(a.size, batch_size=a.batch_size, amp=not a.fp32)
+        model = Maia3(a.size, batch_size=a.batch_size or 512, amp=not a.fp32)
         base = a.out or FEATURES / model.name
         outs = [base / model.variant(e) for e in elos]
         for e, out in zip(elos, outs):
@@ -212,7 +212,9 @@ def run(a) -> None:
     elif a.model == "lc0-policy":
         from tnh.models.lc0 import Lc0Policy
 
-        model = Lc0Policy(a.network, batch_size=a.batch_size)
+        from tnh.models.lc0 import MAX_BATCH
+
+        model = Lc0Policy(a.network, batch_size=a.batch_size or MAX_BATCH)
         outs = [(a.out or FEATURES / model.name) / model.variant]
         check_meta(outs[0], {"model": model.name, "variant": model.variant, "network": model.network.name,
                              "backend": model.backend_name})
@@ -284,7 +286,7 @@ def main(argv=None) -> None:
     g.add_argument("--elo", nargs="+", help="variant names: offset+300, offset+300-opp+100, fixed2200-2200")
     g.add_argument("--elo-min", type=float, default=0.0)
     g.add_argument("--elo-max", type=float, default=5000.0)
-    g.add_argument("--batch-size", type=int, default=512)
+    g.add_argument("--batch-size", type=int, help="default: 512 for maia3, 12 for lc0-policy")
     g.add_argument("--fp32", action="store_true", help="no autocast (the reference uses float16 autocast)")
     g = p.add_argument_group("stockfish and lc0-search")
     g.add_argument("--nodes", type=int, default=10_000, help="nodes per position for the whole search")
@@ -294,7 +296,8 @@ def main(argv=None) -> None:
     g = p.add_argument_group("lc0")
     g.add_argument("--network", default="BT4-1024x15x32h-swa-6147500.pb.gz", help="file under <lc0>/networks, or a path")
     g.add_argument("--wdl-elo", help="lc0-search: calibrate to two players, e.g. offset+0 or fixed2200-2000")
-    g.add_argument("--lc0-processes", type=int, default=4, help="lc0-search: engine processes sharing the GPU")
+    g.add_argument("--lc0-processes", type=int, default=1,
+                   help="lc0-search: engine processes sharing the GPU (about 1 GB each; 4 gave only +25%%)")
     run(p.parse_args(argv))
 
 
