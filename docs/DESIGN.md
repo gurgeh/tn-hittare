@@ -219,7 +219,7 @@ is a bootstrap over tournaments.
   stratified on the mover's rating in 100-point buckets with equal
   allocation, a short bucket's surplus going to the others. A sample has the
   positions schema plus `tournament_id`, `tempo_source`, `in_window`,
-  `out_of_book`, `part`, `bucket` and `weight`. `weight` is population rows
+  `out_of_book`, `exit_ply_<book_count>`, `part`, `bucket` and `weight`. `weight` is population rows
   per sampled row, and every pooled number is weighted with it. A sample also
   holds a smaller set of rows from outside the window, flagged by
   `in_window`, for the clock breakdown and for the window shared with blitz.
@@ -227,6 +227,14 @@ is a bootstrap over tournaments.
   distribution over the legal moves, `p' = (1 - eps) * p + eps / n`. `eps` is
   fitted. This keeps the score proper and stops single impossible moves from
   dominating.
+- **Where theory ends**, a separate test with its own sample
+  (`tnh.eval.theory`), Maia-3 only. Rows are stratified on ply band, band of
+  `pos_count` and the mover's rating group, with no window rule. Per cell,
+  the offset with the lowest log loss. Memory makes people play above their
+  strength, so within one ply band and one rating group the best offset
+  should rise with `pos_count`; theory ends at the count where it has come
+  down to its value in rare positions. This is what `book_count` should be
+  set from.
 - **The Elo sweep.** Maia-3 with both ratings offset by the same amount, from
   -200 to +800. The first measurement on elite games had its minimum at +300
   and broke down above about 2800 on Maia's scale. The result wanted is the
