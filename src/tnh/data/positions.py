@@ -19,10 +19,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import multiprocessing
 import os
 import shutil
 import time
-import multiprocessing
 
 import chess
 import numpy as np

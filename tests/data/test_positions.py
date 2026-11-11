@@ -6,7 +6,7 @@ import chess
 import polars as pl
 import pytest
 
-import tnh.data.positions as positions
+from tnh.data import positions
 from tnh.data.parse import GAMES_SCHEMA
 
 

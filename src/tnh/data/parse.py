@@ -24,11 +24,11 @@ import argparse
 import datetime
 import hashlib
 import json
+import multiprocessing
 import re
 import time
 import unicodedata
 from collections import Counter
-import multiprocessing
 from pathlib import Path
 
 import chess
