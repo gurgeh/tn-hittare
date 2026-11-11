@@ -313,6 +313,74 @@ def cmd_lc0(a) -> None:
         print(f"Maia-3 79M alongside, alone again: {20000 / (time.perf_counter() - t):.0f} pos/s")
 
 
+def cmd_lc0_children(a) -> None:
+    """Throughput of Lc0Children, pooled across positions or not, and how its move values compare
+    with Stockfish's at a deep budget: rank correlation, and the share of Stockfish's mistakes
+    (expected-score loss over `--loss`) that the raw network already sees as mistakes."""
+    import os
+    import random
+
+    from scipy.stats import spearmanr
+
+    from tnh.models import lc0
+    from tnh.models.stockfish import Stockfish
+
+    games = read_games(a.pgn)
+    qs, _, _ = positions(games, min_ply=a.min_ply)
+    sample = random.Random(1).sample(qs, a.n)
+    print(f"load {os.getloadavg()}; {len(sample)} positions, mean legal moves "
+          f"{np.mean([chess.Board(q.fen).legal_moves.count() for q in sample]):.1f}")
+    timing = sample[: a.n_timing]
+    for pool in (False, True):
+        m = lc0.Lc0Children(pool_across_positions=pool)
+        m.evaluate(timing[:5])
+        t = time.perf_counter()
+        res = m.evaluate(timing)
+        dt = time.perf_counter() - t
+        print(f"children, pooled across positions {pool}: {len(timing) / dt:.1f} pos/s, "
+              f"{m.stats['children evaluated'] / dt:.0f} children/s", flush=True)
+        del m
+    ch = lc0.Lc0Children().evaluate(sample)
+    with Stockfish(a.sf_nodes, processes=a.processes) as sf:
+        t = time.perf_counter()
+        st = sf.evaluate(sample)
+        print(f"stockfish {a.sf_nodes} nodes: {len(sample) / (time.perf_counter() - t):.0f} pos/s", flush=True)
+    rhos, skipped = [], 0
+    n_mist = seen = n_ok = false_alarm = 0
+    edges = [0.05, 0.1, 0.2, 0.5, 1.01]
+    by_bucket = [[0, 0] for _ in edges[:-1]]
+    for c, s_ in zip(ch, st):
+        assert c.moves == s_.moves
+        ok = ~np.isnan(c.value) & ~np.isnan(s_.value)
+        cv, sv = c.value[ok].astype(np.float64), s_.value[ok].astype(np.float64)
+        if len(cv) >= 3 and np.ptp(cv) > 0 and np.ptp(sv) > 0:
+            rhos.append(spearmanr(cv, sv).statistic)
+        else:
+            skipped += 1
+        if len(cv) == 0:
+            continue
+        s_loss = sv.max() - sv
+        c_loss = cv.max() - cv
+        mist = s_loss > a.loss
+        n_mist += int(mist.sum())
+        seen += int((mist & (c_loss > a.loss)).sum())
+        n_ok += int((~mist).sum())
+        for k in range(len(edges) - 1):
+            sel = (s_loss > edges[k]) & (s_loss <= edges[k + 1])
+            by_bucket[k][0] += int(sel.sum())
+            by_bucket[k][1] += int((sel & (c_loss > a.loss)).sum())
+        false_alarm += int((~mist & (c_loss > a.loss)).sum())
+    print(f"rank correlation (Spearman) of child values with Stockfish {a.sf_nodes}: mean {np.mean(rhos):.3f}, "
+          f"median {np.median(rhos):.3f} over {len(rhos)} positions ({skipped} skipped: under 3 moves or constant)")
+    print(f"Stockfish mistakes (loss > {a.loss}): {n_mist}; seen by the raw children values (their loss > {a.loss}): "
+          f"{seen} = {seen / n_mist:.3f}; moves Stockfish rates fine but the children call mistakes: "
+          f"{false_alarm} of {n_ok} = {false_alarm / n_ok:.3f}")
+    for k in range(len(edges) - 1):
+        n, sn = by_bucket[k]
+        print(f"  Stockfish loss in ({edges[k]:.2f}, {min(edges[k + 1], 1):.2f}]: {n:6d} moves, "
+              f"seen by the children {sn / max(n, 1):.3f}")
+
+
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(prog="python -m tnh.models.bench")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -369,6 +437,16 @@ def main(argv=None) -> None:
     sp.add_argument("--backends", nargs="+", default=["cuda-auto"])
     sp.add_argument("--with-maia", action="store_true", help="keep Maia-3 79M loaded on the GPU meanwhile")
     sp.set_defaults(fn=cmd_lc0)
+
+    sp = sub.add_parser("lc0-children")
+    sp.add_argument("--pgn", type=Path, required=True)
+    sp.add_argument("--min-ply", type=int, default=20)
+    sp.add_argument("--n", type=int, default=600)
+    sp.add_argument("--n-timing", type=int, default=200)
+    sp.add_argument("--sf-nodes", type=int, default=100_000)
+    sp.add_argument("--processes", type=int, default=8)
+    sp.add_argument("--loss", type=float, default=0.05)
+    sp.set_defaults(fn=cmd_lc0_children)
 
     a = p.parse_args(argv)
     a.fn(a)

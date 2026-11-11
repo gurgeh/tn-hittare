@@ -5,6 +5,7 @@
     uv run python -m tnh.models.run --model maia3 --size 79m --elo offset+300-opp+100 fixed2200-2200 ...
     uv run python -m tnh.models.run --model stockfish --nodes 10000 --processes 16 ...
     uv run python -m tnh.models.run --model lc0-policy ...
+    uv run python -m tnh.models.run --model lc0-children ...
     uv run python -m tnh.models.run --model lc0-search --nodes 400 [--wdl-elo offset+0] ...
 
 Maia-3 takes any number of Elo settings (`--offsets` for both sides at once,
@@ -218,6 +219,13 @@ def run(a) -> None:
         outs = [(a.out or FEATURES / model.name) / model.variant]
         check_meta(outs[0], {"model": model.name, "variant": model.variant, "network": model.network.name,
                              "backend": model.backend_name})
+    elif a.model == "lc0-children":
+        from tnh.models.lc0 import Lc0Children
+
+        model = Lc0Children(a.network)
+        outs = [(a.out or FEATURES / model.name) / model.variant]
+        check_meta(outs[0], {"model": model.name, "variant": model.variant, "network": model.network.name,
+                             "backend": model.backend_name, "batch_size": model.batch_size})
     elif a.model == "lc0-search":
         from tnh.models.lc0 import Lc0Search
         from tnh.models.maia3 import Elo
@@ -262,6 +270,8 @@ def run(a) -> None:
             model.close()
         elif a.model == "lc0-policy":
             print(f"lc0 policy: input transforms used {dict(model.transforms)}")
+        elif a.model == "lc0-children":
+            print(f"lc0 children: {dict(model.stats)}")
         else:
             print(f"lc0 search: {dict(model.stats)}")
             model.close()
@@ -270,7 +280,7 @@ def run(a) -> None:
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(prog="python -m tnh.models.run", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--model", required=True, choices=["maia3", "stockfish", "lc0-policy", "lc0-search"])
+    p.add_argument("--model", required=True, choices=["maia3", "stockfish", "lc0-policy", "lc0-search", "lc0-children"])
     p.add_argument("--positions", type=Path, required=True)
     p.add_argument("--games", type=Path,
                    help="default: games.parquet next to --positions, else <corpus>/games.parquet")

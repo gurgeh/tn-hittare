@@ -134,6 +134,11 @@ def test_lc0_run_both_kinds(corpus, tmp_path):
     visited = np.concatenate([~np.isnan(np.array(v, dtype=np.float64)) for v in val["value"].to_list()])
     assert 0 < visited.mean() < 1          # 50 nodes: some root moves are never visited
     assert sorted(pol["game_id"] + pol["ply"].cast(pl.String)) == sorted(val["game_id"] + val["ply"].cast(pl.String))
+    run.main(["--model", "lc0-children"] + common)
+    ch = read_features(tmp_path / "children")
+    assert ch.schema == val.schema and ch.height == 80
+    vals = np.concatenate([np.array(v, dtype=np.float64) for v in ch["value"].to_list()])
+    assert not np.isnan(vals).any() and np.all((vals >= 0) & (vals <= 1))   # every child has a value
 
 
 def test_games_file_default(tmp_path, monkeypatch):

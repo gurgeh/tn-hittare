@@ -475,3 +475,121 @@ class Lc0Search:
 
     def __exit__(self, *exc):
         self.close()
+
+
+# -- every child once, without search ---------------------------------------------------
+
+def _terminal_value(board: chess.Board) -> tuple[float, int] | None:
+    """Exact (expected score for the side that just moved, mate) when the game is over
+    after the move, else None.
+
+    Handled: checkmate; stalemate; insufficient material (python-chess: K v K, K+minor
+    v K, bishops all on one colour); the fifty-move rule (halfmove clock >= 100, which a
+    player may claim) and threefold repetition (claimable, counted over the whole game),
+    both taken as draws. The network's input carries the halfmove clock and eight
+    positions of history, so it cannot see a repetition further back, nor that a draw
+    is already claimable.
+    """
+    if board.is_checkmate():
+        return 1.0, 1
+    if (board.is_stalemate() or board.is_insufficient_material() or board.halfmove_clock >= 100
+            or board.is_repetition(3)):
+        return 0.5, 0
+    return None
+
+
+class Lc0Children:
+    """The raw network's value of the position after every legal move, as a `ValueModel`.
+
+    Each child is evaluated once, with the game so far plus the move as history. `value`
+    is the mover's expected score after the move, 1 minus the child's own expected score
+    for its side to move; `cp` by Lc0's formula on the mover's Q; `wdl` the raw value of
+    the position itself. Terminal children get their exact value (see `_terminal_value`).
+    Children of all queries in a call are pooled and evaluated in calls of `batch_size`
+    (at most `MAX_BATCH`), so a position's last partial batch is filled by the next one's.
+    """
+
+    def __init__(self, network: str | Path = DEFAULT_NETWORK, *, backend: str = "cuda-auto",
+                 batch_size: int = MAX_BATCH, pool_across_positions: bool = True, home: Path = LC0_HOME) -> None:
+        if batch_size > MAX_BATCH:
+            raise ValueError(f"batch_size above the backend's max_batch {MAX_BATCH}")
+        self.network = network_path(str(network), home)
+        self._lc = backends(home)
+        self._weights = self._lc.Weights(str(self.network))
+        self._backend = self._lc.Backend(weights=self._weights, backend=backend, options=f"max_batch={MAX_BATCH}")
+        self.backend_name = backend
+        self.batch_size = batch_size
+        self.pool = pool_across_positions
+        self.name = f"lc0-{short_name(self.network)}"
+        self.variant = "children" + ("" if backend == "cuda-auto" else f"-{backend}")
+        self._replayer = Replayer()
+        self.stats: Counter = Counter()
+
+    def _state(self, q: Query, extra: list[str]):
+        if q.moves_uci:
+            return self._lc.GameState(moves=q.moves_uci + extra)
+        return self._lc.GameState(fen=q.fen, moves=extra)
+
+    def _evaluate_inputs(self, inputs: list) -> list[tuple[float, float]]:
+        out = []
+        for s in range(0, len(inputs), self.batch_size):
+            out += [(float(r.q()), float(r.d())) for r in self._backend.evaluate(*inputs[s : s + self.batch_size])]
+        return out
+
+    def evaluate(self, queries: list[Query]) -> list[MoveValues]:
+        plans = []   # per query: legal moves, terminal values, and the slots of its network inputs
+        inputs: list = []
+        results: list[MoveValues] = []
+        for q in queries:
+            game = chess.Board()
+            if q.moves_uci:
+                for m in q.moves_uci:
+                    game.push_uci(m)
+            else:
+                game = chess.Board(q.fen)
+            self._replayer.boards(q)   # checks that the moves reach the FEN
+            legal = list(game.legal_moves)
+            root_slot = len(inputs)
+            inputs.append(self._state(q, []).as_input(self._backend))
+            slots, terminal = [], []
+            for m in legal:
+                game.push(m)
+                t = _terminal_value(game)
+                game.pop()
+                terminal.append(t)
+                if t is None:
+                    slots.append(len(inputs))
+                    inputs.append(self._state(q, [m.uci()]).as_input(self._backend))
+                else:
+                    slots.append(None)
+            plans.append((legal, terminal, slots, root_slot))
+            if not self.pool:
+                results += self._finish(plans, inputs)
+                plans, inputs = [], []
+        results += self._finish(plans, inputs)
+        return results
+
+    def _finish(self, plans, inputs) -> list[MoveValues]:
+        evals = self._evaluate_inputs(inputs)
+        out = []
+        for legal, terminal, slots, root_slot in plans:
+            n = len(legal)
+            value = np.full(n, np.nan, dtype=np.float32)
+            cp = np.full(n, np.nan, dtype=np.float32)
+            mate = np.zeros(n, dtype=np.int16)
+            for i, (t, slot) in enumerate(zip(terminal, slots)):
+                if t is not None:
+                    value[i], mate[i] = t
+                    self.stats["terminal children"] += 1
+                    if mate[i] == 0:
+                        cp[i] = 0.0
+                    continue
+                q_child, _d = evals[slot]
+                q_mover = -q_child
+                value[i] = (1.0 + q_mover) / 2.0
+                cp[i] = 90.0 * math.tan(1.5637541897 * max(-0.9999, min(0.9999, q_mover)))
+            rq, rd = evals[root_slot]
+            self.stats["positions"] += 1
+            self.stats["children evaluated"] += sum(s is not None for s in slots)
+            out.append(MoveValues([m.uci() for m in legal], value, cp, mate, ((1 + rq - rd) / 2, rd, (1 - rq - rd) / 2)))
+        return out

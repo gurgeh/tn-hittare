@@ -211,3 +211,92 @@ def test_search_values_do_not_depend_on_the_number_of_processes():
     same_visits = all(np.array_equal(np.isnan(x.value), np.isnan(y.value)) for x, y in zip(a, b))
     print(f"\n1 vs 3 processes: same visited moves {same_visits}, max |value difference| {worst:.5f}")
     assert same_visits and worst == 0.0
+
+
+def engine_child_q(queries_and_moves):
+    """The engine's Q (ScoreType Q, exact to 1e-4) at one node for each child position,
+    reached through the game's moves plus the child's move."""
+    e = lc0._Engine([str(lc0.binary())], {
+        "WeightsFile": str(lc0.network_path()), "Backend": "cuda-auto", "Threads": "1",
+        "BackendOptions": f"max_batch={lc0.MAX_BATCH}", "ScoreType": "Q", "NNCacheSize": "0"})
+    out = []
+    try:
+        for q, mv in queries_and_moves:
+            e.send("ucinewgame")
+            if q.moves_uci:
+                e.send("position startpos moves " + " ".join(q.moves_uci + [mv]))
+            else:
+                e.send(f"position fen {q.fen} moves {mv}")
+            e.send("go nodes 1")
+            score = [l.split() for l in e.until("bestmove") if l.startswith("info") and " score cp " in l][-1]
+            out.append(int(score[score.index("cp") + 1]) / 10000)
+    finally:
+        e.close()
+    return out
+
+
+@installed
+@pytest.mark.slow
+def test_children_agree_with_engine():
+    rng = random.Random(5)
+    positions = fixture_positions(step=3) + random_positions(120, seed=7) + [Query(f, [], 2000, 2000) for f in PAWNLESS]
+    exact = lc0.Lc0Children(batch_size=1, pool_across_positions=False).evaluate(positions)
+    pooled = lc0.Lc0Children().evaluate(positions)
+    picks = []
+    for q, r in zip(positions, exact):
+        for i in rng.sample(range(len(r.moves)), min(5, len(r.moves))):
+            picks.append((q, r.moves[i], i))
+    terminal = {(id(q), mv) for q, mv, _ in picks
+                if lc0._terminal_value(_after(q, mv)) is not None}
+    to_check = [(q, mv, i) for q, mv, i in picks if (id(q), mv) not in terminal]
+    eq = engine_child_q([(q, mv) for q, mv, _ in to_check])
+    by_q = {id(q): k for k, q in enumerate(positions)}
+    d1, d12 = [], []
+    for (q, mv, i), qe in zip(to_check, eq):
+        k = by_q[id(q)]
+        want = (1 - qe) / 2
+        d1.append(abs(exact[k].value[i] - want))
+        d12.append(abs(pooled[k].value[i] - want))
+    print(f"\n{len(positions)} positions, {len(to_check)} children checked ({len(picks) - len(to_check)} terminal skipped): "
+          f"|value - engine| batch 1 max {max(d1):.5f} mean {np.mean(d1):.6f}; "
+          f"batch 12 pooled max {max(d12):.5f} mean {np.mean(d12):.6f}")
+    assert max(d1) <= 5e-5 + 1e-6          # engine Q printed to 1e-4, value = (1 - Q) / 2
+    assert max(d12) < 0.01                 # float16 kernels for batch 12 differ from batch 1 (see policy test)
+
+
+def _after(q, mv):
+    b = chess.Board()
+    if q.moves_uci:
+        for m in q.moves_uci:
+            b.push_uci(m)
+    else:
+        b = chess.Board(q.fen)
+    b.push_uci(mv)
+    return b
+
+
+@installed
+@pytest.mark.slow
+def test_children_terminal_values():
+    m = lc0.Lc0Children()
+    mate_in_1 = Query("r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4", [], 2000, 2000)
+    stalemate = Query("7k/8/6Q1/8/8/8/8/K7 w - - 0 1", [], 2000, 2000)          # any quiet move stalemates
+    bare_kings = Query("8/8/8/3k4/8/3r4/3K4/8 w - - 0 1", [], 2000, 2000)       # Kxd3 leaves K v K
+    fifty = Query("8/8/8/3k4/8/8/3K4/7R w - - 99 80", [], 2000, 2000)           # any non-capture: 100 plies
+    rep = ["g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6", "f3g1"]
+    b = chess.Board()
+    for x in rep:
+        b.push_uci(x)
+    threefold = Query(b.fen(), rep, 2000, 2000)                                    # f6g8 repeats a third time
+    r = dict(zip(["mate", "stale", "kings", "fifty", "rep"], m.evaluate([mate_in_1, stalemate, bare_kings, fifty, threefold])))
+    def v(name, mv):
+        res = r[name]
+        i = res.moves.index(mv)
+        return float(res.value[i]), int(res.mate[i])
+    assert v("mate", "h5f7") == (1.0, 1)
+    assert v("stale", "g6f7") == (0.5, 0) and v("stale", "a1b2") == (0.5, 0)
+    assert r["stale"].mate[r["stale"].moves.index("g6g7")] == 0 and not np.isnan(r["stale"].value[r["stale"].moves.index("g6g7")])
+    assert v("kings", "d2d3") == (0.5, 0)
+    assert all(v("fifty", mv) == (0.5, 0) for mv in r["fifty"].moves)
+    assert v("rep", "f6g8") == (0.5, 0)
+    assert v("rep", "b8c6")[0] != 0.5
