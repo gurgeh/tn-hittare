@@ -3,7 +3,7 @@
     uv run python -m tnh.eval.report [--results reports/step1] [--out reports/step1.md] [--note TEXT]
 
 Reads the json files the analysis commands wrote into ``--results``
-(``logloss``, ``sweep``, ``mistakes``, ``logit``, ``breakdown``, ``book``, ``theory``, ``value``,
+(``logloss``, ``sweep``, ``mistakes``, ``logit``, ``stack``, ``breakdown``, ``book``, ``theory``, ``value``,
 ``reference``; any that is missing is said to be missing), draws the figures
 into the same directory, and writes the markdown. Every table says which sample
 and which feature variant its numbers came from. Nothing is computed here that
@@ -490,6 +490,45 @@ def sec_logit(w, r):
     w("\n")
 
 
+def sec_stack(w, r):
+    w("## A non-linear stack\n\n")
+    if not r:
+        w("_No `stack.json`._\n\n"); return
+    o = r["options"]
+    rows = r["rows"]
+    w(f"A score per legal move from its own features and the position's context, softmax over the legal moves, "
+      f"trained on the played move with the weighted log loss: `score = b . x_move + MLP([x_move, x_context])`, two "
+      f"hidden layers of {o['hidden']} (SiLU), the skip `b` starting at the linear logit. Fitted on {rows['train']} "
+      f"rows of the fitting sample, early stopping on {rows['validation']} rows of held-out tournaments, reported "
+      f"on {rows['test']} test window rows; every model mixed with its own `eps`.\n\n"
+      f"- Per-move features: {', '.join('`' + c + '`' for c in r['move_features'])}.\n"
+      f"- Context features: {', '.join('`' + c + '`' for c in r['context_features'])}.\n"
+      f"- The interaction logit is the linear logit plus each engine loss x rating and x log clock, and each log "
+      f"probability x rating (standardised rating and clock), so its coefficients can be read.\n\n")
+    order = ["stack", "interactions", "linear+board", "linear"] + [k for k in r["models"] if k.startswith("maia ")]
+    w(table(["model", "parameters", "test, mixed", "minus linear logit", "minus stack"],
+            [[k, r["models"][k].get("params", ""), f(r["models"][k]["test"]), f(r["models"][k]["minus_linear"]),
+              f(r["models"][k]["minus_stack"])] for k in order if k in r["models"]]))
+    if r["ablation"]:
+        w("\nAblation: the stack retrained without one group of features. The rise in test log loss is what the "
+          "group earns; the cost is what it takes to compute per position, which the repertoire builder pays at "
+          "every node.\n\n")
+        w(table(["without", "features dropped", "cost per position", "test", "rise"],
+                [[g, ", ".join(f"`{c}`" for c in v["dropped"]), v["cost"], f(v["test"]), f(v["rise"])]
+                 for g, v in r["ablation"].items()]))
+    for feat, tabs in r["effective_weight"].items():
+        w(f"\n**Effective weight on `{feat}`**: the derivative of a move's score with respect to the raw feature, "
+          f"averaged over the moves of the positions in each group (stack, with a bootstrap interval over test "
+          f"tournaments for the model as fitted), the interaction logit's coefficient at the same contexts, and "
+          f"the linear logit's constant.\n\n")
+        for by, rows_ in tabs.items():
+            w(table([("minutes left" if by == "clock" else "mover's rating"), "rows", "stack", "interaction logit",
+                     "linear logit"],
+                    [[x["group"], x["rows"], f(x["stack"], 2), f(x["interactions"], 2), f"{x['linear']:.2f}"]
+                     for x in rows_]) + "\n")
+    w("\n")
+
+
 def sec_value(w, r, figdir, rel):
     w("## The value head\n\n")
     if not r:
@@ -581,7 +620,7 @@ def main(argv=None) -> None:
     p.add_argument("--out", type=Path, default=REPORTS / "step1.md")
     p.add_argument("--note", help="a paragraph put at the top (e.g. that this is a rehearsal)")
     a = p.parse_args(argv)
-    names = ["logloss", "sweep", "mistakes", "logit", "breakdown", "book", "theory", "value", "reference"]
+    names = ["logloss", "sweep", "mistakes", "logit", "stack", "breakdown", "book", "theory", "value", "reference"]
     R = {n: load(a.results, n) for n in names}
     rel = Path(a.results).resolve().relative_to(Path(a.out).resolve().parent) \
         if Path(a.results).resolve().is_relative_to(Path(a.out).resolve().parent) else Path(a.results).resolve()
@@ -600,6 +639,7 @@ def main(argv=None) -> None:
     sec_book(w, R["book"], a.results, rel)
     sec_theory(w, R["theory"], a.results, rel)
     sec_logit(w, R["logit"])
+    sec_stack(w, R["stack"])
     sec_value(w, R["value"], a.results, rel)
     sec_reference(w, R["reference"])
     provenance_section(w, R)

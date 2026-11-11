@@ -103,6 +103,8 @@ class Data:
     w: np.ndarray
     clusters: np.ndarray
     single_lp: dict[str, np.ndarray]   # per logp source: log p of the played move
+    rows: np.ndarray | None = None     # index into the sample of each kept row
+    moves: pl.Series | None = None     # the move list of each kept row (from the first source)
 
     @property
     def r(self) -> Ragged:
@@ -110,7 +112,14 @@ class Data:
 
     def subset(self, cols: list[str]) -> "Data":
         idx = [self.names.index(c) for c in cols]
-        return Data(cols, self.X[:, idx], self.offsets, self.y, self.n, self.w, self.clusters, self.single_lp)
+        return Data(cols, self.X[:, idx], self.offsets, self.y, self.n, self.w, self.clusters, self.single_lp,
+                    self.rows, self.moves)
+
+    def with_columns(self, cols: dict[str, np.ndarray]) -> "Data":
+        names = self.names + list(cols)
+        X = np.column_stack([self.X] + [cols[c] for c in cols]) if cols else self.X
+        return Data(names, X, self.offsets, self.y, self.n, self.w, self.clusters, self.single_lp, self.rows,
+                    self.moves)
 
 
 def build(sample: pl.DataFrame, logp: dict[str, Path], engines: dict[str, Path]) -> tuple[Data, dict]:
@@ -148,7 +157,8 @@ def build(sample: pl.DataFrame, logp: dict[str, Path], engines: dict[str, Path])
     X = np.column_stack([cols[c][move_keep] for c in names])
     data = Data(names, X, offsets, offsets[:-1] + idx[keep], lens.astype(np.float64),
                 sample.get_column("weight").to_numpy()[keep], cluster_codes(sample.filter(pl.Series(keep))),
-                {k: v[keep] for k, v in single.items()})
+                {k: v[keep] for k, v in single.items()}, np.flatnonzero(keep),
+                first.get_column("moves").filter(pl.Series(keep)))
     info["rows"] = int(sample.height)
     info["rows_dropped_no_engine_value"] = int(drop.sum())
     return data, info
