@@ -22,6 +22,8 @@ override with `TNH_DATA`). It can all be regenerated from the sources.
 ```
 raw/<source>/...                  downloads, exactly as fetched
 corpus/games.parquet
+corpus/games_extra.parquet        per-source detail behind the parsing decisions; not an input to anything downstream
+corpus/parse_stats.json           what was dropped and why
 corpus/positions.parquet
 features/<model>/<variant>/*.parquet
 reports/*.md
@@ -29,15 +31,19 @@ reports/*.md
 
 ## `corpus/games.parquet`
 
-One row per game, every tempo, every rating. Filtering happens later.
+One row per game: standard chess between humans over the board, every tempo,
+every rating. Variants, non-standard starting positions, engine games, simuls
+and online events are dropped at parse time, as are games without a result,
+without moves or with an illegal move. `parse_stats.json` counts each reason.
+Filtering on tempo and rating happens later.
 
 | column | type | meaning |
 |---|---|---|
-| `game_id` | str | 16 hex chars of sha1 over source, players, date and moves. Stable across rebuilds |
+| `game_id` | str | 16 hex chars of sha1 over the de-duplication key: both surnames, the year and the moves. The source is not part of it, so the id is the same whichever copy of a game is kept |
 | `source` | str | `lichess_broadcast`, `twic`, ... |
 | `tournament_id` | str | The unit the split is made on. One id per event, not per round |
 | `event`, `site`, `round` | str | PGN tags, verbatim |
-| `date` | date, nullable | Null when the PGN date is partial |
+| `date` | date, nullable | The `Date` tag, else `UTCDate`. Null when partial |
 | `year` | int, nullable | |
 | `white`, `black` | str | |
 | `white_elo`, `black_elo` | int, nullable | As given in the PGN |
@@ -46,8 +52,8 @@ One row per game, every tempo, every rating. Filtering happens later.
 | `result` | str | `1-0`, `0-1`, `1/2-1/2`. Games with any other result are dropped |
 | `time_control_raw` | str, nullable | The `TimeControl` tag, verbatim |
 | `tempo` | str | `classical`, `rapid`, `blitz`, `unknown` |
-| `tempo_source` | str | How `tempo` was decided: `tag`, `clock`, `event_name`, `none` |
-| `base_s`, `inc_s` | int, nullable | Base time and increment of the first time-control period |
+| `tempo_source` | str | How `tempo` was decided: `tag`, `clock`, `round`, `event_name`, `assumed`, `none` |
+| `base_s`, `inc_s` | int, nullable | Base time and increment of the first time-control period. Estimates when `tempo_source` is `clock` |
 | `has_clock` | bool | True when at least 80 % of the moves carry `%clk` |
 | `n_plies` | int | |
 | `moves_uci` | str | The whole game, space-separated UCI |
@@ -58,8 +64,22 @@ Tempo follows FIDE: 60 minutes or more per player for a 60-move game
 (`base_s + 60 * inc_s >= 3600`) is classical, more than 10 minutes is rapid,
 the rest is blitz.
 
+How `tempo` is decided, in order. The first that applies wins.
+
+1. `clock`: the clock readings, where they contradict the tag or the tag is
+   missing or unreadable.
+2. `tag`: the `TimeControl` tag.
+3. `round`: every other game with a known tempo in the same broadcast round
+   has the same tempo.
+4. `event_name`: the words rapid, blitz and the like in the event name.
+5. `assumed`: the source's default. TWIC carries no time control and no
+   clocks; a TWIC game with no sign of rapid or blitz is taken as classical.
+   Anything measured on classical games must be able to leave these out.
+6. `none`: `tempo` is `unknown`.
+
 The same game arriving from two sources is stored once. The copy with clock
-times wins.
+times wins, then the copy with more tags filled in. Two copies of one game
+put their tournaments in the same split.
 
 ## `corpus/positions.parquet`
 
@@ -75,10 +95,10 @@ which is move 40).
 | `played_uci` | str | The move that was played |
 | `white_to_move` | bool | |
 | `mover_elo`, `opp_elo` | int | |
-| `clock_mover_s`, `clock_opp_s` | int, nullable | Before the move |
-| `move_time_s` | int, nullable | Time spent on this move. Never a model input |
+| `clock_mover_s`, `clock_opp_s` | int, nullable | Before the move. Null before a side's first move: many DGT clocks add the increment before move 1, so the base time is not the reading |
+| `move_time_s` | int, nullable | Time spent on this move. Null where it cannot be computed, including where it comes out below -2 s (an unknown bonus at a time control). Never a model input |
 | `pos_key` | str | Board, side to move, castling rights and en passant square. No move counters |
-| `pos_count` | int | Number of games in `games.parquet` with both ratings at least 1800 that reach `pos_key`, any tempo |
+| `pos_count` | int | Number of games in `games.parquet` with both ratings at least 1800 that reach `pos_key`, any tempo, any split. 0 when only games with a lower-rated player reach it |
 | `n_legal` | int | |
 | `result_mover` | float | 1, 0.5 or 0 from the mover's side |
 | `split` | str | Copied from the game |
@@ -93,15 +113,23 @@ so that the thresholds can be changed without a rebuild. `tnh.data.window`
 holds one function:
 
 ```python
-def in_window(positions, *, book_count=5, max_ply=60, min_clock_s=600) -> polars.Expr
+def in_window(positions, *, book_count=5, max_ply=60, max_ply_no_clock=40, min_clock_s=600) -> polars.Expr
 ```
+
+Apply it before any other row filter. The out-of-book point is computed per
+game over all of the game's rows.
 
 - **Out of book.** A game is out of book from the first ply where
   `pos_count < book_count`. The row at that ply is the first one that counts.
   The move that led there is excluded, since it is rare by construction.
 - **Not too late.** `ply < max_ply`.
 - **Not in time trouble.** Where the clock is known, `clock_mover_s >=
-  min_clock_s`. Rows without a clock rely on `max_ply` alone.
+  min_clock_s`. Rows without a clock must have `ply < max_ply_no_clock`.
+
+`max_ply_no_clock` is 40 because of what step 0 measured on classical games
+between players rated 1800 to 2500: 1.7 % of the moves at plies 30-39 are
+made with under ten minutes left, 9.3 % at plies 40-49 and 25.1 % at plies
+50-59.
 
 ## Model interface
 
