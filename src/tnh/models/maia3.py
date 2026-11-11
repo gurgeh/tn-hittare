@@ -192,10 +192,8 @@ class Maia3:
     def predict_logp(self, queries: list[Query]) -> list[LogPrediction]:
         """Like `predict`, with log probabilities and the legal mass kept.
 
-        Batches are encoded on this thread and run on the GPU on another, so encoding
-        the next batch overlaps the network. A plain asynchronous launch does not
-        overlap: the reference forward indexes with Python lists, which copies from
-        pageable memory and waits for the GPU.
+        Batches are encoded (python-chess, CPU) on this thread and run on the GPU on a
+        worker thread, so encoding the next batch overlaps the network.
         """
         out: list[LogPrediction] = []
         pending: list[Future] = []
