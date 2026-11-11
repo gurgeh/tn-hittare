@@ -68,12 +68,19 @@ def read_meta(d: Path) -> dict:
     return json.loads(p.read_text()) if p.exists() else {}
 
 
-def load_features(d: Path, columns: list[str] | None = None) -> pl.DataFrame:
+def load_features(d: Path, columns: list[str] | None = None, keys: pl.DataFrame | None = None) -> pl.DataFrame:
+    """The feature rows of ``d``; with ``keys`` (game_id, ply) only those rows, filtered part by part, so that
+    memory follows the sample, not the feature directory (which holds every sample's rows)."""
     parts = sorted(Path(d).glob("part-*.parquet"))
     if not parts:
         raise FeatureMismatch(f"no part-*.parquet in {d}")
-    df = pl.concat([pl.read_parquet(p, columns=columns) for p in parts], how="vertical_relaxed")
-    df = df.with_columns(pl.col("ply").cast(pl.Int64))
+    out = []
+    for p in parts:
+        f = pl.read_parquet(p, columns=columns).with_columns(pl.col("ply").cast(pl.Int64))
+        if keys is not None:
+            f = f.join(keys, on=KEY, how="semi")
+        out.append(f)
+    df = pl.concat(out, how="vertical_relaxed")
     n_dup = df.height - df.select(pl.struct(KEY).n_unique()).item()
     if n_dup:
         raise FeatureMismatch(f"{d}: {n_dup} duplicate (game_id, ply) rows")
@@ -84,7 +91,7 @@ def attach(sample: pl.DataFrame, d: Path, columns: list[str]) -> pl.DataFrame:
     """The feature rows of ``d`` for every sample row, in the sample's order, with ``_idx``,
     the index of the played move in ``moves``. Raises if any sample row is not covered or
     the played move is not among the moves."""
-    feats = load_features(d, KEY + ["moves"] + columns)
+    feats = load_features(d, KEY + ["moves"] + columns, sample.select(KEY))
     j = sample.select(KEY + ["played_uci", "n_legal"]).join(feats, on=KEY, how="left", maintain_order="left")
     n_missing = j.get_column("moves").null_count()
     if n_missing:
