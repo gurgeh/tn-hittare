@@ -13,7 +13,9 @@ Writes ``corpus/samples/<name>.parquet`` in the positions schema, plus these col
 - ``weight``: population rows per sampled row in the row's stratum (part x bucket),
   so a weighted mean over the sample estimates the mean over the population.
 
-And ``<name>.json``: the options, the population and sample size of each stratum.
+And ``<name>.json``: the options, the population and sample size of each stratum;
+and ``<name>.window.parquet``, the window rows alone, for feature runs that only
+the window analyses need (the Elo sweep, the engines).
 
 The population, in order (``in_window`` is evaluated on all of a game's rows
 before anything else is dropped, as DESIGN.md requires):
@@ -163,6 +165,7 @@ def main(argv=None) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"{a.name}.parquet"
     s.write_parquet(out)
+    s.filter(pl.col("in_window")).write_parquet(out_dir / f"{a.name}.window.parquet")
     meta = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(a).items()}
     meta.update({"games_file": str(games_path), "rows": s.height, "games": s.get_column("game_id").n_unique(),
                  "tournaments": s.get_column("tournament_id").n_unique(), "strata": strata})

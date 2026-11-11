@@ -23,7 +23,7 @@ def positions(n_rows: int, rng: np.random.Generator, *, n_tournaments: int = 20,
               min_moves: int = 5, max_moves: int = 30, elo=(1800, 2500)) -> tuple[pl.DataFrame, list[list[str]]]:
     """A sample-shaped frame and each row's move names (m0, m1, ...)."""
     n_moves = rng.integers(min_moves, max_moves + 1, n_rows)
-    gids = [f"{split[0]}{i // 10:015x}" for i in range(n_rows)]
+    gids = [f"{ {"test": "e", "train": "a"}.get(split, "c")}{i // 10:015x}" for i in range(n_rows)]
     df = pl.DataFrame({
         "game_id": gids,
         "ply": [20 + i % 10 for i in range(n_rows)],
@@ -41,7 +41,7 @@ def positions(n_rows: int, rng: np.random.Generator, *, n_tournaments: int = 20,
 
 
 def write_features(d: Path, df: pl.DataFrame, moves: list[list[str]], cols: dict[str, list], meta: dict | None = None,
-                   wdl: list | None = None) -> Path:
+                   wdl: list | None = None, part: int = 0) -> Path:
     d.mkdir(parents=True, exist_ok=True)
     data = {"game_id": pa.array(df.get_column("game_id").to_list()), "ply": pa.array(df.get_column("ply").to_list(), pa.int64()),
             "moves": pa.array(moves, pa.list_(pa.string()))}
@@ -50,7 +50,7 @@ def write_features(d: Path, df: pl.DataFrame, moves: list[list[str]], cols: dict
         data[k] = pa.array([np.asarray(x).tolist() for x in v], pa.list_(t))
     if wdl is not None:
         data["wdl"] = pa.array([list(map(float, x)) for x in wdl], pa.list_(pa.float32()))
-    pq.write_table(pa.table(data), d / "part-00000.parquet")
+    pq.write_table(pa.table(data), d / f"part-{part:05d}.parquet")
     (d / "meta.json").write_text(json.dumps(meta or {"model": "synth", "variant": d.name}))
     return d
 

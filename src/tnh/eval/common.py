@@ -95,7 +95,7 @@ def attach(sample: pl.DataFrame, d: Path, columns: list[str]) -> pl.DataFrame:
     if bad:
         raise FeatureMismatch(f"{d}: {bad} rows where len(moves) != n_legal")
     for c in columns:
-        if j.schema[c] == pl.List:
+        if c != "wdl" and j.schema[c] == pl.List:
             k = (j.get_column(c).list.len() != n_moves).sum()
             if k:
                 raise FeatureMismatch(f"{d}: {k} rows where len({c}) != len(moves)")
