@@ -39,25 +39,37 @@ def test_movetext_clocks_variations_and_annotations():
         "2. Nf3?! { [%eval 0.1] } { Inaccuracy. } { [%clk 1:29:00] } (2. f4 exf4 { [%clk 0:00:01] }) "
         "2... Nc6 3. Bb5 { [%clk 1:28:00.5] } 1-0"
     )
-    ucis, clocks, token = parse_movetext(mt)
+    ucis, clocks, token, cut = parse_movetext(mt)
     assert ucis == ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5"]
     assert clocks == [5443, 5442, 5340, None, 5280]
-    assert token == "1-0"
+    assert token == "1-0" and not cut
 
 
 def test_movetext_illegal_move_raises():
     with pytest.raises(GameError) as e:
-        parse_movetext("1. e4 e5 2. Ke3 Nc6 1-0")
+        parse_movetext("1. e4 e5 2. Nf6 Nc6 1-0")
     assert e.value.reason == "illegal_move"
+    # an illegal king move with two more moves after it is not the kings-to-the-centre ending
+    with pytest.raises(GameError):
+        parse_movetext("1. e4 e5 2. Ke3 Nc6 3. d4 1-0")
+
+
+def test_final_illegal_king_move_cuts_the_game():
+    # the arbiter puts both kings in the centre: Ke4 (illegal) and Ke5 follow the last real move
+    ucis, clocks, token, cut = parse_movetext("1. e4 { [%clk 1:30:00] } e5 2. Nf3 Nc6 3. Ke4 { [%clk 1:00:00] } Ke5 1-0")
+    assert ucis == ["e2e4", "e7e5", "g1f3", "b8c6"] and cut and token == "1-0"
+    assert clocks == [5400, None, None, None]
+    ucis, _, _, cut = parse_movetext("1. e4 e5 2. Nf3 Nc6 3. Ke4 1/2-1/2")
+    assert len(ucis) == 4 and cut
 
 
 def test_drops_are_counted(parsed):
     _, drops, games, _, n_dup = parsed
     assert drops["variant"] == 1
-    assert drops["illegal_move"] == 1
+    assert drops["illegal_move"] == 1  # "Nf6" in game g0000012
     assert drops["result_not_final"] == 1
     assert n_dup == 1
-    assert len(games) == 7
+    assert len(games) == 8  # g0000009 is kept, cut before its final "Ke3"
 
 
 def test_dedup_keeps_the_copy_with_clocks(parsed):
@@ -137,3 +149,10 @@ def test_game_id_is_the_dedup_key_without_source(parsed):
     g = by_url(games, extra, "g0000007")
     assert g["game_id"] == dedup_key("Beta, Bo", "Theta, Tor", 2025, g["moves_uci"])
     assert g["game_id"] == dedup_key("Beta,B", "Theta,T", 2025, g["moves_uci"])
+
+
+def test_kings_to_the_centre_game_is_kept_and_marked(parsed):
+    _, _, games, extra, _ = parsed
+    g = by_url(games, extra, "g0000009")
+    assert g["moves_uci"] == "e2e4 e7e5" and g["result"] == "1-0"
+    assert extra.filter(extra["game_url"].str.ends_with("g0000009"))["cut_king_ending"][0] is True

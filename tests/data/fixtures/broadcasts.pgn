@@ -168,3 +168,17 @@
 [GameURL "https://lichess.org/broadcast/test-open-2025--open/round-1/AAAAAAAA/g0000011"]
 
 1. c4 c5 2. g3 g6 0-1
+
+[Event "Broken Relay"]
+[Site "?"]
+[Date "2025.07.01"]
+[Round "2"]
+[White "Rho, Rolf"]
+[Black "Sigma, Sam"]
+[Result "0-1"]
+[Variant "Standard"]
+[BroadcastName "Broken Relay"]
+[BroadcastURL "https://lichess.org/broadcast/broken-relay/round-2/KKKKKKKK"]
+[GameURL "https://lichess.org/broadcast/broken-relay/round-2/KKKKKKKK/g0000012"]
+
+1. e4 e5 2. Nf6 Nc6 3. d4 0-1

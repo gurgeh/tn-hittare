@@ -97,22 +97,35 @@ class GameError(Exception):
         self.reason = reason
 
 
-def parse_movetext(movetext: str, board: chess.Board | None = None) -> tuple[list[str], list[int | None], str | None]:
-    """Mainline moves as UCI, the clock after each ply, and the result token.
+def _is_san_token(tok: str) -> bool:
+    return bool(tok) and tok[0] not in "{();$" and tok not in ("1-0", "0-1", "1/2-1/2", "*") \
+        and bool(ANNOT_RE.sub("", MOVENUM_RE.sub("", tok)))
+
+
+def parse_movetext(
+    movetext: str, board: chess.Board | None = None
+) -> tuple[list[str], list[int | None], str | None, bool]:
+    """Mainline moves as UCI, the clock after each ply, the result token, and whether the game was cut.
 
     Variations are skipped. A comment belongs to the ply before it; the first
     ``%clk`` in the comments after a ply is that ply's clock. Raises
-    ``GameError`` on an illegal, ambiguous or unreadable move.
+    ``GameError`` on an illegal, ambiguous or unreadable move, with one
+    exception: an illegal king move followed by at most one more move ends
+    the game there (``cut`` is True). That is the DGT board after the game,
+    when the arbiter puts both kings in the centre to signal the result; the
+    game before it is complete and its result is right.
     """
     board = board or chess.Board()
     ucis: list[str] = []
     clocks: list[int | None] = []
     result_token = None
     depth = 0
-    for tok in TOKEN_RE.findall(movetext):
+    cut = False
+    tokens = TOKEN_RE.findall(movetext)
+    for t_i, tok in enumerate(tokens):
         c = tok[0]
         if c == "{":
-            if depth == 0 and ucis and clocks[-1] is None:
+            if depth == 0 and ucis and clocks[-1] is None and not cut:
                 clocks[-1] = parse_clock(tok)
             continue
         if c == "(":
@@ -128,6 +141,8 @@ def parse_movetext(movetext: str, board: chess.Board | None = None) -> tuple[lis
         if tok in ("1-0", "0-1", "1/2-1/2", "*"):
             result_token = tok
             continue
+        if cut:
+            continue
         san = ANNOT_RE.sub("", MOVENUM_RE.sub("", tok))
         if not san:
             continue
@@ -136,6 +151,10 @@ def parse_movetext(movetext: str, board: chess.Board | None = None) -> tuple[lis
         try:
             move = board.parse_san(san)
         except chess.IllegalMoveError as e:
+            rest = sum(_is_san_token(x) for x in _depth0(tokens[t_i + 1:]))
+            if san.startswith("K") and rest <= 1 and ucis:
+                cut = True
+                continue
             raise GameError("illegal_move", str(e)) from None
         except chess.AmbiguousMoveError as e:
             raise GameError("ambiguous_move", str(e)) from None
@@ -146,7 +165,20 @@ def parse_movetext(movetext: str, board: chess.Board | None = None) -> tuple[lis
         board.push(move)
     if depth:
         raise GameError("malformed_movetext", "unclosed (")
-    return ucis, clocks, result_token
+    return ucis, clocks, result_token, cut
+
+
+def _depth0(tokens: list[str]) -> list[str]:
+    """The tokens outside variations."""
+    out, depth = [], 0
+    for t in tokens:
+        if t == "(":
+            depth += 1
+        elif t == ")":
+            depth -= 1
+        elif depth == 0:
+            out.append(t)
+    return out
 
 
 def surname(name: str) -> str:
@@ -234,7 +266,7 @@ def parse_game(text: str, source: Source) -> dict:
         raise GameError("result_not_final" if result == "*" else "result_other", result)
 
     board = chess.Board()
-    ucis, clocks, token = parse_movetext(movetext, board)
+    ucis, clocks, token, cut = parse_movetext(movetext, board)
     if not ucis:
         raise GameError("no_moves")
     if token is not None and token != result:
@@ -285,6 +317,7 @@ def parse_game(text: str, source: Source) -> dict:
         "_game_url": h.get("GameURL") or h.get("BroadcastURL"),
         "_result_token_missing": token is None,
         "_round_key": source.round_key(h),
+        "_cut_king_ending": cut,
     }
     row["_n_tags"] = sum(row[c] is not None for c in TAG_COLUMNS)
     return row
@@ -335,6 +368,7 @@ ROW_SCHEMA = {
     "_game_url": pl.String,
     "_result_token_missing": pl.Boolean,
     "_round_key": pl.String,
+    "_cut_king_ending": pl.Boolean,
     "_n_tags": pl.Int32,
     "_file": pl.String,
 }
@@ -464,6 +498,7 @@ def assemble(df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame, int]:
         pl.col("_n_copies").alias("n_copies"),
         pl.col("_copy_sources").alias("copy_sources"),
         pl.col("_result_token_missing").alias("result_token_missing"),
+        pl.col("_cut_king_ending").alias("cut_king_ending"),
     )
     return games, extra, n_dup, info
 
@@ -564,6 +599,9 @@ def build(sources: list[str], workers: int, limit_files: int | None) -> None:
         "drop_examples": examples,
         "tournaments": games["tournament_id"].n_unique(),
         "games_before_dedup": before.to_dicts(),
+        # kept, not dropped: cut before an illegal king move at the end (both kings to the centre)
+        "cut_illegal_king_ending": dict(extra.join(games.select("game_id", "source"), on="game_id")
+                                        .filter(pl.col("cut_king_ending")).group_by("source").len().iter_rows()),
         **info,
         "seconds": round(time.time() - t0),
     }
