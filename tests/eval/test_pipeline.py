@@ -9,7 +9,7 @@ import json
 import numpy as np
 import polars as pl
 
-from tnh.eval import breakdown, logit, logloss, mistakes, report, sweep, value
+from tnh.eval import book, breakdown, logit, logloss, mistakes, report, sweep, theory, value
 
 from _synth import positions, softmax_rows, write_features
 
@@ -27,7 +27,13 @@ def make(tmp, split, n, rng, offset_true=100):
     df = df.with_columns(
         pl.Series("played_uci", [m[i] for m, i in zip(moves, idx)]),
         pl.Series("clock_mover_s", rng.integers(30, 5400, n)),
-        pl.lit(True).alias("out_of_book"),
+        pl.Series("out_of_book", rng.random(n) < 0.8),
+        pl.Series("pos_count", rng.choice([0, 1, 3, 10, 50, 500, 5000], n)),
+        pl.Series("exit_ply_5", rng.integers(5, 21, n)),
+        pl.Series("ply_band", rng.choice(["0-7", "12-15", "24-29"], n)),
+        pl.Series("pos_count_band", rng.choice(["1", "5-19", "1000+"], n)),
+        pl.Series("rating_group", rng.choice(["1800-2149", "2150-2500"], n)),
+        pl.lit("window").alias("part"),
         pl.Series("result_mover", res),
     )
     # some rows outside the window, as a real sample has
@@ -76,11 +82,21 @@ def test_all_commands_and_the_report(tmp_path):
     # the logit on m0 alone would recover the temperature 1.25; here A is mbest, which is exact: beta ~ 1
     assert abs(lg["sets"]["A"]["beta"][0] - 1.0) < 0.15
     breakdown.main(["--model", M[2]] + C)
+    book.main(["--variants", *M, "--shallow", str(feats / "sf/nodes10"), "--deep", str(feats / "sf/nodes100"),
+               "--min-rows", "20"] + C)
+    bk = json.loads((R / "book.json").read_text())
+    # moves are drawn from offset +100 everywhere, so every well-filled cell matches about +100
+    allc = [c for c in bk["cells"] if c["band"] == "all window rows" and "offset" in c and c["rows"] > 300]
+    assert allc and all(abs(c["offset"]["est"] - 100) < 60 for c in allc)
+    theory.main(["analyse", "--variants", *M, "--sample", str(test), "--results", str(R), "--boot", "30",
+                 "--min-rows", "50"])
+    th = json.loads((R / "theory.json").read_text())
+    assert all(abs(c["best"]["est"] - 100) < 80 for c in th["cells"] if "best" in c and c["rows"] > 300)
     value.main(["--model", M[1], str(feats / "sf/nodes100")] + C)
     out = tmp_path / "step1.md"
     report.main(["--results", str(R), "--out", str(out), "--note", "synthetic"])
     text = out.read_text()
     for h in ("## The Elo sweep", "## Is classical play a rating-shifted blitz?", "## The conditional logit",
-              "## The value head", "## Breakdowns"):
+              "## The value head", "## Breakdowns", "### Play just out of book", "## Where theory ends"):
         assert h in text
-    assert (R / "sweep.png").exists() and (R / "mistakes.png").exists()
+    assert (R / "sweep.png").exists() and (R / "mistakes.png").exists() and (R / "theory.png").exists()

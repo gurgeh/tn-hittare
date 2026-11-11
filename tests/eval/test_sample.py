@@ -25,7 +25,7 @@ def corpus(rng, n_games=400):
 
 
 def args(**kw):
-    a = dict(split="test", n=700, extra_frac=0.25, extra_min_ply=20, elo_min=1800, elo_max=2500, seed=1,
+    a = dict(split="test", n=700, extra_frac=0.25, exit_counts=[2, 5, 20, 100], extra_min_ply=20, elo_min=1800, elo_max=2500, seed=1,
              book_count=5, max_ply=60, max_ply_no_clock=40, min_clock_s=600)
     a.update(kw)
     return SimpleNamespace(**a)
@@ -82,3 +82,37 @@ def test_allocate_water_fills():
     assert allocate({1: 5, 2: 5}, 100) == {1: 5, 2: 5}
     a = allocate({1: 50, 2: 50, 3: 50}, 100)
     assert sum(a.values()) == 100 and max(a.values()) - min(a.values()) <= 1
+
+
+def test_exit_plies():
+    rng = np.random.default_rng(4)
+    pos, games = corpus(rng)
+    s, _ = draw(population(pos, games, args()), args())
+    # pos_count = 100 - 10 * ply, floored at 0: the first ply below k
+    for k, ply in ((2, 10), (5, 10), (20, 9), (100, 1)):
+        assert (s.get_column(f"exit_ply_{k}") == ply).all()
+
+
+def test_theory_sample_is_stratified_on_ply_and_pos_count():
+    from tnh.eval import theory
+    rng = np.random.default_rng(5)
+    pos, games = corpus(rng)
+    a = SimpleNamespace(splits=["train", "test"], ply_bands=["0-7", "8-11", "12-15"], rating_groups=["1800-2149", "2150-2500"],
+                        elo_min=1800, elo_max=2500, per_cell=60, seed=1)
+    pop = theory.population(pos, games, a)
+    assert pop.get_column("ply").max() == 15
+    s, strata = theory.draw(pop, a)
+    s2, _ = theory.draw(pop.sample(fraction=1.0, shuffle=True, seed=2), a)
+    assert s.equals(s2)
+    per_cell = s.group_by("ply_band", "pos_count_band").len()
+    for (pb, pc, n) in per_cell.iter_rows():
+        avail = pop.filter((pl.col("ply_band") == pb) & (pl.col("pos_count_band") == pc)).height
+        assert n == min(60, avail)
+    # pos_count = 100 - 10 * ply: ply 0 is 100-999, ply 10+ is 0
+    assert set(s.filter(pl.col("ply") == 0).get_column("pos_count_band")) == {"100-999"}
+    assert set(s.filter(pl.col("ply") >= 10).get_column("pos_count_band")) == {"0"}
+    for st in strata:
+        rows = s.filter((pl.col("ply_band") == st["ply_band"]) & (pl.col("pos_count_band") == st["pos_count_band"])
+                        & (pl.col("rating_group") == st["rating_group"]))
+        assert rows.height == st["sampled"]
+        assert np.allclose(rows.get_column("weight").to_numpy(), st["population"] / st["sampled"])

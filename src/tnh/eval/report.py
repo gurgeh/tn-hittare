@@ -3,7 +3,7 @@
     uv run python -m tnh.eval.report [--results reports/step1] [--out reports/step1.md] [--note TEXT]
 
 Reads the json files the analysis commands wrote into ``--results``
-(``logloss``, ``sweep``, ``mistakes``, ``logit``, ``breakdown``, ``value``,
+(``logloss``, ``sweep``, ``mistakes``, ``logit``, ``breakdown``, ``book``, ``theory``, ``value``,
 ``reference``; any that is missing is said to be missing), draws the figures
 into the same directory, and writes the markdown. Every table says which sample
 and which feature variant its numbers came from. Nothing is computed here that
@@ -330,6 +330,105 @@ def sec_breakdown(w, r, figdir, rel):
     w(f"\n![Log loss by clock]({rel}/clock.png)\n\n")
 
 
+def _off(c):
+    o = c["offset"]
+    return f"{o['est']:+.0f} [{o['lo']:+.0f}, {o['hi']:+.0f}]" + (" edge" if o["at_edge"] else "")
+
+
+def sec_book(w, r, figdir, rel):
+    w("### Play just out of book\n\n")
+    if not r:
+        w("_No `book.json`._\n\n"); return
+    t = r["thresholds"]
+    w(f"Window rows of the test sample by plies since the game left book (`book_count = {r['book_count']}`), "
+      f"within ply bands so that rows at the same stage of the game are compared. {r['rows']} rows; dropped "
+      f"{r['dropped_missing_value']} with a move without an engine value and {r['dropped_decided']} decided. "
+      f"**deep loss**: mean expected-score loss of the played move at `{r['deep']}`; **mistakes**, **visible**, "
+      f"**deep only**: share of played moves in those classes (sound: deep loss <= {t['sound']}; visible: also a "
+      f"loss > {t['visible']} at `{r['shallow']}`); **obs/Maia**: mistakes, and mean loss, divided by what Maia-3 "
+      f"at {r['ref_offset']:+g} expects (Maia-3 memorised openings too, so this does not take out all of a "
+      f"position's ease); **offset**: the Maia-3 offset with the lowest log loss in the cell. Cells with fewer than "
+      f"{r['min_rows']} rows show only the count. If play just out of book is still better, the first columns are "
+      f"lower in the exit and +1 rows than in the later rows of the same band.\n\n")
+    hdr = ["plies", "since exit", "rows", "deep loss", "mistakes", "visible", "deep only", "obs/Maia",
+           "loss obs/Maia", "offset", "log loss", "top-1"]
+    rows = []
+    for c in r["cells"]:
+        if "offset" not in c:
+            rows.append([c["band"], c["group"], c["rows"]] + [""] * (len(hdr) - 3))
+            continue
+        mist = {"est": 1 - c["sound"]["est"], "lo": 1 - c["sound"]["hi"], "hi": 1 - c["sound"]["lo"]}
+        rows.append([c["band"], c["group"], c["rows"], f(c["deep_loss"], 4), f(mist, 3),
+                     f"{c['visible']['est']:.3f}", f"{c['deep_only']['est']:.3f}", f(c["ratio_mistake"], 2),
+                     f(c["ratio_loss"], 2), _off(c), f"{c['logloss']['est']:.3f}", f"{c['top1']['est']:.3f}"])
+    w(table(hdr, rows) + "\n")
+
+
+def sec_theory(w, r, figdir, rel):
+    w("## Where theory ends\n\n")
+    if not r:
+        w("_No `theory.json`._\n\n"); return
+    m = r["sample_meta"] or {}
+    w(f"A separate test on its own sample (`{r['sample']}`): Maia-3 alone, no Stockfish, no window rule. Rows "
+      f"from classical games with clocks, both players {m.get('elo_min')}-{m.get('elo_max')}, `tempo_source` not "
+      f"`assumed`, splits {m.get('splits')}, stratified on ply band x `pos_count` band x rating group with up to "
+      f"{m.get('per_cell')} rows per ply x `pos_count` cell; {r['rows']} rows, {r['tournaments']} tournaments. "
+      f"Per cell: the offset with the lowest raw log loss (variants {', '.join('`' + v + '`' for v in r['variants'])}"
+      f"; parabola vertex, bootstrap interval over tournaments) and the log loss there. Cells with fewer than "
+      f"{r['min_rows']} rows show only their count.\n\n"
+      "Reading it: within one ply band (a row), if the best offset rises with `pos_count`, people play above their "
+      "strength in the positions that are known. Theory ends at the count where the best offset has come down to "
+      "its value in the rare positions of the same band. Two caveats: `pos_count` counts games between players "
+      "rated 1800 and up in the whole corpus, grandmasters included, and the game itself (1 means no other game), "
+      "so it measures what is known to someone, not at the mover's level; and Maia-3 memorised openings from its "
+      "own training games, so in a common position the model is also better informed, whatever the player knows. "
+      "The pooled table mixes rating groups in proportions that differ from cell to cell, and the best offset "
+      "depends on rating, so read the per-rating tables where their cells are filled.\n\n")
+    pcs, plys = r["pos_count_bands"], r["ply_bands"]
+
+    def grid(cells, val):
+        cell = {(c["ply"], c["pos_count"]): c for c in cells}
+        out = []
+        for pb in plys:
+            row = [pb]
+            for pc in pcs:
+                c = cell.get((pb, pc))
+                row.append("" if c is None else (val(c) if "best" in c else f"({c['rows']})"))
+            out.append(row)
+        return out
+
+    w("**Best offset** [interval] (rows), rows ply band, columns `pos_count`:\n\n")
+    w(table(["ply \\ pos_count"] + pcs, grid(r["cells"], lambda c: f"{c['best']['est']:+.0f} [{c['best']['lo']:+.0f}, "
+                                                               f"{c['best']['hi']:+.0f}]{' edge' if c['best']['at_edge'] else ''} ({c['rows']})")))
+    w("\n**Log loss at the best offset** [interval]:\n\n")
+    w(table(["ply \\ pos_count"] + pcs, grid(r["cells"], lambda c: f(c["loss_at_best"], 3))))
+    for g, cells in r["by_rating"].items():
+        w(f"\n**Best offset, movers rated {g}**:\n\n")
+        w(table(["ply \\ pos_count"] + pcs, grid(cells, lambda c: f"{c['best']['est']:+.0f} [{c['best']['lo']:+.0f}, "
+                                                            f"{c['best']['hi']:+.0f}] ({c['rows']})")))
+    fig, ax = plt.subplots(figsize=(7.5, 4.5))
+    cols = blues(len(plys))
+    for col, pb in zip(cols, plys):
+        cs = [c for c in r["cells"] if c["ply"] == pb and "best" in c]
+        if not cs:
+            continue
+        xs = np.array([pcs.index(c["pos_count"]) for c in cs])
+        e = np.array([c["best"]["est"] for c in cs])
+        lo = np.array([c["best"]["lo"] for c in cs])
+        hi = np.array([c["best"]["hi"] for c in cs])
+        ax.errorbar(xs, e, yerr=[np.maximum(e - lo, 0), np.maximum(hi - e, 0)], fmt="o-", color=col, capsize=2,
+                    linewidth=2, markersize=5, label=f"plies {pb}")
+    ax.set_xticks(np.arange(len(pcs)), pcs)
+    ax.set_xlabel("pos_count (games reaching the position)"); ax.set_ylabel("best Maia-3 offset")
+    ax.set_title("The Elo the play matches, by stage and commonness", color=INK, fontsize=11)
+    ax.legend(fontsize=7, frameon=False, ncol=2)
+    style(ax)
+    fig.tight_layout()
+    fig.savefig(figdir / "theory.png", dpi=130)
+    plt.close(fig)
+    w(f"\n![Where theory ends]({rel}/theory.png)\n\n")
+
+
 def sec_logit(w, r):
     w("## The conditional logit\n\n")
     if not r:
@@ -456,7 +555,7 @@ def main(argv=None) -> None:
     p.add_argument("--out", type=Path, default=REPORTS / "step1.md")
     p.add_argument("--note", help="a paragraph put at the top (e.g. that this is a rehearsal)")
     a = p.parse_args(argv)
-    names = ["logloss", "sweep", "mistakes", "logit", "breakdown", "value", "reference"]
+    names = ["logloss", "sweep", "mistakes", "logit", "breakdown", "book", "theory", "value", "reference"]
     R = {n: load(a.results, n) for n in names}
     rel = Path(a.results).resolve().relative_to(Path(a.out).resolve().parent) \
         if Path(a.results).resolve().is_relative_to(Path(a.out).resolve().parent) else Path(a.results).resolve()
@@ -472,6 +571,8 @@ def main(argv=None) -> None:
     sec_sweep(w, R["sweep"], a.results, rel)
     sec_shift(w, R["mistakes"], R["logit"], a.results, rel)
     sec_breakdown(w, R["breakdown"], a.results, rel)
+    sec_book(w, R["book"], a.results, rel)
+    sec_theory(w, R["theory"], a.results, rel)
     sec_logit(w, R["logit"])
     sec_value(w, R["value"], a.results, rel)
     sec_reference(w, R["reference"])

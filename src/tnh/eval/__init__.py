@@ -10,6 +10,7 @@ In order:
     tnh.eval.mistakes    calibration by kind of mistake: is classical a rating-shifted blitz?
     tnh.eval.logit       the conditional logit over the legal moves
     tnh.eval.breakdown   log loss by ply and by time left
+    tnh.eval.book        log loss by how common the position is, and by plies since leaving book
     tnh.eval.value       the value head on the game results
     tnh.eval.blitz       fetch and build the Lichess blitz reference positions
     tnh.eval.reference   Maia-3 on blitz beside classical under one window

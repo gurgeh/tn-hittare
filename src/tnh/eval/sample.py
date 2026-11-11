@@ -9,6 +9,9 @@ Writes ``corpus/samples/<name>.parquet`` in the positions schema, plus these col
 - ``in_window``: ``tnh.data.window.in_window`` with its defaults (or the options given).
 - ``out_of_book``: the row is at or after the game's out-of-book ply.
 - ``part``: ``window`` for rows in the window, ``extra`` for rows outside it.
+- ``exit_ply_<k>`` for each ``k`` in ``--exit-counts`` (default: the window's ``book_count``):
+  the game's first ply with ``pos_count < k``, over all of its rows; null when the game
+  never gets there before the corpus's ``max_ply``. ``tnh.eval.book`` counts plies from it.
 - ``bucket``: the mover's rating, 100-point bucket (lower edge).
 - ``weight``: population rows per sampled row in the row's stratum (part x bucket),
   so a weighted mean over the sample estimates the mean over the population.
@@ -97,7 +100,10 @@ def population(positions: pl.LazyFrame, games: pl.DataFrame, a) -> pl.DataFrame:
     ).drop("split", "white_elo", "black_elo", "tempo", "has_clock")
     p = positions.join(g.lazy(), on="game_id", how="semi").collect().with_columns(pl.col("ply").cast(pl.Int64))
     first_rare = pl.when(pl.col("pos_count") < a.book_count).then(pl.col("ply")).min().over("game_id")
+    exits = [pl.when(pl.col("pos_count") < k).then(pl.col("ply")).min().over("game_id").alias(f"exit_ply_{k}")
+             for k in a.exit_counts]
     p = p.with_columns(
+        *exits,
         in_window(p, book_count=a.book_count, max_ply=a.max_ply, max_ply_no_clock=a.max_ply_no_clock,
                   min_clock_s=a.min_clock_s).alias("in_window"),
         (pl.col("ply") >= first_rare).fill_null(False).alias("out_of_book"),
@@ -138,6 +144,8 @@ def main(argv=None) -> None:
     p.add_argument("--n", type=int, required=True, help="window rows")
     p.add_argument("--extra-frac", type=float, default=0.25, help="extra (out-of-window) rows per window row")
     p.add_argument("--extra-min-ply", type=int, default=20)
+    p.add_argument("--exit-counts", type=int, nargs="+",
+                   help="book_count values whose exit ply is stored per row (default: --book-count)")
     p.add_argument("--elo-min", type=int, default=1800)
     p.add_argument("--elo-max", type=int, default=2500)
     p.add_argument("--seed", type=int, default=1)
@@ -150,6 +158,7 @@ def main(argv=None) -> None:
     g.add_argument("--max-ply-no-clock", type=int, default=40)
     g.add_argument("--min-clock-s", type=int, default=600)
     a = p.parse_args(argv)
+    a.exit_counts = a.exit_counts or [a.book_count]
     games_path = a.games or a.positions.parent / "games.parquet"
     out_dir = a.out_dir or a.positions.parent / "samples"
     if a.elo_min % BUCKET:
