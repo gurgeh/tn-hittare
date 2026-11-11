@@ -140,7 +140,7 @@ def _count_task(args):
                                          pl.col("pos_count").min().cast(pl.Int64).alias("_min"))
 
 
-def lookup_counts(positions: Path, keys: pl.DataFrame, groups_per_task: int = 12, procs: int = 2) -> pl.DataFrame:
+def lookup_counts(positions: Path, keys: pl.DataFrame, groups_per_task: int = 12, procs: int = 1) -> pl.DataFrame:
     """pos_count per wanted pos_key, read from positions.parquet a few row groups at a time.
 
     Each slice of row groups is read in a fresh worker process that exits after it: memory used to read
@@ -172,6 +172,8 @@ def with_continuations(s: pl.DataFrame, positions: Path) -> pl.DataFrame:
 
     from tnh.data.positions import pos_key
 
+    # child keys built in chunks of rows, so that Python lists never hold all of them
+    frames = []
     rows, keys, played = [], [], []
     for i, (fen, uci) in enumerate(s.select("fen", "played_uci").iter_rows()):
         b = chess.Board(fen)
@@ -181,7 +183,13 @@ def with_continuations(s: pl.DataFrame, positions: Path) -> pl.DataFrame:
             keys.append(pos_key(b))
             b.pop()
             played.append(m.uci() == uci)
-    kids = pl.DataFrame({"_r": rows, "pos_key": keys, "_played": played})
+        if len(rows) > 1_000_000:
+            frames.append(pl.DataFrame({"_r": rows, "pos_key": keys, "_played": played}))
+            rows, keys, played = [], [], []
+    frames.append(pl.DataFrame({"_r": rows, "pos_key": keys, "_played": played},
+                               schema={"_r": pl.Int64, "pos_key": pl.String, "_played": pl.Boolean}))
+    kids = pl.concat(frames)
+    del frames, rows, keys, played
     counts = lookup_counts(positions, kids.select("pos_key").unique())
     counts = counts.with_columns((pl.col("pos_count") != pl.col("_min")).alias("_n")).drop("_min")
     if counts.get_column("_n").any():
