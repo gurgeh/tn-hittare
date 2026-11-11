@@ -23,6 +23,28 @@ Growth is best-first. `grow` expands in order of the reach bound (the most a
 node could be reached by any repertoire); `refine` expands the frontier nodes
 whose values weigh most in a given solution (their reach under it), which is
 how a partly grown graph says where it needs to grow next.
+
+What is guaranteed, and what is not:
+
+- Guaranteed on whatever graph has been grown: the DP is exact on a tree, for any
+  kappa, lam, lam_node, costs and pruning (checked against enumeration); the value
+  reported for a repertoire is its exact expected score on that graph given the
+  frontier values; every learned move is within eps of the engine's best at the
+  search's engine budget (and at the deep budget if `deepcheck` ran); every
+  model call is cached on the position and counted.
+- Not guaranteed: that the graph contains the best repertoire. With `explore` < 1
+  a sound move my model rarely plays is grown as if it were rarely reached, and
+  `refine` grows only below the current solution, so a line can lose because it
+  was looked at less. A position never expanded cannot be learned.
+  `grow` also stops at `max_expansions`, so even with `explore` = 1 positions in
+  the budget zone may be left unexpanded. `frontier_mass(...)["in_budget_zone"]`
+  in the output is the probability under the repertoire of reaching such a
+  position: the honest measure of how unfinished a result is.
+- Not guaranteed: that the frontier values are unbiased where the search chose.
+  The max over my sound moves picks up noise in the value head (the winner's
+  curse); `drift` measures it, `Params.shrink` and `solve_until_stable` reduce it.
+- On a graph with transpositions the DP is not exact; the repaired solution was
+  measured at 99.9 % of the optimum on synthetic graphs (`python -m tnh.builder gap`).
 """
 
 from __future__ import annotations

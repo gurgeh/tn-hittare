@@ -19,13 +19,14 @@ from pathlib import Path
 import numpy as np
 
 from tnh.builder.game import Game, Params
-from tnh.builder.output import curve_json, curve_text, pgn, rows, table
+from tnh.builder.output import curve_json, curve_text, pgn, rows, steps_text, table
 from tnh.builder.search import DP, brute_force, candidates, improve, is_tree, repair, solve
 from tnh.builder.synth import random_game
 
 
 def _params(a) -> Params:
-    return Params(kappa=a.kappa, lam=a.lam, eps_white=a.eps, eps_black=a.eps, min_reach=a.min_reach)
+    return Params(kappa=a.kappa, lam=a.lam, lam_node=a.lam_node, eps_white=a.eps, eps_black=a.eps,
+                  min_reach=a.min_reach, shrink=a.shrink, shrink_to=a.shrink_to)
 
 
 def cmd_synth(a) -> None:
@@ -40,7 +41,9 @@ def cmd_synth(a) -> None:
     print(curve_text(sols))
     s = sols[a.N]
     print(f"\nN={a.N}: learned {s.cost} positions" + (f", local search: {s.local_steps}" if s.local_steps else ""))
-    print(table(rows(game, s)))
+    print(table(rows(game, sols, a.N)))
+    print()
+    print(steps_text(sols))
 
 
 def _gap_one(game: Game, N_max: int) -> list[dict]:
@@ -108,11 +111,26 @@ def cmd_curse(a) -> None:
         print()
 
 
+def _solve_report(game: Game, N: int, label: str, log: list[str]) -> list:
+    t = time.perf_counter()
+    _, sols = solve(game, N)
+    log.append(f"{label}: {len(game.order)} nodes, value at N={N} {sols[N].value:.4f} (N=0 {sols[0].value:.4f}), "
+               f"{time.perf_counter() - t:.1f} s")
+    print(log[-1], flush=True)
+    return sols
+
+
 def cmd_chess(a) -> None:
+    import pickle
+    from dataclasses import replace
+
     import chess
     import torch
 
-    from tnh.builder.expand import Expander, frontier_importance
+    from tnh.builder.deepcheck import DeepChecker, check_repertoire
+    from tnh.builder.drift import drift, drift_text
+    from tnh.builder.expand import Expander
+    from tnh.builder.output import budget_for_price, frontier_mass, steps_text
     from tnh.models.maia3 import Elo, Maia3
     from tnh.models.stockfish import Stockfish
 
@@ -123,54 +141,121 @@ def cmd_chess(a) -> None:
     maia = Maia3(a.size, Elo.offset(0), device=a.device, local_files_only=True, batch_size=64)
     params = _params(a)
     me_white = a.me == "white"
+    root_moves = a.moves.split()
+    board = chess.Board()
+    for m in root_moves:
+        board.push_uci(m)
+    san = lambda path: " ".join(_san(board, list(path)))
+    log: list[str] = []
+    report: dict = {}
     with Stockfish(a.sf_nodes, processes=1, per_move=True) as sf:
         ex = Expander(maia, sf, params, me_white=me_white, me_elo=a.elo, opp_elo=a.opp_elo,
-                      root_moves=a.moves.split(), explore=a.explore)
-        log = []
+                      root_moves=root_moves, explore=a.explore)
         n = ex.grow(expand_reach=a.expand_reach, max_expansions=a.max_expansions)
         log.append(f"grow: {n} expansions, {len(ex.graph)} nodes, {dict(ex.stats)}")
         print(log[-1], flush=True)
         for r in range(a.refine_rounds + 1):
-            game = Game(ex.graph, params)
-            t = time.perf_counter()
-            dp, sols = solve(game, a.N)
-            log.append(f"solve {r}: {len(game.order)} nodes, value at N={a.N} {sols[a.N].value:.4f} "
-                       f"(N=0 {sols[0].value:.4f}), {time.perf_counter() - t:.1f} s")
-            print(log[-1], flush=True)
+            sols = _solve_report(Game(ex.graph, params), a.N, f"solve {r}", log)
             if r < a.refine_rounds:
                 k = ex.refine(sols[a.N].learned, n=a.refine_n)
                 log.append(f"refine {r}: {k} expansions, {len(ex.graph)} nodes")
                 print(log[-1], flush=True)
+
+        if a.compare:
+            # the same graph under each pessimism; lam_node needs the engine at every opponent's node
+            for nd in list(ex.graph.nodes):
+                if nd.expanded and not nd.me_to_move:
+                    ex.ensure_engine(nd)
+            variants = {"lam 0": replace(params, lam=0.0, lam_node=0.0),
+                        f"lam {a.compare:g} per opponent": replace(params, lam=a.compare, lam_node=0.0),
+                        f"lam {a.compare:g} per node": replace(params, lam=0.0, lam_node=a.compare),
+                        "base, shrink 0.5 to parent": replace(params, shrink=0.5)}
+            cmp = {}
+            for name, p in variants.items():
+                g = Game(ex.graph, p)
+                _, vs = solve(g, a.N)
+                cmp[name] = {"value": vs[a.N].value, "v0": vs[0].value,
+                             "learned": {san(ex.graph.nodes[g.by_key[k][0]].path + (m,)): m
+                                         for k, m in vs[a.N].learned.items()},
+                             "keys": set(vs[a.N].learned.items())}
+            base_keys = cmp[f"lam {a.compare:g} per opponent"]["keys"]
+            lines = [f"Same graph ({len(ex.graph)} nodes), N={a.N}: each variant's choice. 'shared' counts "
+                     f"(position, move) pairs in common with lam {a.compare:g} per opponent."]
+            for name, c in cmp.items():
+                lines.append(f"- {name}: value {c['value']:.4f} (N=0 {c['v0']:.4f}), shared {len(c['keys'] & base_keys)}"
+                             f"/{len(c['keys'])}: " + "; ".join(sorted(c["learned"])))
+            report["compare"] = "\n".join(lines)
+            print(report["compare"], flush=True)
+
+        if a.drift_rounds:
+            fixed = sols[a.N].learned
+            rs = drift(ex, fixed, a.N, a.drift_rounds, a.drift_per_round,
+                       variants={"shrink .5 parent": replace(params, shrink=0.5)})
+            report["drift"] = drift_text(rs)
+            print(report["drift"], flush=True)
+
+        final_game = Game(ex.graph, params)
+        if a.deep_nodes:
+            with DeepChecker(a.deep_nodes) as dc:
+                check = lambda k, m: dc.check(list(root_moves) + list(ex.graph.nodes[final_game.by_key[k][0]].path), m,
+                                              params.eps(me_white))
+                chk = check_repertoire(ex.graph, params, a.N, a.N, check)
+            log += chk.log
+            print("\n".join(chk.log), flush=True)
+            sols = chk.sols
+            final_game = Game(ex.graph, chk.params)
+            deep = {k: d for (k, m), d in chk.results.items() if sols[a.N].learned.get(k) == m}
+            report["deep"] = [{"line": san(ex.graph.nodes[final_game.by_key[k][0]].path + (m,)), **d}
+                              for (k, m), d in chk.results.items()]
+        else:
+            sols = _solve_report(final_game, a.N, "final solve", log)
+            deep = None
+        rs = rows(final_game, sols, a.N, ensure=ex.ensure_engine, deep=deep)
         stats = dict(ex.stats)
         seconds = {k: round(v, 1) for k, v in ex.seconds.items()}
         sf_stats = dict(sf.stats)
-    board = chess.Board()
-    for m in a.moves.split():
-        board.push_uci(m)
+
     sol = sols[a.N]
-    rs = rows(game, sol)
+    names = {k: san(ex.graph.nodes[final_game.by_key[k][0]].path + (m,)) for s_ in sols for k, m in s_.learned.items()}
     headers = {"Event": f"tnh.builder repertoire, N={a.N}", "White": f"{'me' if me_white else 'opponent'}",
                "Black": f"{'opponent' if me_white else 'me'}",
                "Annotator": f"maia3-{a.size} {a.elo} vs {a.opp_elo}, stockfish {a.sf_nodes} nodes/move, "
-                            f"eps {a.eps}, lam {a.lam}"}
-    (out / "repertoire.pgn").write_text(pgn(rs, a.moves.split(), headers))
+                            f"eps {a.eps}, lam {a.lam}, lam_node {a.lam_node}, shrink {a.shrink}"}
+    (out / "repertoire.pgn").write_text(pgn(rs, root_moves, headers))
     tab = table(rs, board)
     (out / "table.md").write_text(tab + "\n")
     (out / "curve.json").write_text(curve_json(sols))
-    imp = frontier_importance(game, sol.learned)[:15]
-    frontier = [{"path": " ".join(ex.graph.nodes[i].path), "weight": w} for i, w in imp]
+    fm = frontier_mass(final_game, sol.learned)
+    prices = {mu: budget_for_price(sols, mu) for mu in a.mu}
+    with open(out / "graph.pkl", "wb") as f:
+        pickle.dump({"graph": ex.graph, "root_moves": root_moves, "params": vars(a)}, f)
     wall = time.perf_counter() - t0
     summary = {"args": vars(a), "stats": stats, "seconds": seconds, "stockfish": sf_stats, "wall_s": wall,
-               "nodes": len(ex.graph), "log": log, "frontier_top": frontier}
+               "nodes": len(ex.graph), "log": log, "frontier_mass": fm, "budget_for_price": prices,
+               **{k: v for k, v in report.items()}}
     (out / "run.json").write_text(json.dumps(summary, indent=1, default=str))
     print()
     print(curve_text(sols))
     print()
+    print(steps_text(sols, lambda k: names.get(k, str(k))))
+    print("\nbudget for a price per position:", ", ".join(f"mu {mu:g} -> N={n}" for mu, n in prices.items()))
+    print()
     print(tab)
-    print(f"\nmodel calls: {stats.get('move model calls', 0)} move model, {stats.get('engine calls', 0)} engine; "
+    print(f"\nfrontier mass under the repertoire: {fm}")
+    print(f"model calls: {stats.get('move model calls', 0)} move model, {stats.get('engine calls', 0)} engine; "
           f"seconds {seconds}; wall {wall:.0f} s")
-    print("frontier positions that weigh most:", *(f"{f['weight']:.3f} {f['path']}" for f in frontier[:5]), sep="\n  ")
     print(f"written to {out}")
+
+
+def _san(board, moves: list[str]) -> list[str]:
+    b = board.copy(stack=False)
+    out = []
+    for m in moves:
+        import chess
+        mv = chess.Move.from_uci(m)
+        out.append(b.san(mv))
+        b.push(mv)
+    return out
 
 
 def main(argv=None) -> None:
@@ -180,7 +265,10 @@ def main(argv=None) -> None:
     def common(p):
         p.add_argument("-N", type=int, default=8)
         p.add_argument("--eps", type=float, default=0.03)
-        p.add_argument("--lam", type=float, default=0.0)
+        p.add_argument("--lam", type=float, default=0.0, help="share of opponents that play the engine's best move")
+        p.add_argument("--lam-node", type=float, default=0.0, help="per-node share on the engine's best move")
+        p.add_argument("--shrink", type=float, default=0.0)
+        p.add_argument("--shrink-to", default="parent", choices=["parent", "engine"])
         p.add_argument("--kappa", type=float, default=math.inf)
         p.add_argument("--min-reach", type=float, default=0.0)
 
@@ -227,6 +315,12 @@ def main(argv=None) -> None:
     p.add_argument("--max-expansions", type=int, default=300)
     p.add_argument("--refine-rounds", type=int, default=2)
     p.add_argument("--refine-n", type=int, default=40)
+    p.add_argument("--compare", type=float, default=0.0,
+                   help="also solve the grown graph with lam 0, this lam per opponent, per node, and shrink 0.5")
+    p.add_argument("--drift-rounds", type=int, default=0)
+    p.add_argument("--drift-per-round", type=int, default=40)
+    p.add_argument("--deep-nodes", type=int, default=0, help="re-check the learned moves at this engine budget")
+    p.add_argument("--mu", type=float, nargs="*", default=[0.001, 0.0005, 0.0002])
     p.add_argument("--out", required=True)
     p.set_defaults(fn=cmd_chess)
 
