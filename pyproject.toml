@@ -13,6 +13,7 @@ dependencies = [
     "tqdm>=4.66",
     "scipy>=1.14",
     "torch>=2.5",
+    "maia3",
 ]
 
 [dependency-groups]
@@ -29,3 +30,6 @@ packages = ["src/tnh"]
 testpaths = ["tests"]
 markers = ["slow: needs network, GPU or a built corpus"]
 addopts = "-m 'not slow'"
+
+[tool.uv.sources]
+maia3 = { git = "https://github.com/CSSLab/maia3", rev = "1e13597c42d4858b7cfd7cfdae01e297263364b2" }
