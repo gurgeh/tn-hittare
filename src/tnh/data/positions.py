@@ -11,8 +11,8 @@ a time; each chunk's rows go to a part file, so memory stays flat.
 tempo, that reach the position at any ply (the start and the final position
 included, each game counted once). The workers return a 64-bit hash of every
 ``pos_key`` those games reach; the counts are taken over all of them, and
-then joined to the rows part by part. With some 30 million distinct keys the
-chance of any hash collision is about 1 in 40 000.
+then joined to the rows part by part. With some 41 million distinct keys the
+chance of any hash collision is about 1 in 20 000.
 """
 
 from __future__ import annotations
@@ -63,20 +63,20 @@ def key_hash(key: str) -> int:
     return int.from_bytes(hashlib.blake2b(key.encode(), digest_size=8).digest(), "little")
 
 
-def clock_before(clocks: list[int | None] | None, ply: int, base_s: int | None) -> int | None:
-    """The clock of the side that moves at ``ply`` (or of its opponent, with ply - 1), before that ply.
+def clock_before(clocks: list[int | None] | None, ply: int) -> int | None:
+    """The clock of the side that moves at ``ply``, before that ply: its clock after its previous move.
 
-    It is the clock after that side's previous move; before a side's first
-    move it is the base time, when known.
+    Null before a side's first move. The clock then is not the base time:
+    many DGT clocks add the increment before move 1, and the first readings
+    of 90+30 games are typically 5 430-5 460 s, so the base would understate
+    the clock and make the first move's time negative.
     """
-    if clocks is None:
+    if clocks is None or ply < 2:
         return None
-    if ply >= 2:
-        return clocks[ply - 2]
-    return base_s
+    return clocks[ply - 2]
 
 
-def move_times(clocks: list[int | None] | None, tc_raw: str | None, tempo_source: str, base_s: int | None, inc_s: int | None) -> list[int | None]:
+def move_times(clocks: list[int | None] | None, tc_raw: str | None, tempo_source: str, inc_s: int | None) -> list[int | None]:
     """Seconds spent on each ply: clock before - clock after + increment (+ the next period's time).
 
     Null where a clock or the increment is unknown, and where the result is
@@ -88,7 +88,7 @@ def move_times(clocks: list[int | None] | None, tc_raw: str | None, tempo_source
     tc = parse_time_control(tc_raw)[0] if tempo_source == "tag" else None
     out: list[int | None] = []
     for ply, after in enumerate(clocks):
-        before = clock_before(clocks, ply, base_s)
+        before = clock_before(clocks, ply)
         if before is None or after is None:
             out.append(None)
             continue
@@ -115,8 +115,7 @@ def process_chunk(args: tuple[int, dict, int, str]) -> tuple[int, np.ndarray, in
         board = chess.Board()
         if emit:
             clocks = cols["clocks_s"][i]
-            base_s, inc_s = cols["base_s"][i], cols["inc_s"][i]
-            mt = move_times(clocks, cols["time_control_raw"][i], cols["tempo_source"][i], base_s, inc_s)
+            mt = move_times(clocks, cols["time_control_raw"][i], cols["tempo_source"][i], cols["inc_s"][i])
             res_white = RESULT_WHITE[cols["result"][i]]
             gid, split = cols["game_id"][i], cols["split"][i]
         game_hashes = set()
@@ -133,8 +132,8 @@ def process_chunk(args: tuple[int, dict, int, str]) -> tuple[int, np.ndarray, in
                 rows["white_to_move"].append(white)
                 rows["mover_elo"].append(welo if white else belo)
                 rows["opp_elo"].append(belo if white else welo)
-                rows["clock_mover_s"].append(clock_before(clocks, ply, base_s))
-                rows["clock_opp_s"].append(clocks[ply - 1] if clocks is not None and ply >= 1 else (base_s if clocks is not None else None))
+                rows["clock_mover_s"].append(clock_before(clocks, ply))
+                rows["clock_opp_s"].append(clock_before(clocks, ply + 1))
                 rows["move_time_s"].append(mt[ply] if mt else None)
                 n_null_move_time += clocks is not None and mt[ply] is None and clocks[ply] is not None
                 rows["pos_key"].append(key)
@@ -160,7 +159,7 @@ def build(max_ply: int, workers: int, chunk: int) -> None:
     games = pl.read_parquet(
         CORPUS / "games.parquet",
         columns=["game_id", "moves_uci", "clocks_s", "white_elo", "black_elo", "tempo", "result", "split",
-                 "base_s", "inc_s", "time_control_raw", "tempo_source", "n_plies"],
+                 "inc_s", "time_control_raw", "tempo_source", "n_plies"],
     )
     both = pl.col("white_elo").is_not_null() & pl.col("black_elo").is_not_null()
     counted = both & (pl.col("white_elo") >= COUNT_MIN_ELO) & (pl.col("black_elo") >= COUNT_MIN_ELO)

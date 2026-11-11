@@ -89,11 +89,12 @@ def test_row_fields(built):
     assert r0["result_mover"] == 0.0 and r1["result_mover"] == 1.0
     assert r0["n_legal"] == 20 and r0["played_uci"] == "e2e4"
     assert r0["fen"] == chess.STARTING_FEN
-    # clocks before the move: base time before each side's first move, then the clock after its previous move
-    assert (r0["clock_mover_s"], r0["clock_opp_s"]) == (5400, 5400)
-    assert (r1["clock_mover_s"], r1["clock_opp_s"]) == (5400, 5420)
+    # clocks before the move: unknown before each side's first move, then the clock after its previous move
+    assert (r0["clock_mover_s"], r0["clock_opp_s"]) == (None, None)
+    assert (r1["clock_mover_s"], r1["clock_opp_s"]) == (None, 5420)
     assert (r2["clock_mover_s"], r2["clock_opp_s"]) == (5420, 5425)
+    assert (r3["clock_mover_s"], r3["clock_opp_s"]) == (5425, 5300)
     # time spent: 5420 -> 5300 with 30 s increment = 150 s
     assert r2["move_time_s"] == 150
-    # ply 0: base 5400 -> 5420 means the increment was given before the move; 10 s spent
-    assert r0["move_time_s"] == 10
+    assert r3["move_time_s"] == 5425 - 5000 + 30
+    assert r0["move_time_s"] is None
