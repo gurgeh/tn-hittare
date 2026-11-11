@@ -3,7 +3,7 @@
     uv run python -m tnh.data.survey [--every 20] [--top 25]
 
 Reads every N-th game of every monthly file (headers only, no move parsing)
-and writes ``reports/tag_survey.md``: how often each tag is present, and the
+and writes ``reports/tag_survey_<source>.md``: how often each tag is present, and the
 most common values of the tags that decisions are based on. This is the
 evidence behind the choices in ``tnh.data.parse``.
 """
@@ -14,12 +14,12 @@ import argparse
 import re
 from collections import Counter, defaultdict
 
-from tnh.data.download import raw_dir
 from tnh.data.pgn import iter_file_games, split_game
+from tnh.data.sources import SOURCES
 from tnh.paths import REPORTS
 
 VALUE_TAGS = [
-    "TimeControl", "Variant", "Result", "WhiteTitle", "Round", "Site", "Event",
+    "EventType", "EventRounds", "EventCategory", "EventDate", "TimeControl", "Variant", "Result", "WhiteTitle", "Round", "Site", "Event",
     "BroadcastName", "Termination", "Annotator", "Board", "WhiteTeam",
 ]
 
@@ -36,26 +36,32 @@ def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--every", type=int, default=20)
     ap.add_argument("--top", type=int, default=25)
+    ap.add_argument("--source", default="lichess_broadcast", choices=sorted(SOURCES))
     args = ap.parse_args(argv)
 
-    files = sorted(raw_dir().glob("lichess_db_broadcast_*.pgn.zst"))
+    files = SOURCES[args.source].files()
     presence: Counter[str] = Counter()
     values: dict[str, Counter[str]] = defaultdict(Counter)
     url_shapes_by_year: dict[str, Counter[str]] = defaultdict(Counter)
+    tag_years: dict[str, Counter[str]] = defaultdict(Counter)
+    games_by_year: Counter[str] = Counter()
     n = 0
     total = 0
     for path in files:
-        year = path.name.split("_")[-1][:4]
         for i, text in enumerate(iter_file_games(path)):
             total += 1
             if i % args.every:
                 continue
             headers, _ = split_game(text)
+            year = headers.get("Date", "????")[:4]
             n += 1
             presence.update(headers.keys())
             for t in VALUE_TAGS:
                 values[t][headers.get(t, "<absent>")] += 1
-            url_shapes_by_year[year][url_shape(headers.get("BroadcastURL", ""))] += 1
+            if "BroadcastURL" in headers:
+                url_shapes_by_year[year][url_shape(headers["BroadcastURL"])] += 1
+            tag_years[year].update(headers.keys())
+            games_by_year[year] += 1
             for side in ("White", "Black"):
                 elo = headers.get(f"{side}Elo")
                 values["Elo form"][
@@ -67,10 +73,10 @@ def main(argv: list[str] | None = None) -> None:
                 ] += 1
 
     lines = [
-        "# Tag survey of the Lichess broadcast dumps",
+        f"# Tag survey: {args.source}",
         "",
-        f"Every {args.every}th game of {len(files)} monthly files: {n} of {total} games.",
-        "Regenerate with `uv run python -m tnh.data.survey`.",
+        f"Source `{args.source}`. Every {args.every}th game of {len(files)} files: {n} of {total} games.",
+        f"Regenerate with `uv run python -m tnh.data.survey --source {args.source} --every {args.every}`.",
         "",
         "## Tag presence",
         "",
@@ -79,6 +85,12 @@ def main(argv: list[str] | None = None) -> None:
     ]
     for tag, c in presence.most_common():
         lines.append(f"| {tag} | {c} | {c / n:.1%} |")
+    key_tags = ["TimeControl", "EventType", "WhiteElo", "WhiteFideId", "WhiteTitle", "EventDate", "Round"]
+    lines += ["", "## Key tags by year (share of games)", "", "| year | games | " + " | ".join(key_tags) + " |",
+              "|---|---:|" + "---:|" * len(key_tags)]
+    for year in sorted(games_by_year):
+        cells = [f"{tag_years[year][t] / games_by_year[year]:.0%}" for t in key_tags]
+        lines.append(f"| {year} | {games_by_year[year]} | " + " | ".join(cells) + " |")
     lines += ["", "## BroadcastURL shape by year", ""]
     for year in sorted(url_shapes_by_year):
         shapes = ", ".join(f"`{s}` {c}" for s, c in url_shapes_by_year[year].most_common(4))
@@ -88,7 +100,7 @@ def main(argv: list[str] | None = None) -> None:
         lines += ["", f"## {t}", "", f"{len(cnt)} distinct values.", "", "| value | games |", "|---|---:|"]
         for v, c in cnt.most_common(args.top):
             lines.append(f"| `{v[:80]}` | {c} |")
-    out = REPORTS / "tag_survey.md"
+    out = REPORTS / f"tag_survey_{args.source}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join(lines) + "\n")
     print("\n".join(lines))

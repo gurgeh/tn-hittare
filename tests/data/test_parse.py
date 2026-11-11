@@ -57,7 +57,7 @@ def test_drops_are_counted(parsed):
     assert drops["illegal_move"] == 1
     assert drops["result_not_final"] == 1
     assert n_dup == 1
-    assert len(games) == 6
+    assert len(games) == 7
 
 
 def test_dedup_keeps_the_copy_with_clocks(parsed):
@@ -119,3 +119,21 @@ def test_surname_and_tour_name():
     assert normalize_tour_name("44th Chess Olympiad 2022 | Open | Boards 1-40") == "44th chess olympiad 2022"
     assert normalize_tour_name("2020 Gibraltar Masters - Round 6") == "2020 gibraltar masters"
     assert normalize_tour_name("Kragerø Resort Chess 2020 - Game 12") == "kragerø resort chess 2020"
+
+
+def test_round_tempo(parsed):
+    _, _, games, extra, _ = parsed
+    g = by_url(games, extra, "g0000011")  # no tag, no clock; round 1 of the Open is classical by tag
+    assert (g["tempo"], g["tempo_source"]) == ("classical", "round")
+    assert g["base_s"] is None
+    # a round where nothing is known stays unknown
+    assert by_url(games, extra, "g0000004")["tempo_source"] == "none"
+
+
+def test_game_id_is_the_dedup_key_without_source(parsed):
+    from tnh.data.parse import dedup_key
+
+    _, _, games, extra, _ = parsed
+    g = by_url(games, extra, "g0000007")
+    assert g["game_id"] == dedup_key("Beta, Bo", "Theta, Tor", 2025, g["moves_uci"])
+    assert g["game_id"] == dedup_key("Beta,B", "Theta,T", 2025, g["moves_uci"])

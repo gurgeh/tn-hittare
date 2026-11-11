@@ -1,0 +1,86 @@
+[Event "Club Relay"]
+[Site "Gothenburg SWE"]
+[Date "2025.03.01"]
+[EventDate "2025.03.01"]
+[Round "1"]
+[White "Beta,B"]
+[Black "Theta,T"]
+[Result "1/2-1/2"]
+[WhiteElo "2105"]
+[BlackElo "2000"]
+[WhiteFideId "5001"]
+
+1. e4 e6 2. d4 d5 3. Nc3 Bb4 1/2-1/2
+
+[Event "Hastings Masters"]
+[Site "Hastings ENG"]
+[Date "2024.12.30"]
+[EventDate "2024.12.28"]
+[Round "3"]
+[White "Müller,K"]
+[Black "Ørsted,H"]
+[Result "1-0"]
+[WhiteElo "2300"]
+[BlackElo "2250"]
+
+1. d4 d5 2. c4 e6 3. Nc3
+Nf6 4. Bg5 Be7 1-0
+
+[Event "Hastings Masters"]
+[Site "Hastings ENG"]
+[Date "2025.01.02"]
+[EventDate "2024.12.28"]
+[Round "6"]
+[White "Ørsted,H"]
+[Black "Rho,R"]
+[Result "0-1"]
+[WhiteElo "2250"]
+[BlackElo "2200"]
+
+1. e4 c5 2. Nf3 d6 0-1
+
+[Event "Tal Mem Blitz"]
+[Site "Moscow RUS"]
+[Date "2019.07.01"]
+[EventDate "2019.07.01"]
+[Round "1"]
+[White "Sigma,S"]
+[Black "Tau,T"]
+[Result "1-0"]
+
+1. e4 e5 2. Nf3 Nc6 1-0
+
+[Event "Summer Open"]
+[Site "Paris FRA"]
+[Date "2019.07.01"]
+[EventDate "2019.06.30"]
+[EventType "swiss (rapid)"]
+[Round "2"]
+[White "Upsilon,U"]
+[Black "Phi,P"]
+[Result "1/2-1/2"]
+
+1. d4 Nf6 2. c4 g6 1/2-1/2
+
+[Event "Titled Tue"]
+[Site "chess.com INT"]
+[Date "2021.01.05"]
+[EventDate "2021.01.05"]
+[Round "1"]
+[White "Chi,C"]
+[Black "Psi,P"]
+[Result "1-0"]
+
+1. e4 e5 1-0
+
+[Event "ICCF Cup"]
+[Site "Corr"]
+[Date "2010.01.01"]
+[EventDate "2010.01.01"]
+[EventType "tourn (corr)"]
+[Round "1"]
+[White "Omega,O"]
+[Black "Alpha,A"]
+[Result "1-0"]
+
+1. e4 e5 1-0

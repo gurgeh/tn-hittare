@@ -35,8 +35,8 @@ import chess
 import polars as pl
 
 from tnh.data.pgn import iter_file_games, split_game
-from tnh.data.sources import SOURCES, Source, event_drop_reason
-from tnh.data.timecontrol import decide_tempo, parse_clock
+from tnh.data.sources import SOURCES, Source
+from tnh.data.timecontrol import WEAK_SOURCES, decide_tempo, parse_clock
 from tnh.paths import CORPUS
 
 RESULTS = ("1-0", "0-1", "1/2-1/2")
@@ -194,6 +194,15 @@ def sha_hex(*parts: str, n: int = 16) -> str:
     return hashlib.sha1("\x1f".join(parts).encode()).hexdigest()[:n]
 
 
+def dedup_key(white: str, black: str, year: int | None, moves_uci: str) -> str:
+    """The game_id: 16 hex of sha1 over both surnames, the year and the moves. No source in it."""
+    return sha_hex(surname(white), surname(black), str(year or ""), moves_uci)
+
+
+# tags whose presence decides between two copies with equal clocks
+TAG_COLUMNS = ("date", "white_elo", "black_elo", "white_fide_id", "black_fide_id", "white_title", "black_title", "time_control_raw")
+
+
 def parse_game(text: str, source: Source) -> dict:
     """One game's row (plus internal fields prefixed ``_``). Raises GameError to drop it."""
     h, movetext = split_game(text)
@@ -207,7 +216,7 @@ def parse_game(text: str, source: Source) -> dict:
         raise GameError("non_standard_start", "From Position without FEN")
 
     names = source.event_names(h)
-    reason = event_drop_reason(names)
+    reason = source.drop_reason(h)
     if reason:
         raise GameError(reason)
     if "BOT" in (h.get("WhiteTitle", "").upper(), h.get("BlackTitle", "").upper()):
@@ -229,12 +238,13 @@ def parse_game(text: str, source: Source) -> dict:
             raise GameError("result_contradicts_final_position", f"{outcome.result()} vs {result}")
 
     n_clk = sum(c is not None for c in clocks)
-    tempo = decide_tempo(h.get("TimeControl"), clocks, names)
+    tempo = decide_tempo(h.get("TimeControl"), clocks, names, h.get("EventType"), source.default_tempo)
     white, black = h.get("White", "?"), h.get("Black", "?")
     date, year = _date(h)
     moves_uci = " ".join(ucis)
-    return {
-        "game_id": sha_hex(source.name, white, black, date or str(year or ""), moves_uci),
+    key = dedup_key(white, black, year, moves_uci)
+    row = {
+        "game_id": key,
         "source": source.name,
         "event": h.get("Event", "?"),
         "site": h.get("Site", "?"),
@@ -259,7 +269,7 @@ def parse_game(text: str, source: Source) -> dict:
         "n_plies": len(ucis),
         "moves_uci": moves_uci,
         "clocks_s": clocks if n_clk else None,
-        "_dedup_key": sha_hex(surname(white), surname(black), str(year or ""), moves_uci, n=20),
+        "_dedup_key": key,
         "_clock_share": n_clk / len(ucis),
         "_priority": source.priority,
         "_nodes": source.tournament_nodes(h),
@@ -267,7 +277,10 @@ def parse_game(text: str, source: Source) -> dict:
         "_broadcast_name": h.get("BroadcastName"),
         "_game_url": h.get("GameURL") or h.get("BroadcastURL"),
         "_result_token_missing": token is None,
+        "_round_key": source.round_key(h),
     }
+    row["_n_tags"] = sum(row[c] is not None for c in TAG_COLUMNS)
+    return row
 
 
 def parse_texts(texts, source: Source, label: str = "") -> tuple[pl.DataFrame, Counter, dict[str, list[str]]]:
@@ -308,6 +321,8 @@ ROW_SCHEMA = {
     "_broadcast_name": pl.String,
     "_game_url": pl.String,
     "_result_token_missing": pl.Boolean,
+    "_round_key": pl.String,
+    "_n_tags": pl.Int32,
     "_file": pl.String,
 }
 
@@ -338,18 +353,47 @@ def split_of(tournament_id: str) -> str:
     return "train" if h < 80 else ("val" if h < 90 else "test")
 
 
+def apply_round_tempo(df: pl.DataFrame) -> pl.DataFrame:
+    """``tempo_source = round``: a game whose tempo is only from its name, a default or
+    nothing takes the tempo of its broadcast round, when every other game of the round
+    with a tempo from its clocks, tag or EventType has that same tempo."""
+    strong = ~pl.col("tempo_source").is_in(WEAK_SOURCES)
+    rounds = (
+        df.filter(pl.col("_round_key").is_not_null() & strong)
+        .group_by("_round_key")
+        .agg(pl.col("tempo").unique().alias("_round_tempi"))
+        .filter(pl.col("_round_tempi").list.len() == 1)
+        .select("_round_key", pl.col("_round_tempi").list.first().alias("_round_tempo"))
+    )
+    df = df.join(rounds, on="_round_key", how="left")
+    take = pl.col("_round_tempo").is_not_null() & ~strong
+    return df.with_columns(
+        tempo=pl.when(take).then(pl.col("_round_tempo")).otherwise(pl.col("tempo")),
+        tempo_source=pl.when(take).then(pl.lit("round")).otherwise(pl.col("tempo_source")),
+        _tempo_note=pl.when(take).then(pl.col("_tempo_note") + "_then_round_" + pl.col("_round_tempo")).otherwise(pl.col("_tempo_note")),
+    ).drop("_round_tempo")
+
+
 def assemble(df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame, int]:
     """Parsed rows -> (games, extra, number of duplicates removed).
 
-    De-duplication: the copy with the most clock comments wins, then the
-    source priority, then the game URL, so that the choice is stable. The
+    Tempo by broadcast round first (``apply_round_tempo``), over all copies.
+    De-duplication: the copy with the most clock comments wins, then the copy
+    with more tags filled in, then the source priority, then the game URL and
+    file, so that the choice is stable. The
     tournament nodes of all copies are joined; a tournament is a connected
     component, named by its smallest node.
     """
-    df = df.sort(["_dedup_key", "_clock_share", "_priority", "_game_url"], descending=[False, True, False, False], nulls_last=True)
+    df = apply_round_tempo(df)
+    df = df.sort(
+        ["_dedup_key", "_clock_share", "_n_tags", "_priority", "_game_url", "_file"],
+        descending=[False, True, True, False, False, False],
+        nulls_last=True,
+    )
     copies = df.group_by("_dedup_key", maintain_order=True).agg(
         pl.col("_nodes").list.explode(keep_nulls=False, empty_as_null=False).alias("_all_nodes"),
         pl.len().alias("_n_copies"),
+        pl.col("source").unique().sort().alias("_copy_sources"),
     )
     n_before = len(df)
     df = df.unique("_dedup_key", keep="first", maintain_order=True).join(copies, on="_dedup_key", how="left")
@@ -382,6 +426,7 @@ def assemble(df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame, int]:
         pl.col("_tempo_note").alias("tempo_note"),
         pl.col("_clock_share").alias("clock_share"),
         pl.col("_n_copies").alias("n_copies"),
+        pl.col("_copy_sources").alias("copy_sources"),
         pl.col("_result_token_missing").alias("result_token_missing"),
     ).sort("game_id")
     return games, extra, n_dup
@@ -416,6 +461,7 @@ def build(sources: list[str], workers: int, limit_files: int | None) -> None:
     del frames
     n_read = len(df) + sum(drops.values())
 
+    before = df.group_by("source", "year").len().sort("source", "year")
     games, extra, n_dup = assemble(df)
     del df
     drops["duplicate"] += n_dup
@@ -430,6 +476,7 @@ def build(sources: list[str], workers: int, limit_files: int | None) -> None:
         "dropped": dict(drops.most_common()),
         "drop_examples": examples,
         "tournaments": games["tournament_id"].n_unique(),
+        "games_before_dedup": before.to_dicts(),
         "seconds": round(time.time() - t0),
     }
     (CORPUS / "parse_stats.json").write_text(json.dumps(stats, indent=1, ensure_ascii=False))

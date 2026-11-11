@@ -152,3 +152,19 @@
 [GameURL "https://lichess.org/broadcast/unfinished/round-1/JJJJJJJJ/g0000010"]
 
 1. e4 e5 *
+
+[Event "Test Open 2025"]
+[Site "Gothenburg"]
+[Date "2025.03.01"]
+[Round "1.2"]
+[White "Omicron, Ola"]
+[Black "Pi, Per"]
+[Result "0-1"]
+[WhiteElo "1900"]
+[BlackElo "1950"]
+[Variant "Standard"]
+[BroadcastName "Test Open 2025 | Open"]
+[BroadcastURL "https://lichess.org/broadcast/test-open-2025--open/round-1/AAAAAAAA"]
+[GameURL "https://lichess.org/broadcast/test-open-2025--open/round-1/AAAAAAAA/g0000011"]
+
+1. c4 c5 2. g3 g6 0-1

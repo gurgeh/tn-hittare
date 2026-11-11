@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import re
+import zipfile
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -17,13 +18,41 @@ import zstandard
 TAG_RE = re.compile(r'^\[([A-Za-z0-9_]+)\s+"(.*)"\]\s*$')
 
 
+def decode(data: bytes) -> tuple[str, str]:
+    """Bytes of a whole PGN -> (text, encoding): UTF-8 when it decodes, else Latin-1.
+
+    The early TWIC issues are Latin-1; Latin-1 decodes any byte string, so a
+    file is never silently mangled by ``errors="replace"``.
+    """
+    try:
+        return data.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        return data.decode("latin-1"), "latin-1"
+
+
+def read_bytes(path: Path) -> bytes:
+    """The PGN bytes of a .pgn, or of the single .pgn member of a .zip."""
+    if path.suffix == ".zip":
+        with zipfile.ZipFile(path) as z:
+            members = [m for m in z.namelist() if m.lower().endswith(".pgn")]
+            if len(members) != 1:
+                raise ValueError(f"{path}: expected one .pgn member, found {z.namelist()}")
+            return z.read(members[0])
+    return path.read_bytes()
+
+
 def open_text(path: Path) -> io.TextIOBase:
-    """Open a .pgn or .pgn.zst as text."""
+    """Open a .pgn, .pgn.zst or .zip (one PGN inside) as text.
+
+    The Lichess dumps are UTF-8 and streamed. Other files are read whole
+    (a TWIC issue is a few MB) and decoded with ``decode``.
+    """
     if path.suffix == ".zst":
         fh = path.open("rb")
         reader = zstandard.ZstdDecompressor().stream_reader(fh, read_size=1 << 20)
         return io.TextIOWrapper(reader, encoding="utf-8", errors="replace", newline="")
-    return path.open("r", encoding="utf-8", errors="replace", newline="")
+    text, _ = decode(read_bytes(path))
+    return io.StringIO(text, newline="")
 
 
 def iter_game_texts(lines: Iterator[str] | io.TextIOBase) -> Iterator[str]:

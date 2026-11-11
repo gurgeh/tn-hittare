@@ -338,38 +338,68 @@ def tempo_from_names(names: list[str]) -> str | None:
     return None
 
 
+# --- The ChessBase EventType tag ---------------------------------------------------
+
+_EVENT_TYPE_RE = re.compile(r"\((rapid|blitz|corr)\)|^(rapid|blitz)$", re.IGNORECASE)
+
+
+def tempo_from_event_type(event_type: str | None) -> str | None:
+    """``rapid``, ``blitz`` or None from an EventType tag such as ``swiss (rapid)``.
+
+    ChessBase marks only the faster tempi; a bare ``swiss`` or ``team`` says
+    nothing, so it is not read as classical. ``(corr)`` is correspondence and
+    is dropped at parse time, not here.
+    """
+    if not event_type:
+        return None
+    m = _EVENT_TYPE_RE.search(event_type.strip())
+    if not m:
+        return None
+    t = (m.group(1) or m.group(2)).lower()
+    return t if t in ("rapid", "blitz") else None
+
+
 # --- The decision ---------------------------------------------------------------
+
+# Decisions that the tempo of the broadcast round may replace (see parse.assemble).
+WEAK_SOURCES = ("event_name", "assumed", "none")
 
 
 @dataclass(frozen=True)
 class TempoDecision:
     tempo: str  # classical, rapid, blitz, unknown
-    source: str  # tag, clock, event_name, none
+    source: str  # clock, tag, event_type, event_name, assumed, none ("round" is set later)
     base_s: int | None
     inc_s: int | None
     note: str  # why, for the counts in the report
 
 
-def decide_tempo(tc_raw: str | None, clocks: list[int | None], names: list[str]) -> TempoDecision:
-    """Tempo of one game from its tag, its clocks and its event names.
+def decide_tempo(
+    tc_raw: str | None,
+    clocks: list[int | None],
+    names: list[str],
+    event_type: str | None = None,
+    default: str | None = None,
+) -> TempoDecision:
+    """Tempo of one game from what the game itself carries. The first that applies wins:
 
-    1. A readable tag decides, unless the clocks clearly contradict it.
-    2. Otherwise usable clocks decide (base and increment estimated from them).
-    3. Otherwise words in the event name ("Blitz", "Rapid") decide.
-    4. Otherwise ``unknown``.
-    Without clocks, a tag that says classical in an event whose name says
-    rapid, blitz or tiebreak is ``unknown``: one of the two is wrong and
-    nothing tells which.
+    1. ``clock``: the clocks, where the tag is missing, unreadable or clearly
+       contradicted by them (base and increment estimated from the clocks).
+    2. ``tag``: a readable TimeControl tag.
+    3. ``event_type``: an EventType tag marked rapid or blitz (TWIC).
+    4. (``round``: set afterwards in ``parse.assemble`` over all games of a
+       broadcast round; it replaces 5-7.)
+    5. ``event_name``: tempo words in the event or broadcast name. A name that
+       says tiebreak or playoff gives ``unknown``, never the default.
+    6. ``assumed``: the source's default, if it has one (TWIC: classical).
+    7. ``none``: ``unknown``.
     """
     tc, how = parse_time_control(tc_raw)
     est = estimate_from_clocks(clocks)
-    named = tempo_from_names(names)
 
     if tc is not None:
         tag_tempo = tempo_of_seconds(tc.seconds_for(60))
         if est is None:
-            if tag_tempo == "classical" and named in ("rapid", "blitz", "tiebreak"):
-                return TempoDecision("unknown", "none", None, None, f"tag_{how}_vs_name_{named}")
             return TempoDecision(tag_tempo, "tag", tc.base_s, tc.inc_s, f"tag_{how}_no_clock")
         if clock_consistent_with(tc, est):
             return TempoDecision(tag_tempo, "tag", tc.base_s, tc.inc_s, f"tag_{how}_clock_agrees")
@@ -378,6 +408,14 @@ def decide_tempo(tc_raw: str | None, clocks: list[int | None], names: list[str])
     if est is not None:
         clock_tempo = tempo_of_seconds(est.base_s + 60 * est.inc_s)
         return TempoDecision(clock_tempo, "clock", est.base_s, est.inc_s, f"tag_{how}_clock")
+    et = tempo_from_event_type(event_type)
+    if et is not None:
+        return TempoDecision(et, "event_type", None, None, f"tag_{how}_event_type_{et}")
+    named = tempo_from_names(names)
     if named in ("rapid", "blitz", "classical"):
         return TempoDecision(named, "event_name", None, None, f"tag_{how}_name_{named}")
+    if named == "tiebreak":
+        return TempoDecision("unknown", "none", None, None, f"tag_{how}_name_tiebreak")
+    if default is not None:
+        return TempoDecision(default, "assumed", None, None, f"tag_{how}_assumed_{default}")
     return TempoDecision("unknown", "none", None, None, f"tag_{how}_nothing")

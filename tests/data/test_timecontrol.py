@@ -9,6 +9,7 @@ from tnh.data.timecontrol import (
     parse_free_text,
     parse_standard,
     parse_time_control,
+    tempo_from_event_type,
     tempo_from_names,
     tempo_of_seconds,
 )
@@ -116,8 +117,26 @@ def test_decide_tempo_order():
     # no tag, no clocks: name
     d = decide_tempo(None, [None] * 6, ["Blitz Open"])
     assert (d.tempo, d.source) == ("blitz", "event_name")
-    # tag classical, name blitz, no clock to settle it
+    # tag before name (DESIGN.md order), even when they disagree
     d = decide_tempo("90+30", [None] * 6, ["Blitz Open"])
-    assert (d.tempo, d.source) == ("unknown", "none")
+    assert (d.tempo, d.source) == ("classical", "tag")
     d = decide_tempo(None, [None] * 6, ["Open"])
     assert (d.tempo, d.source) == ("unknown", "none")
+    # TWIC: EventType before the name, the default last, tiebreaks never assumed classical
+    d = decide_tempo(None, [None] * 4, ["Classic Open"], event_type="swiss (rapid)", default="classical")
+    assert (d.tempo, d.source) == ("rapid", "event_type")
+    d = decide_tempo(None, [None] * 4, ["Tal Mem Blitz"], event_type="tourn", default="classical")
+    assert (d.tempo, d.source) == ("blitz", "event_name")
+    d = decide_tempo(None, [None] * 4, ["Tata Steel Masters"], event_type="tourn", default="classical")
+    assert (d.tempo, d.source) == ("classical", "assumed")
+    d = decide_tempo(None, [None] * 4, ["World Cup playoff"], default="classical")
+    assert (d.tempo, d.source) == ("unknown", "none")
+
+
+def test_event_type():
+    assert tempo_from_event_type("swiss (rapid)") == "rapid"
+    assert tempo_from_event_type("team-match (blitz)") == "blitz"
+    assert tempo_from_event_type("blitz") == "blitz"
+    assert tempo_from_event_type("swiss") is None
+    assert tempo_from_event_type("tourn (corr)") is None
+    assert tempo_from_event_type(None) is None

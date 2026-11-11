@@ -94,17 +94,90 @@ def lichess_broadcast_nodes(h: dict[str, str]) -> list[str]:
     return nodes
 
 
+def lichess_broadcast_round(h: dict[str, str]) -> str | None:
+    """The broadcast round: the round id at the end of BroadcastURL."""
+    m = _SLUG_RE.search(h.get("BroadcastURL", ""))
+    return "lb/round:" + m.group(3) if m else None
+
+
+def lichess_broadcast_drop(h: dict[str, str]) -> str | None:
+    return event_drop_reason([h.get("BroadcastName", ""), h.get("Event", "")])
+
+
+# --- TWIC ------------------------------------------------------------------------
+
+# Chess960 and engine-assisted "freestyle" events, named as such. TWIC rarely
+# carries a FEN tag for them, so the name is what there is.
+TWIC_VARIANT_RE = re.compile(r"\b960\b|chess ?960|fischer ?random|\bfrc\b|freestyle|\bshuffle\b", re.IGNORECASE)
+_SPACES_RE = re.compile(r"\s+")
+
+
+def _norm(s: str | None) -> str:
+    return _SPACES_RE.sub(" ", (s or "").strip().lower())
+
+
+def twic_nodes(h: dict[str, str]) -> list[str]:
+    """Tournament nodes of one TWIC game.
+
+    TWIC reuses event names every year and many are generic ("Open", "It",
+    "Masters"), so the event name is always qualified:
+
+    - event name and EventDate (the first day of the event, present in 98 %
+      of games), which holds an event that crosses New Year together;
+    - event name, Site and year, which joins an event whose EventDate differs
+      between issues, and is the only node when EventDate is missing.
+    """
+    event = _norm(h.get("Event"))
+    site = _norm(h.get("Site"))
+    year = (h.get("Date") or "")[:4]
+    nodes = []
+    event_date = h.get("EventDate", "")
+    if re.match(r"^\d{4}\.\d{2}\.\d{2}$", event_date):
+        nodes.append(f"twic/event_date:{event}|{event_date}")
+    nodes.append(f"twic/event_site_year:{event}|{site}|{year}")
+    return nodes
+
+
+def twic_drop(h: dict[str, str]) -> str | None:
+    """Online (Site "chess.com INT", "ICC INT", ...), correspondence, simul, variant, then the shared name rules."""
+    site = h.get("Site", "")
+    if re.search(r"\bINT$", site.strip()):
+        return "online"
+    event_type = h.get("EventType", "").lower()
+    if "corr" in event_type:
+        return "correspondence"
+    if "simul" in event_type:
+        return "simul"
+    if TWIC_VARIANT_RE.search(h.get("Event", "")):
+        return "variant"
+    return event_drop_reason([h.get("Event", "")])
+
+
 @dataclass(frozen=True)
 class Source:
     name: str
-    priority: int  # lower wins a tie between copies of one game with equal clock coverage
+    priority: int  # lower wins a tie between copies of one game with equal clocks and tags
     files: Callable[[], list[Path]]
     tournament_nodes: Callable[[dict[str, str]], list[str]]
-    event_names: Callable[[dict[str, str]], list[str]]  # names searched for drops and tempo words
+    event_names: Callable[[dict[str, str]], list[str]]  # names searched for tempo words
+    drop_reason: Callable[[dict[str, str]], str | None]  # engine, simul, online, ... from the tags
+    round_key: Callable[[dict[str, str]], str | None]  # games whose tempo is the same; None if unknown
+    default_tempo: str | None  # tempo when nothing says otherwise ("assumed")
 
 
 def _lichess_broadcast_files() -> list[Path]:
     return sorted((RAW / "lichess_broadcast").glob("lichess_db_broadcast_*.pgn.zst"))
+
+
+def _issue_number(path: Path) -> int:
+    return int(re.search(r"twic(\d+)", path.name).group(1))
+
+
+def _twic_files() -> list[Path]:
+    """Issues 210-919 as plain PGN (``twic_early``), 920 on as zip (``twic``), in issue order."""
+    early = list((RAW / "twic_early").glob("twic*.pgn"))
+    late = list((RAW / "twic").glob("twic*g.zip"))
+    return sorted(early + late, key=_issue_number)
 
 
 SOURCES: dict[str, Source] = {
@@ -114,5 +187,18 @@ SOURCES: dict[str, Source] = {
         files=_lichess_broadcast_files,
         tournament_nodes=lichess_broadcast_nodes,
         event_names=lambda h: [h.get("BroadcastName", ""), h.get("Event", "")],
+        drop_reason=lichess_broadcast_drop,
+        round_key=lichess_broadcast_round,
+        default_tempo=None,
+    ),
+    "twic": Source(
+        name="twic",
+        priority=1,
+        files=_twic_files,
+        tournament_nodes=twic_nodes,
+        event_names=lambda h: [h.get("Event", "")],
+        drop_reason=twic_drop,
+        round_key=lambda h: None,
+        default_tempo="classical",
     ),
 }
