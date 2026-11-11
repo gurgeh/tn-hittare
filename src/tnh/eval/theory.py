@@ -68,7 +68,7 @@ import polars as pl
 
 from tnh.eval.common import (BUCKET, RESULTS, boot_counts, boot_means, bucket_of, cluster_codes, label, move_scores,
                              parse_variant, provenance, read_sample, variant_name, write_result)
-from tnh.eval.sample import allocate, row_keys
+
 from tnh.eval.sweep import vertex
 from tnh.paths import CORPUS
 
@@ -95,39 +95,36 @@ def pc_band_expr() -> pl.Expr:
     return e
 
 
-def population(positions: pl.LazyFrame, games: pl.DataFrame, a) -> pl.DataFrame:
-    g = games.select(GAME_COLS).filter(
-        (pl.col("tempo") == "classical") & pl.col("has_clock") & (pl.col("tempo_source") != "assumed")
-        & pl.col("white_elo").is_between(a.elo_min, a.elo_max) & pl.col("black_elo").is_between(a.elo_min, a.elo_max)
-        & pl.col("split").is_in(a.splits)
-    ).select("game_id", "tournament_id", "tempo_source")
+def annotate_theory(a):
     pb, rg = bands(a.ply_bands), bands(a.rating_groups)
-    max_ply = max(hi for _, hi in pb)
-    p = (positions.filter(pl.col("ply") <= max_ply).join(g.lazy(), on="game_id", how="inner").collect()
-         .with_columns(pl.col("ply").cast(pl.Int64)))
-    return p.with_columns(
-        band_expr("ply", pb).alias("ply_band"), pc_band_expr().alias("pos_count_band"),
-        band_expr("mover_elo", rg).alias("rating_group"), bucket_of("mover_elo", a.elo_min, a.elo_max).alias("bucket"),
-    ).filter(pl.col("ply_band").is_not_null() & pl.col("rating_group").is_not_null())
+
+    def f(p: pl.DataFrame) -> pl.DataFrame:
+        return p.with_columns(
+            band_expr("ply", pb).alias("ply_band"), pc_band_expr().alias("pos_count_band"),
+            band_expr("mover_elo", rg).alias("rating_group"), bucket_of("mover_elo", a.elo_min, a.elo_max).alias("bucket"),
+        ).filter(pl.col("ply_band").is_not_null() & pl.col("rating_group").is_not_null()).select(
+            "game_id", "ply", "pos_count", "ply_band", "pos_count_band", "rating_group", "bucket")
+    return f
 
 
-def draw(pop: pl.DataFrame, a) -> tuple[pl.DataFrame, list[dict]]:
-    pop = pop.with_columns(pl.Series("_key", row_keys(pop.get_column("game_id"), pop.get_column("ply"), a.seed)))
-    avail = {(x, y, z): n for x, y, z, n in pop.group_by("ply_band", "pos_count_band", "rating_group").len().iter_rows()}
-    out, strata = [], []
-    cells = sorted({(k[0], k[1]) for k in avail})
-    for pb, pc in cells:
-        groups = {k[2]: n for k, n in avail.items() if k[0] == pb and k[1] == pc}
-        alloc = allocate(groups, a.per_cell)
-        for rg, k in sorted(alloc.items()):
-            if k == 0:
-                continue
-            rows = (pop.filter((pl.col("ply_band") == pb) & (pl.col("pos_count_band") == pc)
-                               & (pl.col("rating_group") == rg)).sort("_key").head(k))
-            out.append(rows.with_columns(pl.lit(groups[rg] / k).alias("weight")))
-            strata.append({"ply_band": pb, "pos_count_band": pc, "rating_group": rg, "population": int(groups[rg]),
-                           "sampled": int(k)})
-    return pl.concat(out).drop("_key").sort("game_id", "ply"), strata
+def draw_theory(positions: Path, games: pl.DataFrame, a, batch_games: int, log=print, games_path: Path | None = None):
+    """Batched like tnh.eval.sample: narrow rows per batch of games, candidates per stratum, wide rows last."""
+    from tnh.eval.sample import candidates, choose, eligible_games, fetch_wide
+
+    eg = eligible_games(games, a, a.splits)
+    ids = eg.get_column("game_id").to_list()
+    if not ids:
+        raise SystemExit("no eligible games")
+    strata = ["ply_band", "pos_count_band", "rating_group"]
+    counts, cand = candidates(positions, ids, batch_games, annotate_theory(a), strata, lambda k: a.per_cell,
+                              a.seed, log)
+    chosen, info = choose(cand, counts, strata, lambda h: a.per_cell, 2)
+    wide = fetch_wide(games_path or positions.parent / "games.parquet", chosen.select("game_id", "ply"))
+    n_plies = games.select("game_id", "n_plies") if "n_plies" in games.columns else None
+    s = wide.join(chosen.drop("_key"), on=["game_id", "ply"], how="inner").join(eg, on="game_id", how="left")
+    if n_plies is not None:
+        s = s.join(n_plies, on="game_id", how="left")
+    return s.sort("game_id", "ply"), info, {"games": len(ids)}
 
 
 def with_continuations(s: pl.DataFrame, positions: Path) -> pl.DataFrame:
@@ -146,11 +143,14 @@ def with_continuations(s: pl.DataFrame, positions: Path) -> pl.DataFrame:
             b.pop()
             played.append(m.uci() == uci)
     kids = pl.DataFrame({"_r": rows, "pos_key": keys, "_played": played})
+    # one streaming pass over positions.parquet's two narrow columns; only the distinct children are held
     counts = (pl.scan_parquet(positions).select("pos_key", "pos_count")
               .join(kids.lazy().select("pos_key").unique(), on="pos_key", how="semi")
-              .group_by("pos_key").agg(pl.col("pos_count").max().cast(pl.Int64), pl.col("pos_count").n_unique().alias("_n"))
-              .collect())
-    if (counts.get_column("_n") > 1).any():
+              .group_by("pos_key").agg(pl.col("pos_count").max().cast(pl.Int64).alias("pos_count"),
+                                       pl.col("pos_count").min().cast(pl.Int64).alias("_min"))
+              .collect(engine="streaming"))
+    counts = counts.with_columns((pl.col("pos_count") != pl.col("_min")).alias("_n")).drop("_min")
+    if counts.get_column("_n").any():
         raise SystemExit("a pos_key with two different pos_count values in positions.parquet")
     kids = kids.join(counts.drop("_n"), on="pos_key", how="left").with_columns(pl.col("pos_count").fill_null(0))
     agg = kids.group_by("_r").agg(
@@ -168,13 +168,9 @@ def with_continuations(s: pl.DataFrame, positions: Path) -> pl.DataFrame:
     found = kids.filter(pl.col("pos_count") > 0).height
     # A move that ends the game leads to a position with no row of its own in positions.parquet, so its
     # count is not there to be found; such rows are flagged and left out of the continuation columns.
-    nxt = (pl.scan_parquet(positions).select("game_id", pl.col("ply").cast(pl.Int64) - 1)
-           .join(s.lazy().select("game_id", pl.col("ply").cast(pl.Int64)), on=["game_id", "ply"], how="semi")
-           .collect().with_columns(pl.lit(False).alias("played_ends_game")))
     out = s.with_columns(agg.select("played_child_count", "max_child_count", "n_max_children", "children_count_sum",
                                     "max_other_child_count", "n_other_at_max").get_columns())
-    out = (out.with_columns(pl.col("ply").cast(pl.Int64)).join(nxt, on=["game_id", "ply"], how="left")
-           .with_columns(pl.col("played_ends_game").fill_null(True)))
+    out = out.with_columns((pl.col("ply") + 1 >= pl.col("n_plies")).alias("played_ends_game"))
     print(f"continuations: {kids.height} child positions, {found} found in {positions}; "
           f"{out.get_column('played_ends_game').sum()} rows whose move ends the game (or the corpus's max_ply)")
     return out
@@ -183,29 +179,24 @@ def with_continuations(s: pl.DataFrame, positions: Path) -> pl.DataFrame:
 def cmd_sample(a) -> None:
     games_path = a.games or a.positions.parent / "games.parquet"
     out_dir = a.out_dir or a.positions.parent / "samples"
-    games = pl.read_parquet(games_path, columns=GAME_COLS)
-    orphans = (pl.scan_parquet(a.positions).select("game_id").unique()
-               .join(games.lazy().select("game_id"), on="game_id", how="anti").select(pl.len()).collect().item())
-    if orphans:
-        raise SystemExit(f"{orphans} game_ids in {a.positions} are not in {games_path}: not the same build")
-    pop = population(pl.scan_parquet(a.positions), games, a)
-    if pop.height == 0:
-        raise SystemExit("no eligible rows")
-    s, strata = draw(pop, a)
+    games = pl.read_parquet(games_path, columns=GAME_COLS + ["n_plies"])
+    s, strata, pop = draw_theory(a.positions, games, a, a.batch_games, games_path=games_path)
     s = with_continuations(s, a.positions)
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"{a.name}.parquet"
     s.write_parquet(out)
     meta = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(a).items() if k != "fn"}
-    meta.update({"games_file": str(games_path), "rows": s.height, "games": s.get_column("game_id").n_unique(),
-                 "tournaments": s.get_column("tournament_id").n_unique(), "strata": strata})
+    meta.update({"games_file": str(games_path), "eligible_games": pop["games"], "rows": s.height,
+                 "games": s.get_column("game_id").n_unique(), "tournaments": s.get_column("tournament_id").n_unique(),
+                 "strata": strata})
     out.with_suffix(".json").write_text(json.dumps(meta, indent=1) + "\n")
     cell = s.group_by("ply_band", "pos_count_band").len()
     piv = cell.pivot(on="pos_count_band", index="ply_band", values="len")
     piv = piv.select(["ply_band"] + [c for c in PC_LABELS if c in piv.columns])
-    print(f"population {pop.height} rows; sample {s.height} rows, {meta['games']} games, "
+    print(f"{pop['games']} eligible games; sample {s.height} rows, {meta['games']} games, "
           f"{meta['tournaments']} tournaments; rows per cell:")
-    print(piv.sort(pl.col("ply_band").str.split("-").list.first().cast(pl.Int64)))
+    with pl.Config(tbl_cols=20, tbl_width_chars=200):
+        print(piv.sort(pl.col("ply_band").str.split("-").list.first().cast(pl.Int64)))
     print(f"wrote {out}")
 
 
@@ -366,6 +357,7 @@ def main(argv=None) -> None:
     sp.add_argument("--elo-min", type=int, default=1800)
     sp.add_argument("--elo-max", type=int, default=2500)
     sp.add_argument("--seed", type=int, default=1)
+    sp.add_argument("--batch-games", type=int, default=20_000, help="games read at a time (memory)")
     sp.add_argument("--positions", type=Path, default=CORPUS / "positions.parquet")
     sp.add_argument("--games", type=Path)
     sp.add_argument("--out-dir", type=Path)

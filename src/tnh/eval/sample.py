@@ -31,6 +31,11 @@ before anything else is dropped, as DESIGN.md requires):
    breakdown and the common window with the blitz reference need: rows in time
    trouble, after ``max_ply``, and still in book at ply 20 or later.
 
+Memory: the corpus is read in batches of ``--batch-games`` games (narrow columns
+only), keeping per stratum only the candidate rows with the smallest keys; the wide
+columns are read for the chosen rows alone. The result does not depend on the batch
+size.
+
 Stratification: ``--n`` window rows split equally over the rating buckets; a
 bucket with fewer rows gives all it has and the rest is shared by the others
 (water-filling). ``extra`` rows: ``--extra-frac * n``, allocated the same way.
@@ -66,13 +71,15 @@ def splitmix64(x: np.ndarray) -> np.ndarray:
 
 def row_keys(game_id: pl.Series, ply: pl.Series, seed: int) -> np.ndarray:
     """A deterministic pseudo-random 64-bit key per (game_id, ply). game_id is 16 hex chars."""
-    g = np.array([int(s[:16], 16) for s in game_id.to_list()], dtype=np.uint64)
+    hi = game_id.str.slice(0, 8).str.to_integer(base=16).cast(pl.UInt64).to_numpy()
+    lo = game_id.str.slice(8, 8).str.to_integer(base=16).cast(pl.UInt64).to_numpy()
+    g = (hi << np.uint64(32)) | lo
     with np.errstate(over="ignore"):
         x = splitmix64(g ^ splitmix64(np.full(len(g), seed, dtype=np.uint64)))
         return splitmix64(x + ply.to_numpy().astype(np.uint64) * np.uint64(0x9E3779B97F4A7C15))
 
 
-def allocate(available: dict[int, int], n: int) -> dict[int, int]:
+def allocate(available: dict, n: int) -> dict:
     """Equal allocation over strata, capped by what each has; leftovers go to the others."""
     alloc = {k: 0 for k in available}
     left = n
@@ -91,49 +98,206 @@ def allocate(available: dict[int, int], n: int) -> dict[int, int]:
     return alloc
 
 
-def population(positions: pl.LazyFrame, games: pl.DataFrame, a) -> pl.DataFrame:
-    """Rows of the eligible games, with in_window computed on the whole game first."""
+# --- working through the corpus in batches of games ------------------------------------
+#
+# positions.parquet has 212 million rows and is sorted by game_id. Nothing here holds more
+# than one batch of games' narrow rows, plus the candidates: per stratum, the rows with the
+# smallest keys, at most as many as the stratum could ever be allocated. Only the rows finally
+# chosen are read with their wide columns (fen, pos_key, ...).
+
+NARROW = ["game_id", "ply", "pos_count", "clock_mover_s", "mover_elo", "opp_elo"]
+
+
+def peak_gb() -> float:
+    import resource
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
+
+
+def eligible_games(games: pl.DataFrame, a, splits: list[str]) -> pl.DataFrame:
     g = games.select(GAME_COLS).filter(
         (pl.col("tempo") == "classical") & pl.col("has_clock") & (pl.col("tempo_source") != "assumed")
         & pl.col("white_elo").is_between(a.elo_min, a.elo_max) & pl.col("black_elo").is_between(a.elo_min, a.elo_max)
-        & (pl.col("split") == a.split)
-    ).drop("split", "white_elo", "black_elo", "tempo", "has_clock")
-    p = positions.join(g.lazy(), on="game_id", how="semi").collect().with_columns(pl.col("ply").cast(pl.Int64))
-    first_rare = pl.when(pl.col("pos_count") < a.book_count).then(pl.col("ply")).min().over("game_id")
-    exits = [pl.when(pl.col("pos_count") < k).then(pl.col("ply")).min().over("game_id").alias(f"exit_ply_{k}")
-             for k in a.exit_counts]
-    p = p.with_columns(
-        *exits,
-        in_window(p, book_count=a.book_count, max_ply=a.max_ply, max_ply_no_clock=a.max_ply_no_clock,
-                  min_clock_s=a.min_clock_s).alias("in_window"),
-        (pl.col("ply") >= first_rare).fill_null(False).alias("out_of_book"),
-    )
-    p = p.join(g, on="game_id", how="left")
-    return p
+        & pl.col("split").is_in(splits)
+    ).select("game_id", "tournament_id", "tempo_source").sort("game_id")
+    frac = getattr(a, "tournament_frac", 1.0)
+    if frac < 1.0:
+        # whole tournaments at random with the seed; a weighted mean over them still estimates the
+        # population mean (the weights are scaled by the same 1/frac everywhere, which cancels)
+        import hashlib
+        ts = g.get_column("tournament_id").unique().sort().to_list()
+        keep = [t for t in ts if int.from_bytes(hashlib.blake2b(f"{a.seed}:{t}".encode(), digest_size=8).digest(),
+                                                "little") / 2 ** 64 < frac]
+        g = g.filter(pl.col("tournament_id").is_in(keep))
+        print(f"tournaments: {len(keep)} of {len(ts)} drawn (frac {frac})")
+    return g
 
 
-def draw(pop: pl.DataFrame, a) -> tuple[pl.DataFrame, list[dict]]:
-    pop = pop.with_columns(bucket_of("mover_elo", a.elo_min, a.elo_max).alias("bucket"))
-    pop = pop.with_columns(
-        pl.when(pl.col("in_window")).then(pl.lit("window"))
-        .when((pl.col("ply") >= a.extra_min_ply) | pl.col("out_of_book")).then(pl.lit("extra"))
-        .otherwise(pl.lit(None)).alias("part")
-    ).filter(pl.col("part").is_not_null())
-    pop = pop.with_columns(pl.Series("_key", row_keys(pop.get_column("game_id"), pop.get_column("ply"), a.seed)))
-    out, strata = [], []
-    for part, n in (("window", a.n), ("extra", int(round(a.extra_frac * a.n)))):
-        pp = pop.filter(pl.col("part") == part)
-        avail = dict(pp.group_by("bucket").len().iter_rows())
-        alloc = allocate(avail, n)
-        for b in sorted(avail):
-            k = alloc[b]
+def narrow_batch(positions: Path, ids: list[str], columns: list[str] = NARROW, extra=None) -> pl.DataFrame:
+    """The narrow rows of the games ``ids`` (sorted). The range filter lets parquet skip row groups."""
+    q = (pl.scan_parquet(positions).select(columns)
+         .filter((pl.col("game_id") >= ids[0]) & (pl.col("game_id") <= ids[-1]))
+         .filter(pl.col("game_id").is_in(ids)))
+    if extra is not None:
+        q = q.filter(extra)
+    return q.collect().with_columns(pl.col("ply").cast(pl.Int64))
+
+
+def candidates(positions: Path, ids: list[str], batch_games: int, annotate, strata: list[str],
+               cap, seed: int, log=print) -> tuple[dict, pl.DataFrame]:
+    """Population counts per stratum and, per stratum, the ``cap(stratum)`` rows with the smallest keys
+    (a bound on what the stratum can ever be allocated).
+
+    ``annotate`` turns one batch of whole games' narrow rows into rows with the ``strata`` columns
+    (rows outside every stratum dropped); it must only look within a game."""
+    counts: dict = {}
+    keep = None
+    for i in range(0, len(ids), batch_games):
+        b = annotate(narrow_batch(positions, ids[i:i + batch_games]))
+        b = b.with_columns(pl.Series("_key", row_keys(b.get_column("game_id"), b.get_column("ply"), seed)))
+        for *k, n in b.group_by(strata).len().iter_rows():
+            counts[tuple(k)] = counts.get(tuple(k), 0) + n
+        keep = b if keep is None else pl.concat([keep, b], how="vertical_relaxed")
+        keep = trim(keep, strata, cap)
+        log(f"  batch {i // batch_games + 1}/{-(-len(ids) // batch_games)}: {b.height} rows, "
+            f"{keep.height} candidates, peak RSS {peak_gb():.2f} GB")
+    return counts, keep
+
+
+def trim(df: pl.DataFrame, strata: list[str], cap) -> pl.DataFrame:
+    parts = []
+    for key, g in df.group_by(strata, maintain_order=True):
+        parts.append(g.sort("_key").head(cap(key)))
+    return pl.concat(parts) if parts else df
+
+
+def choose(cand: pl.DataFrame, counts: dict, strata: list[str], n_of, alloc_over: int) -> tuple[pl.DataFrame, list[dict]]:
+    """Within each group of the first ``alloc_over`` stratum columns, allocate ``n_of(group)`` rows equally
+    over the rest (water-filling) and take the smallest keys. Weight = population / sampled."""
+    out, info = [], []
+    groups: dict = {}
+    for k, n in counts.items():
+        groups.setdefault(k[:alloc_over], {})[k[alloc_over:]] = n
+    for head, avail in sorted(groups.items(), key=lambda x: str(x[0])):
+        alloc = allocate(avail, n_of(head))
+        for tail, k in sorted(alloc.items(), key=lambda x: str(x[0])):
             if k == 0:
                 continue
-            rows = pp.filter(pl.col("bucket") == b).sort("_key").head(k)
-            out.append(rows.with_columns(pl.lit(avail[b] / k).alias("weight")))
-            strata.append({"part": part, "bucket": int(b), "population": int(avail[b]), "sampled": int(k)})
-    s = pl.concat(out).drop("_key").sort("game_id", "ply")
-    return s, strata
+            key = head + tail
+            f = pl.lit(True)
+            for c, v in zip(strata, key):
+                f = f & (pl.col(c) == v)
+            rows = cand.filter(f).sort("_key").head(k)
+            if rows.height != k:
+                raise RuntimeError(f"stratum {key}: {rows.height} candidates for {k} rows")
+            pop = avail[tail]
+            out.append(rows.with_columns(pl.lit(pop / k).alias("weight")))
+            info.append({**dict(zip(strata, [int(x) if isinstance(x, (int, np.integer)) else x for x in key])),
+                         "population": int(pop), "sampled": int(k)})
+    return pl.concat(out), info
+
+
+REPLAY_COLS = ["game_id", "source", "white_elo", "black_elo", "tempo", "moves_uci", "clocks_s", "time_control_raw",
+               "tempo_source", "inc_s", "result", "split"]
+
+
+def fetch_wide(games_path: Path, chosen: pl.DataFrame, workers: int = 8, max_ply: int = 80) -> pl.DataFrame:
+    """The positions-schema columns of the chosen (game_id, ply) rows, rebuilt by replaying only the chosen
+    games with the data developer's own row builder (``tnh.data.positions.process_chunk``).
+
+    Reading the wide columns from positions.parquet kept memory that grew with the part of the file read
+    (polars and pyarrow alike, about 0.5 GB per 2 % of the file, measured 2026-11-11); replaying is bounded by
+    the number of chosen games. ``pos_count`` is not rebuilt here: it comes with the narrow rows."""
+    import multiprocessing
+    import shutil
+    import tempfile
+
+    import pyarrow.parquet as pq
+
+    from tnh.data.positions import process_chunk
+    from tnh.paths import DATA_ROOT
+
+    keys = chosen.select("game_id", pl.col("ply").cast(pl.Int64)).unique()
+    ids = keys.get_column("game_id").unique().sort()
+    tmp = Path(tempfile.mkdtemp(prefix="replay-", dir=DATA_ROOT / "scratch"))
+    try:
+        g = (pl.scan_parquet(games_path).select(REPLAY_COLS)
+             .filter(pl.col("game_id").is_in(ids.implode())).collect().sort("game_id"))
+        if g.height != ids.len():
+            raise RuntimeError(f"{ids.len() - g.height} chosen games are not in {games_path}")
+        gp = tmp / "games.parquet"
+        g.write_parquet(gp, row_group_size=1000)
+        n_groups = pq.ParquetFile(gp).metadata.num_row_groups
+        del g
+        parts = tmp / "parts"
+        parts.mkdir()
+        with multiprocessing.get_context("spawn").Pool(workers) as pool:
+            for _ in pool.imap_unordered(process_chunk, [(i, str(gp), max_ply, str(parts)) for i in range(n_groups)]):
+                pass
+        out = []
+        for f in sorted(parts.glob("part-*.parquet")):
+            w = pl.read_parquet(f).drop("_h").with_columns(pl.col("ply").cast(pl.Int64))
+            out.append(w.join(keys, on=["game_id", "ply"], how="semi"))
+        w = pl.concat(out)
+    finally:
+        shutil.rmtree(tmp)
+    if w.height != keys.height:
+        raise RuntimeError(f"rebuilt {w.height} rows for {keys.height} chosen")
+    return w
+
+
+def count_orphans(positions: Path, game_ids: pl.Series) -> int:
+    """Game ids in positions.parquet that games.parquet lacks, one row group at a time (a unique over all
+    212 million rows at once took more than 6 GB)."""
+    import pyarrow.parquet as pq
+
+    known = pl.DataFrame({"game_id": game_ids})
+    f = pq.ParquetFile(positions)
+    n = 0
+    for r in range(f.metadata.num_row_groups):
+        ids = pl.from_arrow(f.read_row_group(r, columns=["game_id"])).unique()
+        n += ids.join(known, on="game_id", how="anti").height
+    return n
+
+
+def annotate_main(a):
+    def f(p: pl.DataFrame) -> pl.DataFrame:
+        exits = [pl.when(pl.col("pos_count") < k).then(pl.col("ply")).min().over("game_id").alias(f"exit_ply_{k}")
+                 for k in a.exit_counts]
+        first_rare = pl.when(pl.col("pos_count") < a.book_count).then(pl.col("ply")).min().over("game_id")
+        p = p.with_columns(
+            *exits,
+            in_window(p, book_count=a.book_count, max_ply=a.max_ply, max_ply_no_clock=a.max_ply_no_clock,
+                      min_clock_s=a.min_clock_s).alias("in_window"),
+            (pl.col("ply") >= first_rare).fill_null(False).alias("out_of_book"),
+            bucket_of("mover_elo", a.elo_min, a.elo_max).alias("bucket"),
+        )
+        p = p.with_columns(
+            pl.when(pl.col("in_window")).then(pl.lit("window"))
+            .when((pl.col("ply") >= a.extra_min_ply) | pl.col("out_of_book")).then(pl.lit("extra"))
+            .otherwise(pl.lit(None)).alias("part"))
+        return p.filter(pl.col("part").is_not_null()).select(
+            "game_id", "ply", "pos_count", "part", "bucket", "in_window", "out_of_book",
+            *[f"exit_ply_{k}" for k in a.exit_counts])
+    return f
+
+
+def draw_main(positions: Path, games: pl.DataFrame, a, batch_games: int, log=print, games_path: Path | None = None) -> tuple[pl.DataFrame, list[dict], dict]:
+    eg = eligible_games(games, a, [a.split])
+    ids = eg.get_column("game_id").to_list()
+    if not ids:
+        raise SystemExit("no eligible games")
+    games_path = games_path or positions.parent / "games.parquet"
+    n_for = {"window": a.n, "extra": int(round(a.extra_frac * a.n))}
+    counts, cand = candidates(positions, ids, batch_games, annotate_main(a), ["part", "bucket"],
+                              lambda k: n_for[k[0]], a.seed, log)
+    chosen, strata = choose(cand, counts, ["part", "bucket"], lambda h: n_for[h[0]], 1)
+    log(f"chose {chosen.height} rows, peak RSS {peak_gb():.2f} GB")
+    wide = fetch_wide(games_path, chosen.select("game_id", "ply"))
+    log(f"fetched the wide columns, peak RSS {peak_gb():.2f} GB")
+    s = (wide.join(chosen.drop("_key"), on=["game_id", "ply"], how="inner")
+         .join(eg, on="game_id", how="left").sort("game_id", "ply"))
+    pop = {"games": len(ids), "rows_by_part": {p_: sum(n for k, n in counts.items() if k[0] == p_) for p_ in n_for}}
+    return s, strata, pop
 
 
 def main(argv=None) -> None:
@@ -149,6 +313,9 @@ def main(argv=None) -> None:
     p.add_argument("--elo-min", type=int, default=1800)
     p.add_argument("--elo-max", type=int, default=2500)
     p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--batch-games", type=int, default=20_000, help="games read at a time (memory)")
+    p.add_argument("--tournament-frac", type=float, default=1.0,
+                   help="draw this share of the split's tournaments first (whole tournaments, with the seed)")
     p.add_argument("--positions", type=Path, default=CORPUS / "positions.parquet")
     p.add_argument("--games", type=Path, help="default: games.parquet next to --positions")
     p.add_argument("--out-dir", type=Path, help="default: samples/ next to --positions")
@@ -165,17 +332,15 @@ def main(argv=None) -> None:
         raise SystemExit("--elo-min must be a multiple of 100")
 
     games = pl.read_parquet(games_path, columns=GAME_COLS)
-    orphans = (pl.scan_parquet(a.positions).select("game_id").unique()
-               .join(games.lazy().select("game_id"), on="game_id", how="anti").select(pl.len()).collect().item())
+    print(f"games read, peak RSS {peak_gb():.2f} GB", flush=True)
+    orphans = count_orphans(a.positions, games.get_column("game_id"))
+    print(f"orphan check done, peak RSS {peak_gb():.2f} GB", flush=True)
     if orphans:
         raise SystemExit(f"{orphans} game_ids in {a.positions} are not in {games_path}: "
                          f"the two files are not from the same build")
-    pop = population(pl.scan_parquet(a.positions), games, a)
-    if pop.height == 0:
-        raise SystemExit("no eligible rows")
-    print(f"population: {pop.height} rows of {pop.get_column('game_id').n_unique()} eligible games "
-          f"(split={a.split}, both ratings {a.elo_min}-{a.elo_max}); in window: {pop.get_column('in_window').sum()}")
-    s, strata = draw(pop, a)
+    s, strata, pop = draw_main(a.positions, games, a, a.batch_games, games_path=games_path)
+    print(f"population: {pop['games']} eligible games (split={a.split}, both ratings {a.elo_min}-{a.elo_max}); "
+          f"rows by part {pop['rows_by_part']}")
     for st in strata:
         print(f"  {st['part']:>6} {st['bucket']}: {st['sampled']:>8} of {st['population']:>9}")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -186,6 +351,7 @@ def main(argv=None) -> None:
     meta.update({"games_file": str(games_path), "rows": s.height, "games": s.get_column("game_id").n_unique(),
                  "tournaments": s.get_column("tournament_id").n_unique(), "strata": strata})
     out.with_suffix(".json").write_text(json.dumps(meta, indent=1) + "\n")
+    print(f"peak RSS {peak_gb():.2f} GB")
     print(f"wrote {out}: {s.height} rows, {meta['games']} games, {meta['tournaments']} tournaments")
 
 
