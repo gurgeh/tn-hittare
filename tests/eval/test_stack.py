@@ -60,3 +60,61 @@ def test_stack_finds_a_context_interaction_the_logit_misses():
     # the effective weight on x follows the planted 1 + 1.5 z
     ew = effective_weight(model, xt.astype(np.float32), zt.astype(np.float32), offt, 0, 1.0, "cpu")
     assert np.corrcoef(ew, slope_t)[0, 1] > 0.9
+
+
+def test_tree_objective_is_the_gradient_of_the_group_log_loss():
+    from tnh.eval.trees import group_loss, objective
+    rng = np.random.default_rng(3)
+    off = np.array([0, 3, 7, 9])
+    y = np.array([1, 5, 7])
+    w = np.array([1.0, 2.0, 0.5])
+    s = rng.normal(size=9)
+    g, h = objective(off, y, w)(s, None)
+    eps = 1e-6
+    num = np.array([(group_loss(s + eps * np.eye(9)[j], off, y, w) - group_loss(s - eps * np.eye(9)[j], off, y, w))
+                    / (2 * eps) for j in range(9)])
+    # the objective's gradient is the summed loss with weights normalised to mean 1
+    assert np.allclose(g / len(y), num, atol=1e-6)
+    assert (h > 0).all()
+
+
+def test_trees_recover_a_context_dependent_coefficient():
+    from tnh.eval import trees as T
+    rng = np.random.default_rng(1)
+    xm, xc, off, y, slope = synth(8000, rng)
+    xt, zt, offt, yt, slope_t = synth(3000, rng)
+    w = np.ones(len(y))
+    D = Data(["x"], xm.astype(float), off, y, np.diff(off).astype(float), w, np.arange(len(y)) % 30, {})
+    b, _ = fit(D)
+    Dt = Data(["x"], xt.astype(float), offt, yt, np.diff(offt).astype(float), np.ones(len(yt)), np.arange(len(yt)) % 30, {})
+    lin = -scores(Dt, b)[0].mean()
+    names, ctx = ["x"], ["ctx_mover_elo"]
+    X, _ = T.design(xm, names, xc, ctx, off, ["x"], True)
+    Xt, _ = T.design(xt, names, zt, ctx, offt, ["x"], True)
+    rows = np.arange(len(y))
+    from tnh.eval.stack import Batches
+    B = Batches(off)
+
+    def sub(r):
+        idx, _, lens = B.moves_of(r)
+        o = np.r_[0, np.cumsum(lens)]
+        return idx, o, o[:-1] + (y - off[:-1])[r]
+
+    tr, va = sub(rows[:6500]), sub(rows[6500:])
+    init = xm[:, 0] * b[0]
+    prm = T.grid([15], [0.1], [50])[0]
+    bst, v = T.train(X[tr[0]], tr[1], tr[2], w[:6500], init[tr[0]], X[va[0]], va[1], va[2], w[6500:], init[va[0]],
+                     prm, 500, 30, 0, threads=2)
+    st = xt[:, 0] * b[0] + T.raw(bst, Xt)
+    trees = T.group_loss(st, offt, yt, np.ones(len(yt)))
+    assert trees < lin - 0.05, (trees, lin)
+    # effective weight by central differences follows the planted 1 + 1.5 z
+    h = 0.1
+    sc = []
+    for sgn in (1, -1):
+        xp = xt + sgn * h
+        Xp, _ = T.design(xp, names, zt, ctx, offt, ["x"], True)
+        sc.append(xp[:, 0] * b[0] + T.raw(bst, Xp))
+    d = (sc[0] - sc[1]) / (2 * h)
+    ew = np.add.reduceat(d, offt[:-1]) / np.diff(offt)
+    assert np.corrcoef(ew, slope_t)[0, 1] > 0.8

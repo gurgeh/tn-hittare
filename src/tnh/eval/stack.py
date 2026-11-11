@@ -301,6 +301,14 @@ def main(argv=None) -> None:
     p.add_argument("--patience", type=int, default=3)
     p.add_argument("--val-frac", type=float, default=0.2, help="share of fitting rows held out, whole tournaments")
     p.add_argument("--no-ablation", action="store_true")
+    p.add_argument("--no-trees", action="store_true", help="skip the boosted trees")
+    p.add_argument("--leaves", type=int, nargs="+", default=[15, 63], help="tree tuning grid: num_leaves")
+    p.add_argument("--rates", type=float, nargs="+", default=[0.05, 0.15], help="tree tuning grid: learning rate")
+    p.add_argument("--min-leaf", type=int, nargs="+", default=[200, 2000], help="tree tuning grid: min rows per leaf")
+    p.add_argument("--rounds", type=int, default=2000, help="most trees; early stopping decides")
+    p.add_argument("--tree-patience", type=int, default=50)
+    p.add_argument("--tune-frac", type=float, default=1.0,
+                   help="share of the training tournaments used to choose the tree settings")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     add_common(p)
     a = p.parse_args(argv)
@@ -412,6 +420,85 @@ def main(argv=None) -> None:
         e = fit_eps(Df.single_lp[k], Df.n, Df.w)
         singles[k] = {"loss": -mix_logp(Dt.single_lp[k], Dt.n, e), "eps": e}
 
+    # boosted trees
+    trees_out, ablation_trees = None, {}
+    if not a.no_trees:
+        from tnh.eval import trees as T
+        prod_cols = [c for c in base if not c.endswith("_nan")]
+        Xraw_f, Xraw_t = Df.subset(move_names).X, Dt.subset(move_names).X
+        Bf = Batches(Df.offsets)
+        ylocal = Df.y - Df.offsets[:-1]
+        train_w = Df.w * np.isin(np.arange(len(Df.w)), rows_train)
+
+        def subrows(rows):
+            idx, _, lens = Bf.moves_of(rows)
+            off = np.r_[0, np.cumsum(lens)]
+            return idx, off, off[:-1] + ylocal[rows]
+
+        tr, va = subrows(rows_train), subrows(rows_val)
+        rng_t = np.random.default_rng(a.seed + 5)
+        tour = np.unique(Df.clusters[rows_train])
+        tune_t = tour[rng_t.random(len(tour)) < a.tune_frac] if a.tune_frac < 1 else tour
+        rows_tune = rows_train[np.isin(Df.clusters[rows_train], tune_t)]
+        tu = subrows(rows_tune)
+
+        def fit_trees(drop_move, drop_ctx, products, settings, tune=False):
+            km = [c for c in move_names if c not in drop_move]
+            kc = [c for c in ctx_names if c not in drop_ctx]
+            kmi = [move_names.index(c) for c in km]
+            kci = [ctx_names.index(c) for c in kc]
+            b, _ = fit_logit(Df.subset(km), train_w)
+            init_f, init_t = Df.subset(km).X @ b, Dt.subset(km).X @ b
+            Xf, names = T.design(Xraw_f[:, kmi], km, Cf[:, kci], kc, Df.offsets, prod_cols, products)
+            tried, best = [], None
+            fit_rows = tu if tune else tr
+            fw = Df.w[rows_tune] if tune else Df.w[rows_train]
+            for prm in settings:
+                t0 = time.time()
+                bst, v = T.train(Xf[fit_rows[0]], fit_rows[1], fit_rows[2], fw, init_f[fit_rows[0]],
+                                 Xf[va[0]], va[1], va[2], Df.w[rows_val], init_f[va[0]], prm, a.rounds,
+                                 a.tree_patience, a.seed)
+                tried.append({**prm, "trees": bst.best_iteration, "validation": v, "seconds": round(time.time() - t0)})
+                print(f"    trees {prm['num_leaves']} leaves, rate {prm['learning_rate']}, min leaf "
+                      f"{prm['min_data_in_leaf']}: {bst.best_iteration} trees, validation {v:.4f}")
+                if best is None or v < best[1]:
+                    best = (bst, v, prm)
+            bst, v, prm = best
+            if tune and a.tune_frac < 1:      # refit the chosen setting on all the training rows
+                bst, v = T.train(Xf[tr[0]], tr[1], tr[2], Df.w[rows_train], init_f[tr[0]], Xf[va[0]], va[1], va[2],
+                                 Df.w[rows_val], init_f[va[0]], prm, a.rounds, a.tree_patience, a.seed)
+            Xt, _ = T.design(Xraw_t[:, kmi], km, Ct[:, kci], kc, Dt.offsets, prod_cols, products)
+            lpf = T.group_logp(init_f + T.raw(bst, Xf), Df.offsets)[Df.y]
+            e = fit_eps(lpf, Df.n, Df.w)
+            lpt = T.group_logp(init_t + T.raw(bst, Xt), Dt.offsets)[Dt.y]
+            gain = bst.feature_importance("gain")
+            imp = sorted(zip(names, (gain / gain.sum()).tolist()), key=lambda x: -x[1])
+            return {"loss": -mix_logp(lpt, Dt.n, e), "eps": e, "trees": bst.best_iteration, "settings": prm,
+                    "tried": tried, "validation": v, "params": f"{bst.best_iteration} trees x {prm['num_leaves']} leaves",
+                    "importance": imp[:25], "_booster": bst, "_km": km, "_kc": kc, "_b": b, "_products": products}
+
+        print("  trees with products, tuning")
+        settings = T.grid(a.leaves, a.rates, a.min_leaf)
+        tw = fit_trees([], [], True, settings, tune=True)
+        chosen = tw["settings"]
+        print(f"  trees chosen: {chosen}")
+        tn = fit_trees([], [], False, [chosen])
+        results["trees"] = tw
+        results["trees without products"] = tn
+        if not a.no_ablation:
+            for g, cols in [(g, c) for g, c in groups.items()] + [(g, None) for g in ("ratings", "clock", "stage", "book")]:
+                if cols is not None:
+                    dm, dc = cols, (["ctx_deep_value"] if g == deep_name else [])
+                else:
+                    dm, dc = [], ctx_groups.get(g, [])
+                    if not dc:
+                        continue
+                print(f"  trees without {g}")
+                r_ = fit_trees(dm, dc, True, [chosen])
+                ablation_trees[g] = {"loss": r_["loss"], "eps": r_["eps"], "trees": r_["trees"], "cost": cost[g],
+                                     "dropped": dm + dc}
+        trees_out = tw
+
     # ablation
     ablation = {}
     if not a.no_ablation:
@@ -431,13 +518,23 @@ def main(argv=None) -> None:
     counts = boot_counts(Dt.clusters.max() + 1, a.boot, a.seed)
     named = {**{k: v["loss"] for k, v in results.items()}, **{f"maia {k}": v["loss"] for k, v in singles.items()}}
     out_models = {}
+    ref_trees = results["trees"]["loss"] if "trees" in results else None
     for k, l in named.items():
-        X = np.column_stack([l, l - results["linear"]["loss"], l - results["stack"]["loss"]])
+        X = np.column_stack([l, l - results["linear"]["loss"], l - results["stack"]["loss"]]
+                            + ([l - ref_trees] if ref_trees is not None else []))
         bm = boot_means(X, wt, Dt.clusters, counts)
         out_models[k] = {"test": est(wmean(l, wt), bm[:, 0]), "minus_linear": est(wmean(X[:, 1], wt), bm[:, 1]),
                          "minus_stack": est(wmean(X[:, 2], wt), bm[:, 2])}
+        if ref_trees is not None:
+            out_models[k]["minus_trees"] = est(wmean(X[:, 3], wt), bm[:, 3])
         src = results.get(k) or singles.get(k.removeprefix("maia "))
-        out_models[k].update({kk: v for kk, v in src.items() if kk not in ("loss",)})
+        out_models[k].update({kk: v for kk, v in src.items() if kk != "loss" and not kk.startswith("_")})
+    out_ablation_trees = {}
+    for g, v in ablation_trees.items():
+        d = v["loss"] - results["trees"]["loss"]
+        bm = boot_means(np.column_stack([v["loss"], d]), wt, Dt.clusters, counts)
+        out_ablation_trees[g] = {"test": est(wmean(v["loss"], wt), bm[:, 0]), "rise": est(wmean(d, wt), bm[:, 1]),
+                                 **{kk: vv for kk, vv in v.items() if kk != "loss"}}
     out_ablation = {}
     for g, v in ablation.items():
         d = v["loss"] - results["stack"]["loss"]
@@ -461,6 +558,22 @@ def main(argv=None) -> None:
             lin = results["linear"]["beta"][bi]
             g = {kname: beta_i[(base + inter_names).index(f"{feat}*{kname}")] for kname in ("rating", "clock")}
             inter_row = beta_i[bi] + g["rating"] * Xct[:, zr] + g["clock"] * Xct[:, zc]
+            trees_row = None
+            if trees_out is not None:
+                from tnh.eval import trees as T
+                km, kc = trees_out["_km"], trees_out["_kc"]
+                kmi = [move_names.index(c) for c in km]
+                kci = [ctx_names.index(c) for c in kc]
+                Xr = Dt.subset(move_names).X[:, kmi]
+                h = 0.1 * ms[col]
+                sc = []
+                for sign in (1, -1):
+                    Xp = Xr.copy()
+                    Xp[:, km.index(feat)] += sign * h
+                    Xd, _ = T.design(Xp, km, Ct[:, kci], kc, Dt.offsets, prod_cols, trees_out["_products"])
+                    sc.append(Xp @ trees_out["_b"] + T.raw(trees_out["_booster"], Xd))
+                d = (sc[0] - sc[1]) / (2 * h)
+                trees_row = np.add.reduceat(d, Dt.offsets[:-1]) / np.diff(Dt.offsets)
             tabs = {}
             for by, codes, labels in (("clock", cb, CLOCK_LABELS), ("rating", None, None)):
                 if by == "rating":
@@ -468,7 +581,7 @@ def main(argv=None) -> None:
                     codes = np.searchsorted(ub, rb)
                     labels = [str(int(x)) for x in ub]
                 ok = codes >= 0
-                X = np.column_stack([per_row, inter_row])[ok]
+                X = np.column_stack([per_row, inter_row] + ([trees_row] if trees_row is not None else []))[ok]
                 bm = boot_means(X, wt[ok], Dt.clusters[ok], counts, groups=codes[ok], n_groups=len(labels))
                 rows = []
                 for i, lab in enumerate(labels):
@@ -477,12 +590,16 @@ def main(argv=None) -> None:
                         continue
                     rows.append({"group": lab, "rows": int(m.sum()),
                                  "stack": est(wmean(X[m, 0], wt[ok][m]), bm[:, i, 0]),
-                                 "interactions": est(wmean(X[m, 1], wt[ok][m]), bm[:, i, 1]), "linear": lin})
+                                 "interactions": est(wmean(X[m, 1], wt[ok][m]), bm[:, i, 1]), "linear": lin,
+                                 **({"trees": est(wmean(X[m, 2], wt[ok][m]), bm[:, i, 2])} if trees_row is not None
+                                    else {})})
                 tabs[by] = rows
             eff[feat] = tabs
     for k, v in out_models.items():
         print(f"{k:>16}: test {v['test']['est']:.4f} [{v['test']['lo']:.4f}, {v['test']['hi']:.4f}] "
               f"minus linear {v['minus_linear']['est']:+.4f} [{v['minus_linear']['lo']:+.4f}, {v['minus_linear']['hi']:+.4f}]")
+    for g, v in out_ablation_trees.items():
+        print(f"  trees without {g:>10}: rise {v['rise']['est']:+.4f} [{v['rise']['lo']:+.4f}, {v['rise']['hi']:+.4f}]")
     for g, v in out_ablation.items():
         print(f"  without {g:>10}: rise {v['rise']['est']:+.4f} [{v['rise']['lo']:+.4f}, {v['rise']['hi']:+.4f}]")
     write_result(a.results, "stack", {
@@ -493,7 +610,8 @@ def main(argv=None) -> None:
         "move_features": move_names, "unused_nan_indicators": unused, "context_features": ctx_names,
         "context_groups": ctx_groups, "groups": groups, "cost": cost, "deep": deep_name,
         "options": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(a).items()},
-        "models": out_models, "ablation": out_ablation, "effective_weight": eff, "boot": a.boot,
+        "models": out_models, "ablation": out_ablation, "ablation_trees": out_ablation_trees,
+        "effective_weight": eff, "boot": a.boot,
         "provenance": provenance({"test": a.test, "fit": a.fit}, list(logp.values()) + list(engines.values()))})
 
 

@@ -491,7 +491,7 @@ def sec_logit(w, r):
 
 
 def sec_stack(w, r):
-    w("## A non-linear stack\n\n")
+    w("## Non-linear stacks: boosted trees and an MLP\n\n")
     if not r:
         w("_No `stack.json`._\n\n"); return
     o = r["options"]
@@ -505,27 +505,47 @@ def sec_stack(w, r):
       f"- Context features: {', '.join('`' + c + '`' for c in r['context_features'])}.\n"
       f"- The interaction logit is the linear logit plus each engine loss x rating and x log clock, and each log "
       f"probability x rating (standardised rating and clock), so its coefficients can be read.\n\n")
-    order = ["stack", "interactions", "linear+board", "linear"] + [k for k in r["models"] if k.startswith("maia ")]
-    w(table(["model", "parameters", "test, mixed", "minus linear logit", "minus stack"],
-            [[k, r["models"][k].get("params", ""), f(r["models"][k]["test"]), f(r["models"][k]["minus_linear"]),
-              f(r["models"][k]["minus_stack"])] for k in order if k in r["models"]]))
+    w("The boosted trees (LightGBM) use the exact group softmax as a custom objective (gradient `w(p - y)`, "
+      "hessian `w p(1 - p)` within the position), start from the linear logit's score, and get the per-move "
+      "features, the context repeated per move and, in the main variant, explicit products of each engine loss "
+      "and each log probability with rating, log clock and ply (a context feature alone cannot be split on at the "
+      "root: its gradient sums to zero over whole positions).\n\n")
+    order = ["trees", "trees without products", "stack", "interactions", "linear+board", "linear"] + \
+        [k for k in r["models"] if k.startswith("maia ")]
+    has_t = "trees" in r["models"]
+    w(table(["model", "size", "test, mixed", "minus linear logit", "minus MLP"] + (["minus trees"] if has_t else []),
+            [[k if k != "stack" else "MLP", r["models"][k].get("params", ""), f(r["models"][k]["test"]),
+              f(r["models"][k]["minus_linear"]), f(r["models"][k]["minus_stack"])]
+             + ([f(r["models"][k]["minus_trees"])] if has_t else []) for k in order if k in r["models"]]))
+    if has_t:
+        t = r["models"]["trees"]
+        w(f"\nTree settings tried (validation log loss on the held-out tournaments of the fitting sample; chosen: "
+          f"{t['settings']['num_leaves']} leaves, rate {t['settings']['learning_rate']}, min "
+          f"{t['settings']['min_data_in_leaf']} rows per leaf, {t['trees']} trees):\n\n")
+        w(table(["leaves", "rate", "min rows per leaf", "trees", "validation", "seconds"],
+                [[x["num_leaves"], x["learning_rate"], x["min_data_in_leaf"], x["trees"], f"{x['validation']:.4f}",
+                  x["seconds"]] for x in t["tried"]]))
+        w("\nGain importance of the trees (share of total gain, top 15; the linear start is not in it):\n\n")
+        w(table(["feature", "share"], [[f"`{n}`", f"{v:.3f}"] for n, v in t["importance"][:15]]))
     if r["ablation"]:
         w("\nAblation: the stack retrained without one group of features. The rise in test log loss is what the "
           "group earns; the cost is what it takes to compute per position, which the repertoire builder pays at "
           "every node.\n\n")
-        w(table(["without", "features dropped", "cost per position", "test", "rise"],
-                [[g, ", ".join(f"`{c}`" for c in v["dropped"]), v["cost"], f(v["test"]), f(v["rise"])]
-                 for g, v in r["ablation"].items()]))
+        abl_t = r.get("ablation_trees") or {}
+        w(table(["without", "features dropped", "cost per position", "MLP rise"] + (["trees rise"] if abl_t else []),
+                [[g, ", ".join(f"`{c}`" for c in v["dropped"]), v["cost"], f(v["rise"])]
+                 + ([f(abl_t[g]["rise"]) if g in abl_t else ""] if abl_t else []) for g, v in r["ablation"].items()]))
     for feat, tabs in r["effective_weight"].items():
         w(f"\n**Effective weight on `{feat}`**: the derivative of a move's score with respect to the raw feature, "
-          f"averaged over the moves of the positions in each group (stack, with a bootstrap interval over test "
-          f"tournaments for the model as fitted), the interaction logit's coefficient at the same contexts, and "
-          f"the linear logit's constant.\n\n")
+          f"averaged over the moves of the positions in each group (MLP by autograd, trees by central differences of "
+          f"0.1 standard deviations; intervals over test tournaments for the models as fitted), the interaction "
+          f"logit's coefficient at the same contexts, and the linear logit's constant.\n\n")
         for by, rows_ in tabs.items():
-            w(table([("minutes left" if by == "clock" else "mover's rating"), "rows", "stack", "interaction logit",
-                     "linear logit"],
-                    [[x["group"], x["rows"], f(x["stack"], 2), f(x["interactions"], 2), f"{x['linear']:.2f}"]
-                     for x in rows_]) + "\n")
+            ht = "trees" in rows_[0]
+            w(table([("minutes left" if by == "clock" else "mover's rating"), "rows"] + (["trees"] if ht else [])
+                    + ["MLP", "interaction logit", "linear logit"],
+                    [[x["group"], x["rows"]] + ([f(x["trees"], 2)] if ht else [])
+                     + [f(x["stack"], 2), f(x["interactions"], 2), f"{x['linear']:.2f}"] for x in rows_]) + "\n")
     w("\n")
 
 
