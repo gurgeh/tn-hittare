@@ -109,7 +109,7 @@ def lichess_broadcast_drop(h: dict[str, str]) -> str | None:
 
 # Chess960 and engine-assisted "freestyle" events, named as such. TWIC rarely
 # carries a FEN tag for them, so the name is what there is.
-TWIC_VARIANT_RE = re.compile(r"\b960\b|chess ?960|fischer ?random|\bfrc\b|freestyle|\bshuffle\b", re.IGNORECASE)
+TWIC_VARIANT_RE = re.compile(r"\b960\b|chess ?960|chess ?9lx|\b9lx\b|fischer ?random|\bfrc\b|freestyle|\bshuffle\b", re.IGNORECASE)
 _SPACES_RE = re.compile(r"\s+")
 
 

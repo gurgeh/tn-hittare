@@ -24,6 +24,7 @@ import argparse
 import datetime
 import hashlib
 import io
+import itertools
 import json
 import multiprocessing
 import re
@@ -458,14 +459,20 @@ def apply_round_tempo(df: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def assemble(df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame, int]:
-    """Parsed rows -> (games, extra, number of duplicates removed).
+def assemble(df: pl.DataFrame, merge_near_copies: bool = True) -> tuple[pl.DataFrame, pl.DataFrame, int, dict]:
+    """Parsed rows -> (games, extra, number of duplicates removed, info).
 
     Tempo by broadcast round first (``apply_round_tempo``), over all copies.
     De-duplication: the copy with the most clock comments wins, then the copy
     with more tags filled in, then the source priority, then the game URL and
     file, so that the choice is stable. The tournament nodes of all copies are
     joined; a tournament is a connected component, named by its smallest node.
+
+    Near copies (``near_copy_links``: the same date and moves under other
+    names, or a truncated copy) are then merged too: the copy with clocks is
+    kept, else the longer one, else the order above. The kept game keeps its
+    own ``game_id``; the removed copies' ids are listed in ``games_extra``
+    (``merged_near_copy_ids``). Their tournaments are joined either way.
 
     The choice is made on a narrow frame of keys and row numbers, and the wide
     frame is gathered once, in game_id order: with TWIC the wide frame is
@@ -517,7 +524,11 @@ def assemble(df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame, int]:
         tid.map_elements(split_of, return_dtype=pl.String).alias("split"),
         copies["_n_copies"],
         copies["_copy_sources"],
+        pl.lit([], dtype=pl.List(pl.String)).alias("_merged_near_copy_ids"),
     )
+    if merge_near_copies and links.height:
+        kept, removed = merge_near_copy_groups(kept, links)
+        info["near_copies_removed"] = removed
     if kept["game_id"].n_unique() != len(kept):
         dup = kept.filter(pl.col("game_id").is_duplicated()).select("game_id", "white", "black", "date", "_game_url").head(10)
         raise RuntimeError(f"game_id is not unique after de-duplication:\n{dup}")
@@ -535,8 +546,54 @@ def assemble(df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame, int]:
         pl.col("_result_token_missing").alias("result_token_missing"),
         pl.col("_cut_king_ending").alias("cut_illegal_central_king"),
         pl.col("_stripped_central_king").alias("stripped_central_king_moves"),
+        pl.col("_merged_near_copy_ids").alias("merged_near_copy_ids"),
     )
     return games, extra, n_dup, info
+
+
+def merge_near_copy_groups(kept: pl.DataFrame, links: pl.DataFrame) -> tuple[pl.DataFrame, dict]:
+    """Keep one game of each group of near copies: the one with clocks, else the longest.
+
+    ``links`` holds row numbers of ``kept``. Groups are the connected
+    components of the links. Returns the kept frame without the other copies
+    (the winner listing their ids and the union of their sources) and counts.
+    """
+    parent = list(range(kept.height))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for a, b in links.select("i", "j").iter_rows():
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+    members = sorted({int(x) for pair in links.select("i", "j").iter_rows() for x in pair})
+    comp = pl.DataFrame({"_r": members, "_comp": [find(m) for m in members]}, schema={"_r": pl.UInt32, "_comp": pl.UInt32})
+    cand = comp.join(
+        kept.select(pl.int_range(pl.len(), dtype=pl.UInt32).alias("_r"), "game_id", "_clock_share", "n_plies",
+                    "_n_tags", "_priority", "_game_url", "_file", "_copy_sources"),
+        on="_r",
+    ).sort(["_comp", "_clock_share", "n_plies", "_n_tags", "_priority", "_game_url", "_file"],
+           descending=[False, True, True, True, False, False, False], nulls_last=True)
+    groups = cand.group_by("_comp", maintain_order=True).agg(
+        pl.col("_r").first().alias("_win"),
+        pl.col("game_id").slice(1).alias("_merged"),
+        pl.col("_r").slice(1).alias("_lose"),
+        pl.col("_copy_sources").list.explode().unique().sort().alias("_sources"),
+    )
+    lose = groups["_lose"].explode().drop_nulls()
+    upd = groups.select(pl.col("_win").alias("_r"), "_merged", "_sources")
+    kept = kept.with_columns(pl.int_range(pl.len(), dtype=pl.UInt32).alias("_r")).join(
+        upd, on="_r", how="left", maintain_order="left")
+    kept = kept.with_columns(
+        _merged_near_copy_ids=pl.coalesce("_merged", "_merged_near_copy_ids"),
+        _copy_sources=pl.coalesce("_sources", "_copy_sources"),
+    ).filter(~pl.col("_r").is_in(lose.implode())).drop("_r", "_merged", "_sources")
+    removed = {"games_removed": int(lose.len()), "groups": groups.height}
+    return kept, removed
 
 
 NEAR_COPY_MIN_PLIES = 20
@@ -569,9 +626,11 @@ def near_copy_links(kept: pl.DataFrame) -> pl.DataFrame:
     for ids, moves in groups.select("i", "moves_uci").iter_rows():
         order = sorted(range(len(ids)), key=lambda x: len(moves[x]))
         for x_pos, x in enumerate(order):
-            for y in order[x_pos + 1:]:
-                if moves[y].startswith(moves[x] + " "):
-                    pairs.append((ids[x], ids[y]))
+            longer = [y for y in order[x_pos + 1:] if moves[y].startswith(moves[x] + " ")]
+            # a truncated copy belongs to a longer game only when the longer copies are one
+            # game (each a prefix of the next); two different continuations stay apart
+            if all(moves[b].startswith(moves[a] + " ") or moves[b] == moves[a] for a, b in itertools.pairwise(longer)):
+                pairs.extend((ids[x], ids[y]) for y in longer)
     trunc = pl.DataFrame(pairs, schema={"i": pl.UInt32, "j": pl.UInt32}, orient="row").with_columns(kind=pl.lit("truncated"))
     return pl.concat([same.select("i", "j", "kind"), trunc])
 

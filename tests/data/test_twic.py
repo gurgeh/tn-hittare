@@ -101,7 +101,7 @@ def pgn(event, site, white, black, moves, date="2023.12.27", extra=""):
             f'[Black "{black}"]\n[Result "1-0"]\n{extra}\n{moves} 1-0\n')
 
 
-def test_near_copies_stay_two_games_but_share_a_tournament():
+def test_near_copies_are_merged_and_the_kept_id_does_not_change():
     lb_texts = [
         pgn("Rapid Cup", "?", "Gareyev, Timur", "Nepomniachtchi, Ian", MOVES22,
             extra='[BroadcastName "Some Broadcast 2023"]\n[BroadcastURL "https://lichess.org/broadcast/some/round-1/ZZZZZZZZ"]\n'),
@@ -114,10 +114,41 @@ def test_near_copies_stay_two_games_but_share_a_tournament():
     ]
     lb, _, _ = parse_texts(lb_texts, SOURCES["lichess_broadcast"], "lb")
     tw, _, _ = parse_texts(tw_texts, SOURCES["twic"], "twic")
-    games, extra, n_dup, info = assemble(pl.concat([lb, tw]))
-    assert n_dup == 0 and len(games) == 4
+    rows = pl.concat([lb, tw])
+    before, _, _, _ = assemble(rows, merge_near_copies=False)
+    games, extra, n_dup, info = assemble(rows)
+    assert n_dup == 0 and len(before) == 4 and len(games) == 2
     assert info["near_copy_links"] == {"same_date_moves": 1, "truncated": 1}
-    t = dict(games.select(pl.col("white"), "tournament_id").iter_rows())
-    assert t["Gareev,T"] == t["Gareyev, Timur"]
-    assert t["Alpha,A"] == t["Alpha, Anna"]
-    assert t["Gareev,T"] != t["Alpha,A"]
+    assert info["near_copies_removed"] == {"games_removed": 2, "groups": 2}
+    # no kept game changes its id
+    assert set(games["game_id"]) <= set(before["game_id"])
+    g = games.join(extra, on="game_id")
+    alpha = g.filter(pl.col("white").str.starts_with("Alpha")).row(0, named=True)
+    assert alpha["white"] == "Alpha, Anna" and alpha["n_plies"] == 23  # the longer copy
+    removed = before.filter(pl.col("white") == "Alpha,A")["game_id"].item()
+    assert alpha["merged_near_copy_ids"] == [removed]
+    assert alpha["copy_sources"] == ["lichess_broadcast", "twic"]
+    # the tournaments of both copies are still one
+    assert before.filter(pl.col("white").str.starts_with("Alpha"))["tournament_id"].n_unique() == 1
+
+
+def test_truncated_copy_with_two_different_continuations_is_left_alone():
+    from tnh.data.parse import near_copy_links
+
+    base = MOVES22
+    texts = [
+        pgn("E", "X", "Alpha,A", "Beta,B", base),
+        pgn("E", "X", "Alpha,A", "Beta,B", base + " 12. g5"),
+        pgn("E", "X", "Alpha,A", "Beta,B", base + " 12. h4"),
+    ]
+    tw, _, _ = parse_texts(texts, SOURCES["twic"], "twic")
+    games, _, _, _ = assemble(tw, merge_near_copies=False)
+    assert near_copy_links(games).height == 0
+
+
+def test_9lx_is_a_variant():
+    from tnh.data.sources import twic_drop
+
+    assert twic_drop({"Event": "Champ Showdown 9LX Blitz", "Site": "Saint Louis USA"}) == "variant"
+    assert twic_drop({"Event": "Chess9LX Showdown", "Site": "Saint Louis USA"}) == "variant"
+    assert twic_drop({"Event": "Champions Showdown", "Site": "Saint Louis USA"}) is None
