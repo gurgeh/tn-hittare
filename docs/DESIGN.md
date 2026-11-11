@@ -25,6 +25,7 @@ corpus/games.parquet
 corpus/games_extra.parquet        per-source detail behind the parsing decisions; not an input to anything downstream
 corpus/parse_stats.json           what was dropped and why
 corpus/positions.parquet
+corpus/book_exit.parquet           per game, the ply at which it leaves book for book_count 2, 5, 20 and 100
 corpus/samples/<name>.parquet     fixed subsets of positions.parquet with extra columns; what features are computed on
 corpus/samples/<name>.window.parquet   the same sample, window rows only
 corpus/blitz_ref/                 the blitz reference in the corpus schema
@@ -42,6 +43,11 @@ One row per game: standard chess between humans over the board, every tempo,
 every rating. Variants, non-standard starting positions, engine games, simuls
 and online events are dropped at parse time, as are games without a result,
 without moves or with an illegal move. `parse_stats.json` counts each reason.
+
+A final king move to d4, d5, e4 or e5 is removed, legal or not, at most once
+per side: it is the arbiter placing the kings in the centre of a DGT board to
+signal the result. The game is kept with its result. An illegal move of any
+other kind drops the game.
 Filtering on tempo and rating happens later.
 
 | column | type | meaning |
@@ -59,7 +65,7 @@ Filtering on tempo and rating happens later.
 | `result` | str | `1-0`, `0-1`, `1/2-1/2`. Games with any other result are dropped |
 | `time_control_raw` | str, nullable | The `TimeControl` tag, verbatim |
 | `tempo` | str | `classical`, `rapid`, `blitz`, `unknown` |
-| `tempo_source` | str | How `tempo` was decided: `tag`, `clock`, `round`, `event_name`, `assumed`, `none` |
+| `tempo_source` | str | How `tempo` was decided: `clock`, `tag`, `event_type`, `round`, `event_name`, `assumed`, `none` |
 | `base_s`, `inc_s` | int, nullable | Base time and increment of the first time-control period. Estimates when `tempo_source` is `clock` |
 | `has_clock` | bool | True when at least 80 % of the moves carry `%clk` |
 | `n_plies` | int | |
@@ -76,17 +82,30 @@ How `tempo` is decided, in order. The first that applies wins.
 1. `clock`: the clock readings, where they contradict the tag or the tag is
    missing or unreadable.
 2. `tag`: the `TimeControl` tag.
-3. `round`: every other game with a known tempo in the same broadcast round
+3. `event_type`: a ChessBase `EventType` tag that says rapid or blitz. A
+   bare `swiss` or `tourn` says nothing.
+4. `round`: every other game with a known tempo in the same broadcast round
    has the same tempo.
-4. `event_name`: the words rapid, blitz and the like in the event name.
-5. `assumed`: the source's default. TWIC carries no time control and no
-   clocks; a TWIC game with no sign of rapid or blitz is taken as classical.
-   Anything measured on classical games must be able to leave these out.
-6. `none`: `tempo` is `unknown`.
+5. `event_name`: the words rapid, blitz and the like in the event name.
+6. `assumed`: the source's default. TWIC rarely carries a time control and
+   never clocks; a TWIC game with no sign of rapid or blitz is taken as
+   classical. Anything measured on classical games must be able to leave
+   these out.
+7. `none`: `tempo` is `unknown`.
+
+Never `assumed`, always `unknown` unless something above decides: a game
+whose name says tiebreak or playoff, and in a knockout event any game in
+sub-round 3 or later (`3.3`), since those are the rapid and blitz tiebreaks
+played under the event's own name.
+
+Online events are dropped. In TWIC they are marked by a `Site` ending in
+` INT`.
 
 The same game arriving from two sources is stored once. The copy with clock
 times wins, then the copy with more tags filled in. Two copies of one game
-put their tournaments in the same split.
+put their tournaments in the same split. So do near copies, which the key
+does not catch and which are still stored as two games: the same date and
+moves under differently spelt names, and a truncated copy of a longer game.
 
 ## `corpus/positions.parquet`
 
