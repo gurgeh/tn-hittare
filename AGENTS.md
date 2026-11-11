@@ -30,6 +30,12 @@ it. The owner is a 2200 FIDE player and a senior programmer.
   same time add up to more than 20 GB. Measure before you scale: run on a
   tenth of the data first and read the "memory peak" line that systemd prints
   (`journalctl --user -u tnh-NAME`).
+- **Engine processes: never more than the machine's 8 physical cores, counted
+  over everything running at the same time.** Hyperthreads add nothing to a
+  chess engine; the benchmark here showed the same throughput at 16 processes
+  as at 8. Leave cores for the other jobs: 6 Stockfish processes when
+  something else CPU-bound runs beside it. The same limit holds for worker
+  pools of any kind.
 - `positions.parquet` has 212 million rows. Never collect it, or a join
   against it, whole. Scan it lazily, select the columns you need, filter
   before you join, and work through it in batches of games.
