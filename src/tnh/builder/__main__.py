@@ -62,7 +62,8 @@ def _gap_one(game: Game, N_max: int) -> list[dict]:
 
 def cmd_gap(a) -> None:
     kinds = [("tree", None)] + [(f"dag pool {p}", p) for p in a.pools]
-    print(f"Share of the optimal gain over N=0 (brute force), N=1..{a.N}, {a.seeds} seeds per kind, depth {a.depth}.")
+    print(f"Share of the optimal gain over N=0 (brute force), N=1..{a.N}, {a.seeds} seeds per kind, "
+          f"depth {a.tree_depth} for trees, {a.depth} for DAGs.")
     print("dp_claimed: the DP's own value. dp_repaired: its learned set made consistent, evaluated exactly.")
     print("final: after the overshoot starts and local search. greedy: local search from nothing, for comparison.\n")
     print(f"{'kind':14s} {'cases':>5s}  " + "  ".join(f"{c:>22s}" for c in ("dp_claimed", "dp_repaired", "final", "greedy")))
@@ -70,12 +71,16 @@ def cmd_gap(a) -> None:
         recs, skipped = [], 0
         for s in range(a.seeds):
             rng = np.random.default_rng(10_000 + s)
-            g = random_game(rng, depth=a.depth, branching=(2, 3), dag=pool is not None, pool=pool)
+            g = random_game(rng, depth=a.depth if pool else a.tree_depth, branching=(2, 3),
+                            dag=pool is not None, pool=pool)
             game = Game(g, Params(eps_white=a.eps))
             if len(candidates(game)) > a.max_cand:
                 skipped += 1
                 continue
             recs += _gap_one(game, a.N)
+        if not recs:
+            print(f"{name:14s}     0  ({skipped} games skipped: more than {a.max_cand} positions to enumerate)")
+            continue
         cols = []
         for c in ("dp_claimed", "dp_repaired", "final", "greedy"):
             x = np.array([r[c] for r in recs])
@@ -176,6 +181,7 @@ def main(argv=None) -> None:
     p.add_argument("--eps", type=float, default=0.05)
     p.add_argument("--pools", type=int, nargs="*", default=[3, 5, 8])
     p.add_argument("--max-cand", type=int, default=16)
+    p.add_argument("--tree-depth", type=int, default=4)
     p.set_defaults(fn=cmd_gap)
 
     p = sub.add_parser("chess")
