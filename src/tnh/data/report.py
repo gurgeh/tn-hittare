@@ -32,7 +32,49 @@ SEED = 20261111
 LB, TWIC = "lichess_broadcast", "twic"
 
 SPOT_CHECK_NOTE = """\
-(Not yet checked by hand for this build.)
+What was found when the three samples below were looked at by hand (corpus
+built 2026-11-11 with both sources; the samples use a fixed seed):
+
+- **Broadcast `unknown` (20 games).** After the round rule, what is left is
+  team leagues and opens relayed without clocks or tags, where no game of the
+  round has a clock either: the Slovak Extraliga (three), the Women's and 2.
+  Women's Bundesliga (three), Oberliga Württemberg (two), the Swiss and Israeli
+  team leagues, the European Club Cup, Manaus Open (two), Buenos Aires Masters,
+  the Pfälzischer Kongress (two), First Saturday Budapest, the Saxony seniors,
+  ITT de la Bandera and a Chinese master-candidate tournament. All twenty are
+  classical events by their nature; none is a rapid or blitz game.
+- **Broadcast `classical` (20 games).** All classical: eighteen at 90+30 (by
+  tag or by clocks that read 5 218-5 459 s after the first move), the
+  German U8 championship at 60+10 (classical by the FIDE rule, 60 min + 60 x
+  10 s), and one game classical by its round (Odense championship).
+- **TWIC `assumed` classical (20 games).** Nineteen are from events that are
+  classical: opens (San Sebastian, Caioba, Groningen, Glassy Stream, Sozina,
+  Wroclaw, Eurasia Cup, AXPG Brazil, Politiken Cup, Patras, Delhi), national
+  and youth championships (Russian women, Yugoslav youth, Italian), the Czech
+  Extraliga, NATO championship, Biel MTO, Gausdal and the World Seniors. The
+  twentieth, the 1st Thanksgiving Open in Stillwater (USA, 2009), is a US
+  weekend Swiss whose time control I cannot tell; such events often play G/60
+  or faster in early rounds. So about 19 of 20 are really classical. What
+  `assumed` cannot catch is a rapid game in an event whose name does not say
+  so: knockout tiebreaks are caught by the round number (`n.3` on), other
+  play-offs only by name.
+"""
+
+
+KING_STRIP_FINDINGS = """\
+Looked at by hand: the early strips are real moves, not the arbiter's
+signal: a king walking up the board in a queenless middlegame or an early
+endgame after mass exchanges (Polgar-Mamedyarov 2002, Shirov-Cazacu 2019), a
+king hunted into the centre before resigning (Vaibhav Nema-Lalit Rajoriya,
+19 plies), and draws by repetition where the repeating move is a king step
+(Yuffa-Narayanan, Kd5-e6). The cost is the last move of about 1 % of the
+stripped games, at the end of the game, in positions that are either won
+or repeated. The share before ply 60 is 1.1 %, so this is not a noticeable
+share; the sample is listed because it was asked for.
+
+TWIC's rate of legal strips (2 % of its games) is the base rate of games that
+simply end with a king move to the centre; the broadcasts' higher rate (3.5 %)
+is that plus the arbiter's signal where it happened to be legal.
 """
 
 
@@ -77,7 +119,8 @@ def gid_int() -> pl.Expr:
 
 
 def main() -> None:
-    games = pl.read_parquet(CORPUS / "games.parquet")
+    # the first two clocks are all the report shows; the full lists would double the memory
+    games = pl.scan_parquet(CORPUS / "games.parquet").with_columns(pl.col("clocks_s").list.head(2)).collect()
     extra = pl.read_parquet(CORPUS / "games_extra.parquet")
     stats = json.loads((CORPUS / "parse_stats.json").read_text())
     g = games.join(extra, on="game_id")
@@ -126,8 +169,10 @@ def main() -> None:
     w("## Games by source and year, before and after de-duplication\n")
     before = pl.DataFrame(stats["games_before_dedup"]).rename({"len": "before"})
     after = g.group_by("source", "year").len().rename({"len": "after"})
-    t = before.join(after, on=["source", "year"], how="full", coalesce=True).fill_null(0)
-    t = t.pivot(on="source", index="year", values=["before", "after"]).sort("year", nulls_last=True).fill_null(0)
+    t = before.join(after, on=["source", "year"], how="full", coalesce=True, nulls_equal=True)
+    t = t.with_columns(pl.col("before", "after").fill_null(0))
+    t = t.pivot(on="source", index="year", values=["before", "after"]).sort("year", nulls_last=True)
+    t = t.with_columns(pl.exclude("year").fill_null(0))
     order = ["year"] + [f"{k}_{s}" for s in sources for k in ("before", "after")]
     w("`before`: games parsed and kept by each source's rules; `after`: games whose kept copy is from that source. "
       "Within TWIC the same game often appears in two issues; across sources the broadcast copy with clocks wins.\n")
@@ -205,15 +250,17 @@ def main() -> None:
     tsrc = g.group_by("tournament_id").agg(
         has_lb=pl.col("copy_sources").list.contains(LB).any(),
         has_twic=pl.col("copy_sources").list.contains(TWIC).any(),
-        twic_events=pl.struct("event", "site", "year").filter(pl.col("copy_sources").list.contains(TWIC)).n_unique(),
+        # TWIC events are named only on games whose kept copy is TWIC's; a matched game carries the broadcast's tags
+        twic_events=pl.concat_str("event", "site", pl.col("year").cast(pl.String), separator="|", ignore_nulls=True)
+        .filter(pl.col("source") == TWIC).n_unique(),
         n=pl.len(),
     )
     joined = tsrc.filter(pl.col("has_lb") & pl.col("has_twic"))
     w(f"- Tournaments: {games['tournament_id'].n_unique():,}; tournaments whose games span two splits: **{span}** "
       "(the split is a function of `tournament_id`, so this checks that no game was given another split).")
     w(f"- Tournaments holding both broadcast and TWIC games (a TWIC event joined to a broadcast tournament through a "
-      f"shared game): **{joined.height:,}**, holding {joined['twic_events'].sum():,} distinct TWIC events "
-      f"(event, site, year) and {joined['n'].sum():,} games.")
+      f"shared game): **{joined.height:,}**, holding {joined['n'].sum():,} games and "
+      f"{joined['twic_events'].sum():,} distinct TWIC events (event, site, year, counted on the games kept from TWIC).")
     tour = games.group_by("tournament_id").len().sort("len", descending=True)
     w(f"- The largest tournament has {tour['len'][0]:,} games ({tour['len'][0] / games.height:.2%} of the corpus): "
       f"`{tour['tournament_id'][0]}`. Split of all games: "
@@ -229,27 +276,30 @@ def main() -> None:
       "`book_count=5, max_ply=60, max_ply_no_clock=40, min_clock_s=600`.\n")
     src_of = games.select(gid_int().alias("gid"), "source")
     win_rows = []
+    # one (source, band, split) at a time: the band and the split are the same on every row of a
+    # game, so filtering on them first keeps whole games and keeps memory down
     for src in sources:
         ids = src_of.filter(pl.col("source") == src).select("gid")
-        pos = (
-            pl.scan_parquet(pos_path)
-            .select(gid_int().alias("gid"), "ply", "pos_count", "clock_mover_s", "mover_elo", "opp_elo", "split")
-            .join(ids.lazy(), on="gid", how="semi")
-            .rename({"gid": "game_id"})
-            .collect()
-        )
         for bname, (lo, hi) in BANDS.items():
-            for bc in BOOK_COUNTS:
-                t = (
-                    pos.filter(in_window(pos, book_count=bc))
-                    .filter(band_expr("mover_elo", "opp_elo", lo, hi))
-                    .group_by("split").agg(rows=pl.len(), games=pl.col("game_id").n_unique())
+            counts: dict[tuple[int, str], tuple[int, int]] = {}
+            for split in ("train", "val", "test"):
+                pos = (
+                    pl.scan_parquet(pos_path)
+                    .filter((pl.col("split") == split) & band_expr("mover_elo", "opp_elo", lo, hi))
+                    .select(gid_int().alias("gid"), "ply", "pos_count", "clock_mover_s")
+                    .join(ids.lazy(), on="gid", how="semi")
+                    .rename({"gid": "game_id"})
+                    .collect()
                 )
-                d = {r["split"]: (r["rows"], r["games"]) for r in t.iter_rows(named=True)}
+                for bc in BOOK_COUNTS:
+                    t = pos.filter(in_window(pos, book_count=bc)).select(rows=pl.len(), games=pl.col("game_id").n_unique())
+                    counts[(bc, split)] = (t["rows"][0], t["games"][0])
+                del pos
+            for bc in BOOK_COUNTS:
                 win_rows.append({"source": src, "band": bname, "book_count": bc,
-                                 **{f"{s} rows": d.get(s, (0, 0))[0] for s in ("train", "val", "test")},
-                                 "test games": d.get("test", (0, 0))[1], "all rows": sum(v[0] for v in d.values())})
-        del pos
+                                 **{f"{sp} rows": counts[(bc, sp)][0] for sp in ("train", "val", "test")},
+                                 "test games": counts[(bc, "test")][1],
+                                 "all rows": sum(counts[(bc, sp)][0] for sp in ("train", "val", "test"))})
     win = pl.DataFrame(win_rows)
     tot = win.group_by("band", "book_count").agg(pl.exclude("source").sum()).with_columns(source=pl.lit("all"))
     win = pl.concat([win, tot.select(win.columns)]).sort("band", "book_count", "source")
@@ -355,14 +405,24 @@ def king_signal(g: pl.DataFrame, stats: dict, w) -> None:
     ).filter((pl.col("cut_at_illegal_central_king") + pl.col("legal_central_king_stripped")) > 0).sort("source", "year")
     w(md_table(year_str(t)) + "\n")
     ill = {src: stats["dropped_by_source"][src].get("illegal_move", 0) for src in stats["dropped_by_source"]}
+    n_cut_lb = g.filter(cut & (pl.col("source") == LB)).height
     w("Games still dropped for an illegal move: " + ", ".join(f"{s} {n:,}" for s, n in ill.items()) + ". "
-      "Step 0 dropped 4,626 broadcast games for an illegal move under the old rule.\n")
+      f"Step 0 dropped 4,626 broadcast games for an illegal move; {n_cut_lb:,} broadcast games are now cut at an "
+      f"illegal central king move and kept, and {ill.get(LB, 0):,} still dropped; the other "
+      f"{4626 - n_cut_lb - ill.get(LB, 0):,} of the 4,626 were not traced one by one "
+      "(de-duplication now chooses among more copies, so some of them may be kept from TWIC). "
+      "TWIC has no illegal central king moves: its games are typed or cleaned before publication. The cuts stop "
+      "after 2023, which suggests the relay began to reject illegal moves then; from then on the signal shows only "
+      "as a legal king move, and the legal strips in the broadcasts rise accordingly.\n")
     s = g.filter(strip & ~cut).with_columns(ply=pl.col("n_plies"))  # the ply of the (first) stripped move
     if s.height:
         bins = [0, 40, 60, 80, 100, 120, 10_000]
         labels = ["0-39", "40-59", "60-79", "80-99", "100-119", "120+"]
-        d = s.with_columns(bucket=pl.col("ply").cut(bins[1:-1], labels=labels, left_closed=True)).group_by("source", "bucket").len()
-        d = d.with_columns(pl.col("bucket").cast(pl.String)).pivot(on="bucket", index="source", values="len").fill_null(0)
+        bucket = pl.lit(labels[-1])
+        for edge, label in reversed(list(zip(bins[1:-1], labels[:-1], strict=True))):
+            bucket = pl.when(pl.col("ply") < edge).then(pl.lit(label)).otherwise(bucket)
+        d = s.with_columns(bucket=bucket).group_by("source", "bucket").len()
+        d = d.pivot(on="bucket", index="source", values="len").fill_null(0)
         w("Legal central king moves stripped (and no illegal one cut), by the ply of the stripped move:\n")
         w(md_table(d.select("source", *[c for c in labels if c in d.columns])) + "\n")
         early = s.filter(pl.col("ply") < 60)
@@ -370,8 +430,9 @@ def king_signal(g: pl.DataFrame, stats: dict, w) -> None:
             ex = early.sample(min(20, early.height), seed=SEED).select(
                 "source", pl.col("event").str.slice(0, 40), "date", "white", "black", "result", "ply",
                 pl.col("moves_uci").str.split(" ").list.tail(4).list.join(" ").alias("last moves kept"), "game_url")
-            w(f"{early.height:,} of them before ply 60; a sample of {ex.height}:\n")
+            w(f"{early.height:,} of them before ply 60 ({early.height / s.height:.1%}); a sample of {ex.height}:\n")
             w(md_table(ex) + "\n")
+            w(KING_STRIP_FINDINGS)
 
 
 def near_duplicates(g: pl.DataFrame) -> str:

@@ -11,9 +11,9 @@ a time; each chunk's rows go to a part file, so memory stays flat.
 tempo, that reach the position at any ply (the start and the final position
 included, each game counted once). The workers return a 64-bit hash of every
 ``pos_key`` those games reach; the counts are taken over all of them, and
-then joined to the rows part by part. With 41 million distinct keys (broadcasts
-alone) the chance of any hash collision is about 1 in 20 000; with three times
-as many, about 1 in 2 500, and a collision moves one count by a few games.
+then joined to the rows part by part. With 179 million distinct keys
+(broadcasts and TWIC, 2026-11) the chance of any collision at all is about
+1 in 1 000, and a collision would move one count by a few games.
 
 Besides ``positions.parquet`` it writes ``book_exit.parquet``, for the
 report: per game, the first ply where the count is below 2, 5, 20 and 100,
