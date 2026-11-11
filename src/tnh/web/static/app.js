@@ -306,7 +306,7 @@ const COLS = [
     {k: "reach", h: "Reach", t: "Games reaching the position after the move by any move order; unfiltered, all tempi"},
     {k: "trend", h: "Trend", num: false, t: "Share per year. ▲/▼: recent share differs from the earlier share beyond chance"},
     {k: "maia", h: "Maia", t: "Maia-3 probability for the side to move at the set ratings, % (blitz scale)"},
-    {k: "delta", h: "Δ", t: "Maia − database share, percentage points"},
+    {k: "delta", h: "Δ", t: "Maia − database share, percentage points. Fair only when the rating filter is near the Maia ratings; Maia is on a blitz scale"},
     {k: "sf", h: "SF", t: "Stockfish after the move, pawns from the side to move's view"},
 ]
 

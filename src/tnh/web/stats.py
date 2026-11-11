@@ -13,6 +13,7 @@ says the source cannot tell.
 from __future__ import annotations
 
 import math
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from statistics import NormalDist
 
@@ -23,6 +24,7 @@ from tnh.data.edges import EdgeDB, pos_hash
 
 TEMPI = ("classical", "rapid", "blitz", "unknown")
 YEAR_MAX = 32767
+_POOL = ThreadPoolExecutor(5, thread_name_prefix="stats")
 
 
 @dataclass(frozen=True)
@@ -146,10 +148,15 @@ def report(stats: Stats, board: chess.Board, f: Filters, rule: TrendRule = Trend
     white = board.turn == chess.WHITE
     kw = f.edgedb()
     db = stats.db
-    total_row = db.total(h)
-    moves = db.moves(h, **kw)
-    by_year = db.moves_by_year(h, **kw).filter(pl.col("year") > 0) if moves.height else None
-    kids = db.children(h, **kw) if moves.height else None
+    # Four independent lookups; polars releases the GIL, so they overlap.
+    calls = {"total": lambda: db.total(h), "moves": lambda: db.moves(h, **kw),
+             "by_year": lambda: db.moves_by_year(h, **kw), "children": lambda: db.children(h, **kw),
+             "parents": lambda: stats.parents(h, f)}
+    futures = {k: _POOL.submit(fn) for k, fn in calls.items()}
+    got = {k: fut.result() for k, fut in futures.items()}
+    total_row, moves = got["total"], got["moves"]
+    by_year = got["by_year"].filter(pl.col("year") > 0) if moves.height else None
+    kids = got["children"] if moves.height else None
     reach = dict(zip(kids["move"].to_list(), kids["child_n"].to_list())) if kids is not None else {}
 
     total_n = int(moves["n"].sum()) if moves.height else 0
@@ -203,7 +210,7 @@ def report(stats: Stats, board: chess.Board, f: Filters, rule: TrendRule = Trend
                           "z": z, "p": p, "flag": (1 if z > 0 else -1) if p < rule.alpha / k else 0}
 
     move_orders = None
-    parents = stats.parents(h, f)
+    parents = got["parents"]
     if parents is not None:
         move_orders = []
         for epd, mv, n in parents.select("parent_epd", "move", "n").iter_rows():
