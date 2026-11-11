@@ -1,0 +1,32 @@
+#!/bin/sh
+# tnh-run NAME MEM_GB CMD...
+#
+# Run CMD as a transient systemd user service with a hard memory cap.
+#
+# Why: a job that runs inside the terminal shares the terminal's cgroup. When
+# it eats the machine's memory, systemd-oomd kills that whole cgroup: the
+# terminal tab, the agent and every other job in it. That happened on
+# 2026-11-11 (25 GB peak in a sampler). As its own service a job that passes
+# its cap is killed alone, and it keeps running if the terminal goes away.
+#
+# - Output goes to $TNH_DATA/logs/NAME.log (default ~/out/tn-hittare/logs).
+# - Blocks until CMD ends and returns non-zero if it failed or was killed.
+# - Holds an idle/sleep inhibitor while CMD runs.
+# - The working directory is the repository root.
+# - Stop a job:  systemctl --user stop tnh-NAME
+# - List jobs:   systemctl --user list-units 'tnh-*'
+set -eu
+[ $# -ge 3 ] || { echo "usage: tnh-run NAME MEM_GB CMD..." >&2; exit 2; }
+NAME=$1; MEM=$2; shift 2
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+DATA=${TNH_DATA:-$HOME/out/tn-hittare}
+LOG=$DATA/logs/$NAME.log
+mkdir -p "$DATA/logs"
+echo "tnh-run: unit tnh-$NAME, cap ${MEM}G, log $LOG" >&2
+exec systemd-run --user --quiet --collect --wait \
+  --unit="tnh-$NAME" \
+  --working-directory="$ROOT" \
+  -p MemoryMax="${MEM}G" -p MemorySwapMax=0 \
+  -p StandardOutput="append:$LOG" -p StandardError="append:$LOG" \
+  -E PATH="$PATH" -E HOME="$HOME" -E TNH_DATA="$DATA" ${TNH_LC0:+-E TNH_LC0="$TNH_LC0"} \
+  systemd-inhibit --what=idle:sleep --why="tn-hittare: $NAME" "$@"
