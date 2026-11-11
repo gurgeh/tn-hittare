@@ -184,3 +184,20 @@ def test_counts_from_the_position_statistics():
 def test_dict_counts_refuse_illegal_moves():
     with pytest.raises(ValueError, match="not legal"):
         DictCounts({1: {"e2e5": 3}}).counts(1, ["e2e4"])
+
+
+def test_resume_from_a_saved_graph_makes_no_model_calls():
+    import pickle
+    mm, eng = FakeMoves(QUEENS_PAWN), FakeEngine()
+    params = Params(eps_white=0.0, lam=0.2, min_reach=0.05)
+    ex = Expander(mm, eng, params, me_white=True, me_elo=2000, opp_elo=2000)
+    ex.grow(expand_reach=0.01, max_expansions=20)
+    g = pickle.loads(pickle.dumps(ex.graph))
+    mm2, eng2 = FakeMoves(QUEENS_PAWN), FakeEngine()
+    ex2 = Expander.resume(g, mm2, eng2, params, me_white=True, me_elo=2000, opp_elo=2000, root_moves=[])
+    assert mm2.queries == 0 and eng2.queries == 0
+    assert ex2.bound == pytest.approx(ex.bound) and ex2.beta == pytest.approx(ex.beta)
+    v = Game(ex.graph, params).evaluate({})
+    assert Game(ex2.graph, params).evaluate({}) == pytest.approx(v)
+    ex2.grow(expand_reach=0.01, max_expansions=5)
+    assert mm2.queries > 0 and ex2.stats["expanded"] == 5

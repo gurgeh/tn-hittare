@@ -172,7 +172,11 @@ def curse_experiment(seeds: int, sigma: float, variants: dict[str, dict], *, N: 
                      visible: int = 4, eps: float = 0.08, seed0: int = 0) -> dict[str, np.ndarray]:
     """The winner's curse on a synthetic game: the frontier values at ply `visible` are
     the truth plus N(0, sigma). Per variant (Params overrides) and seed: the gain the
-    search predicts for its choice and that choice's true gain on the full tree."""
+    search predicts for its choice, that choice's true gain on the full tree, and the
+    positions expanded beyond the visible graph.
+
+    A variant with the key `stable` (a dict of `solve_until_stable` arguments) runs
+    remedy (a) instead of one solve; its other keys are Params overrides."""
     from dataclasses import replace
 
     from tnh.builder.synth import random_game
@@ -184,9 +188,15 @@ def curse_experiment(seeds: int, sigma: float, variants: dict[str, dict], *, N: 
         noisy_values(full, base, rng, sigma)
         truth = Game(full, base)
         t0 = truth.evaluate({})
-        ex = RevealExpander(full, base, depth=visible)
         for name, kw in variants.items():
-            g = Game(ex.graph, replace(base, **kw))
-            _, sols = solve(g, N)
-            out[name].append((sols[N].value - sols[0].value, truth.evaluate(sols[N].learned) - t0))
+            kw = dict(kw)
+            stable = kw.pop("stable", None)
+            p = replace(base, **kw)
+            ex = RevealExpander(full, p, depth=visible)
+            if stable is None:
+                _, sols = solve(Game(ex.graph, p), N)
+            else:
+                sols = solve_until_stable(ex, N, **stable).sols
+            out[name].append((sols[N].value - sols[0].value, truth.evaluate(sols[N].learned) - t0,
+                              ex.stats["expanded"]))
     return {k: np.array(v) for k, v in out.items()}

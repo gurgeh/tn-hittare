@@ -378,7 +378,8 @@ class Game:
                     RB[n.children[best_index(n.engine, n)]] += RB[i]
         leaves = list(self.leaf)
         v = np.array([self.leaf[i] for i in leaves])
-        return float(((1 - lam) * RA[leaves] + lam * RB[leaves]) @ v)
+        # elementwise, not `@`: a long dot product goes to a multi-threaded BLAS
+        return float(np.sum(((1 - lam) * RA[leaves] + lam * RB[leaves]) * v))
 
     def reach(self, learned: Learned = {}) -> np.ndarray:
         """Probability of reaching each node in the game, given the learned set."""

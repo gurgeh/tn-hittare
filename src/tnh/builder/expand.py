@@ -106,6 +106,41 @@ class Expander:
             self.beta[root.id] = params.lam
         self.bound[root.id] = 1.0
 
+    @classmethod
+    def resume(cls, graph: Graph, move_model: MoveModel, value_model: ValueModel | None, params: Params, *,
+               me_white: bool, me_elo: int, opp_elo: int, root_moves: list[str],
+               counts: CountSource | None = None, batch: int = 64, explore: float = 1.0) -> "Expander":
+        """An expander over a saved graph: boards replayed from the paths, the caches
+        refilled from the nodes, reach bounds and posteriors recomputed. No model calls
+        unless `params` need engine values the saved graph lacks."""
+        ex = cls.__new__(cls)
+        ex.move_model, ex.value_model, ex.params = move_model, value_model, params
+        ex.me_white, ex.me_elo, ex.opp_elo = me_white, me_elo, opp_elo
+        ex.counts_source = counts or NoCounts()
+        ex.batch, ex.explore = batch, explore
+        ex.graph = graph
+        ex.root_moves = tuple(root_moves)
+        ex.stats, ex.seconds = Counter(), Counter()
+        ex.boards, ex._pred, ex._engine = {}, {}, {}
+        for n in graph.nodes:
+            b = chess.Board()
+            for m in n.path:
+                b.push_uci(m)
+            if pos_key(b) != n.key:
+                raise ValueError(f"node {n.id}: its path does not lead to its key")
+            ex.boards[n.id] = b
+            s = n.value if n.me_to_move else 1.0 - n.value
+            ex._pred.setdefault(n.key, (list(n.moves), n.p_model if n.moves else np.zeros(0), s))
+            if n.engine is not None:
+                ex._engine.setdefault(n.key, n.engine)
+        ex.bound = {graph.root: 1.0}
+        ex.beta = {graph.root: params.lam} if params.lam > 0 else {}
+        root = graph.nodes[graph.root]
+        if (root.me_to_move and ex.in_budget_zone(root)) or ex.needs_best(root):
+            ex.ensure_engine(root)
+        ex._propagate(root)
+        return ex
+
     # -- model calls ----------------------------------------------------------------
 
     def _query(self, board: chess.Board, path: tuple[str, ...]) -> Query:

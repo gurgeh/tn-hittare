@@ -10,6 +10,14 @@
 
 from __future__ import annotations
 
+import os
+
+# One thread for BLAS and OpenMP, set before numpy loads: the machine's cores are
+# budgeted per process, and a multi-threaded BLAS on long vectors here used four
+# cores to run slower than one (2026-11-12).
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
 import argparse
 import json
 import math
@@ -98,16 +106,18 @@ def cmd_curse(a) -> None:
     for x in a.shrinks:
         variants[f"parent {x:g}"] = {"shrink": x}
     variants["engine 0.5"] = {"shrink": 0.5, "shrink_to": "engine"}
+    variants["until stable"] = {"stable": {"per_round": 10, "tol": 0.002, "max_rounds": 40}}
+    variants["stable + parent 0.5"] = {"shrink": 0.5, "stable": {"per_round": 10, "tol": 0.002, "max_rounds": 40}}
     print(f"Winner's curse: full tree depth {a.depth}, frontier at ply {a.visible} read as truth + N(0, sigma), "
           f"N={a.N}, {a.seeds} seeds. Gains over N=0.\n")
     for sigma in a.sigmas:
         res = curse_experiment(a.seeds, sigma, variants, N=a.N, depth=a.depth, visible=a.visible)
         print(f"sigma {sigma:g}")
-        print(f"  {'shrink toward':14s} {'predicted':>10s} {'true':>8s} {'optimism':>9s} {'(se)':>7s}")
+        print(f"  {'remedy':20s} {'predicted':>10s} {'true':>8s} {'optimism':>9s} {'(se)':>7s} {'expanded':>9s}")
         for name, r in res.items():
             d = r[:, 0] - r[:, 1]
-            print(f"  {name:14s} {r[:, 0].mean():+10.4f} {r[:, 1].mean():+8.4f} {d.mean():+9.4f} "
-                  f"({d.std() / np.sqrt(len(d)):.4f})")
+            print(f"  {name:20s} {r[:, 0].mean():+10.4f} {r[:, 1].mean():+8.4f} {d.mean():+9.4f} "
+                  f"({d.std() / np.sqrt(len(d)):.4f}) {r[:, 2].mean():9.1f}")
         print()
 
 
@@ -135,6 +145,7 @@ def cmd_chess(a) -> None:
     from tnh.models.stockfish import Stockfish
 
     torch.set_num_threads(a.threads)
+    torch.set_num_interop_threads(1)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     t0 = time.perf_counter()
@@ -149,17 +160,38 @@ def cmd_chess(a) -> None:
     log: list[str] = []
     report: dict = {}
     with Stockfish(a.sf_nodes, processes=1, per_move=True) as sf:
-        ex = Expander(maia, sf, params, me_white=me_white, me_elo=a.elo, opp_elo=a.opp_elo,
-                      root_moves=root_moves, explore=a.explore)
-        n = ex.grow(expand_reach=a.expand_reach, max_expansions=a.max_expansions)
-        log.append(f"grow: {n} expansions, {len(ex.graph)} nodes, {dict(ex.stats)}")
-        print(log[-1], flush=True)
+        if a.resume:
+            with open(a.resume, "rb") as f:
+                saved = pickle.load(f)
+            if saved["root_moves"] != root_moves:
+                raise ValueError(f"saved graph has root {saved['root_moves']}, not {root_moves}")
+            ex = Expander.resume(saved["graph"], maia, sf, params, me_white=me_white, me_elo=a.elo,
+                                 opp_elo=a.opp_elo, root_moves=root_moves, explore=a.explore)
+            log.append(f"resumed {a.resume}: {len(ex.graph)} nodes; calls to complete it: {dict(ex.stats)}")
+            print(log[-1], flush=True)
+        else:
+            ex = Expander(maia, sf, params, me_white=me_white, me_elo=a.elo, opp_elo=a.opp_elo,
+                          root_moves=root_moves, explore=a.explore)
+            n = ex.grow(expand_reach=a.expand_reach, max_expansions=a.max_expansions)
+            log.append(f"grow: {n} expansions, {len(ex.graph)} nodes, {dict(ex.stats)}")
+            print(log[-1], flush=True)
         for r in range(a.refine_rounds + 1):
             sols = _solve_report(Game(ex.graph, params), a.N, f"solve {r}", log)
             if r < a.refine_rounds:
                 k = ex.refine(sols[a.N].learned, n=a.refine_n)
                 log.append(f"refine {r}: {k} expansions, {len(ex.graph)} nodes")
                 print(log[-1], flush=True)
+
+        if a.stable_rounds:
+            from tnh.builder.drift import solve_until_stable
+            st = solve_until_stable(ex, a.N, per_round=a.drift_per_round, tol=a.stable_tol, max_rounds=a.stable_rounds)
+            lines = [f"until stable (tol {a.stable_tol}, {a.drift_per_round} expansions per round): "
+                     f"{'converged' if st.converged else 'NOT converged'} after {st.rounds} rounds",
+                     "round  nodes   choice's value   after growing below it"]
+            lines += [f"{r:5d}  {nn:5d}   {v:.4f}           {after:.4f}" for r, v, after, nn in st.history]
+            report["stable"] = "\n".join(lines)
+            print(report["stable"], flush=True)
+            sols = st.sols
 
         if a.compare:
             # the same graph under each pessimism; lam_node needs the engine at every opponent's node
@@ -228,7 +260,8 @@ def cmd_chess(a) -> None:
     fm = frontier_mass(final_game, sol.learned)
     prices = {mu: budget_for_price(sols, mu) for mu in a.mu}
     with open(out / "graph.pkl", "wb") as f:
-        pickle.dump({"graph": ex.graph, "root_moves": root_moves, "params": vars(a)}, f)
+        pickle.dump({"graph": ex.graph, "root_moves": root_moves,
+                     "args": {k: v for k, v in vars(a).items() if k != "fn"}}, f)
     wall = time.perf_counter() - t0
     summary = {"args": vars(a), "stats": stats, "seconds": seconds, "stockfish": sf_stats, "wall_s": wall,
                "nodes": len(ex.graph), "log": log, "frontier_mass": fm, "budget_for_price": prices,
@@ -319,6 +352,9 @@ def main(argv=None) -> None:
                    help="also solve the grown graph with lam 0, this lam per opponent, per node, and shrink 0.5")
     p.add_argument("--drift-rounds", type=int, default=0)
     p.add_argument("--drift-per-round", type=int, default=40)
+    p.add_argument("--resume", help="a graph.pkl from an earlier run; skips growing")
+    p.add_argument("--stable-rounds", type=int, default=0, help="remedy (a): grow below the choice until it holds")
+    p.add_argument("--stable-tol", type=float, default=0.001)
     p.add_argument("--deep-nodes", type=int, default=0, help="re-check the learned moves at this engine budget")
     p.add_argument("--mu", type=float, nargs="*", default=[0.001, 0.0005, 0.0002])
     p.add_argument("--out", required=True)
