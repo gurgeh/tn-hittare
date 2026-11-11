@@ -123,7 +123,7 @@ def test_end_to_end_black_after_e4_gives_a_pgn_with_the_learned_moves():
     sol = sols[4]
     assert 0 < sol.cost <= 4
     assert sols[4].value >= sols[0].value
-    rs = rows(game, sol)
+    rs = rows(game, sols, 4)
     text = pgn(rs, ["e2e4"], {"White": "opponent 2000", "Black": "me 2000"})
     parsed = chess.pgn.read_game(io.StringIO(text))
     found = set()

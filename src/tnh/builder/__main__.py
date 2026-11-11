@@ -89,6 +89,25 @@ def cmd_gap(a) -> None:
               + f"   ({skipped} games skipped: more than {a.max_cand} positions to enumerate)", flush=True)
 
 
+def cmd_curse(a) -> None:
+    from tnh.builder.drift import curse_experiment
+    variants = {"no shrink": {}}
+    for x in a.shrinks:
+        variants[f"parent {x:g}"] = {"shrink": x}
+    variants["engine 0.5"] = {"shrink": 0.5, "shrink_to": "engine"}
+    print(f"Winner's curse: full tree depth {a.depth}, frontier at ply {a.visible} read as truth + N(0, sigma), "
+          f"N={a.N}, {a.seeds} seeds. Gains over N=0.\n")
+    for sigma in a.sigmas:
+        res = curse_experiment(a.seeds, sigma, variants, N=a.N, depth=a.depth, visible=a.visible)
+        print(f"sigma {sigma:g}")
+        print(f"  {'shrink toward':14s} {'predicted':>10s} {'true':>8s} {'optimism':>9s} {'(se)':>7s}")
+        for name, r in res.items():
+            d = r[:, 0] - r[:, 1]
+            print(f"  {name:14s} {r[:, 0].mean():+10.4f} {r[:, 1].mean():+8.4f} {d.mean():+9.4f} "
+                  f"({d.std() / np.sqrt(len(d)):.4f})")
+        print()
+
+
 def cmd_chess(a) -> None:
     import chess
     import torch
@@ -183,6 +202,15 @@ def main(argv=None) -> None:
     p.add_argument("--max-cand", type=int, default=16)
     p.add_argument("--tree-depth", type=int, default=4)
     p.set_defaults(fn=cmd_gap)
+
+    p = sub.add_parser("curse")
+    p.add_argument("-N", type=int, default=4)
+    p.add_argument("--seeds", type=int, default=40)
+    p.add_argument("--depth", type=int, default=8)
+    p.add_argument("--visible", type=int, default=4)
+    p.add_argument("--sigmas", type=float, nargs="*", default=[0.0, 0.04, 0.08])
+    p.add_argument("--shrinks", type=float, nargs="*", default=[0.3, 0.5, 0.7, 0.9])
+    p.set_defaults(fn=cmd_curse)
 
     p = sub.add_parser("chess")
     common(p)
