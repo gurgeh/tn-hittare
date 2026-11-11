@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import re
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -113,31 +114,89 @@ class Encoder:
         return tokens, moves, idxs
 
 
-@dataclass
-class LogPrediction:
-    moves: list[str]
-    logp: np.ndarray                          # float32, log probability over the legal moves
-    wdl: tuple[float, float, float]           # win, draw, loss for the mover
-    legal_mass: float                         # softmax mass on legal moves before renormalising
+_NAME_RE = re.compile(
+    r"(?:offset(?P<m>[+-]\d+(?:\.\d+)?)(?:-opp(?P<o>[+-]\d+(?:\.\d+)?))?"
+    r"|fixed(?P<s>\d+(?:\.\d+)?)-(?P<f>\d+(?:\.\d+)?))"
+    r"(?:-clamp(?P<lo>\d+(?:\.\d+)?)-(?P<hi>\d+(?:\.\d+)?))?"
+)
+
+
+@dataclass(frozen=True)
+class Elo:
+    """The ratings given to the network, one of:
+
+    - fixed: `self_elo` and `oppo_elo`, whatever the players' real ratings;
+    - offset: the network gets `mover_elo + mover_offset` and `opp_elo + opp_offset`.
+
+    Both are clamped to `clamp`, by default the network's own [0, 5000]. The name is
+    the variant directory: `offset+300` (both sides +300), `offset+300-opp+100`
+    (mover +300, opponent +100), `fixed2200-2200`, with `-clampLO-HI` when not default.
+    """
+
+    self_elo: float | None = None
+    oppo_elo: float | None = None
+    mover_offset: float | None = None
+    opp_offset: float | None = None
+    clamp: tuple[float, float] = ELO_RANGE
+
+    def __post_init__(self) -> None:
+        fixed = (self.self_elo is not None, self.oppo_elo is not None)
+        offset = (self.mover_offset is not None, self.opp_offset is not None)
+        if not ((all(fixed) and not any(offset)) or (all(offset) and not any(fixed))):
+            raise ValueError(f"give self_elo and oppo_elo, or mover_offset and opp_offset: {self}")
+
+    @classmethod
+    def fixed(cls, self_elo: float, oppo_elo: float, clamp: tuple[float, float] = ELO_RANGE) -> "Elo":
+        return cls(self_elo=float(self_elo), oppo_elo=float(oppo_elo), clamp=clamp)
+
+    @classmethod
+    def offset(cls, mover: float, opp: float | None = None, clamp: tuple[float, float] = ELO_RANGE) -> "Elo":
+        return cls(mover_offset=float(mover), opp_offset=float(mover if opp is None else opp), clamp=clamp)
+
+    @classmethod
+    def parse(cls, name: str) -> "Elo":
+        m = _NAME_RE.fullmatch(name)
+        if m is None:
+            raise ValueError(f"not an Elo variant name: {name!r} (e.g. offset+300, offset+300-opp+100, fixed2200-2200)")
+        clamp = (float(m["lo"]), float(m["hi"])) if m["lo"] is not None else ELO_RANGE
+        if m["m"] is not None:
+            return cls.offset(float(m["m"]), None if m["o"] is None else float(m["o"]), clamp)
+        return cls.fixed(float(m["s"]), float(m["f"]), clamp)
+
+    @property
+    def name(self) -> str:
+        if self.mover_offset is not None:
+            v = f"offset{self.mover_offset:+g}"
+            if self.opp_offset != self.mover_offset:
+                v += f"-opp{self.opp_offset:+g}"
+        else:
+            v = f"fixed{self.self_elo:g}-{self.oppo_elo:g}"
+        if self.clamp != ELO_RANGE:
+            v += f"-clamp{self.clamp[0]:g}-{self.clamp[1]:g}"
+        return v
+
+    def of(self, query: Query) -> tuple[float, float]:
+        if self.mover_offset is not None:
+            s, o = query.mover_elo + self.mover_offset, query.opp_elo + self.opp_offset
+        else:
+            s, o = self.self_elo, self.oppo_elo
+        lo, hi = self.clamp
+        return min(max(s, lo), hi), min(max(o, lo), hi)
 
 
 class Maia3:
-    """Maia-3 as a `MoveModel`.
+    """Maia-3 as a `MoveModel`, with the ratings it is given set by `elo`.
 
-    Elo given to the network, one of:
-      - fixed: `self_elo` and `oppo_elo`, whatever the players' real ratings;
-      - offset: `elo_offset`, the network gets `mover_elo + offset` and `opp_elo + offset`.
-    Both are clamped to `elo_clamp`, by default the network's own [0, 5000].
+    `predict_many` runs several `Elo` settings on one encoding of the positions; the
+    CPU encoding is the bottleneck for 5M and 23M, so a sweep costs little more than
+    one setting until the GPU is saturated.
     """
 
     def __init__(
         self,
         size: str = "23m",
+        elo: Elo | str | None = None,
         *,
-        self_elo: float | None = None,
-        oppo_elo: float | None = None,
-        elo_offset: float | None = None,
-        elo_clamp: tuple[float, float] = ELO_RANGE,
         device: str = "cuda",
         amp: bool = True,
         batch_size: int = 512,
@@ -146,14 +205,8 @@ class Maia3:
     ) -> None:
         if size not in SIZES:
             raise ValueError(f"size must be one of {SIZES}, got {size!r}")
-        fixed = self_elo is not None or oppo_elo is not None
-        if fixed == (elo_offset is not None):
-            raise ValueError("give either self_elo and oppo_elo, or elo_offset")
-        if fixed and (self_elo is None or oppo_elo is None):
-            raise ValueError("fixed Elo needs both self_elo and oppo_elo")
         self.size = size
-        self.self_elo, self.oppo_elo, self.elo_offset = self_elo, oppo_elo, elo_offset
-        self.elo_clamp = elo_clamp
+        self.elo = Elo.parse(elo) if isinstance(elo, str) else elo
         self.device = device
         self.amp = amp and device.startswith("cuda")
         self.batch_size = batch_size
@@ -162,78 +215,69 @@ class Maia3:
         self._encoder = Encoder()
         self._gpu = ThreadPoolExecutor(1, thread_name_prefix="maia3-gpu")
         self.n_predicted = 0
-        self.illegal_mass_sum = 0.0
+        self.illegal_mass_sum = 0.0   # softmax mass outside the legal moves, before renormalising
 
-    @property
-    def variant(self) -> str:
-        if self.elo_offset is not None:
-            v = f"offset{self.elo_offset:+g}"
-        else:
-            v = f"fixed{self.self_elo:g}-{self.oppo_elo:g}"
-        if self.elo_clamp != ELO_RANGE:
-            v += f"-clamp{self.elo_clamp[0]:g}-{self.elo_clamp[1]:g}"
-        return v + ("" if self.amp else "-fp32")
-
-    def elos(self, query: Query) -> tuple[float, float]:
-        if self.elo_offset is not None:
-            s, o = query.mover_elo + self.elo_offset, query.opp_elo + self.elo_offset
-        else:
-            s, o = self.self_elo, self.oppo_elo
-        lo, hi = self.elo_clamp
-        return min(max(s, lo), hi), min(max(o, lo), hi)
+    def variant(self, elo: Elo | None = None) -> str:
+        return (elo or self.elo).name + ("" if self.amp else "-fp32")
 
     def predict(self, queries: list[Query]) -> list[Prediction]:
-        out = []
-        for p in self.predict_logp(queries):
-            probs = np.exp(p.logp.astype(np.float64))
-            out.append(Prediction(p.moves, (probs / probs.sum()).astype(np.float32), p.wdl))
-        return out
+        if self.elo is None:
+            raise ValueError("this Maia3 has no elo; pass one to the constructor or use predict_many")
+        return self.predict_many(queries, [self.elo])[0]
 
-    def predict_logp(self, queries: list[Query]) -> list[LogPrediction]:
-        """Like `predict`, with log probabilities and the legal mass kept.
+    def predict_many(self, queries: list[Query], elos: list[Elo]) -> list[list[Prediction]]:
+        """One list of predictions per `Elo` setting, from a single encoding pass.
 
         Batches are encoded (python-chess, CPU) on this thread and run on the GPU on a
         worker thread, so encoding the next batch overlaps the network.
         """
-        out: list[LogPrediction] = []
+        out: list[list[Prediction]] = [[] for _ in elos]
         pending: list[Future] = []
+
+        def drain(f: Future) -> None:
+            for k, preds in enumerate(f.result()):
+                out[k].extend(preds)
+
         for start in range(0, len(queries), self.batch_size):
-            batch = self._encode(queries[start : start + self.batch_size])
-            pending.append(self._gpu.submit(lambda b=batch: self._collect(b, self._launch(b))))
+            qs = queries[start : start + self.batch_size]
+            batch = self._encoder.encode(qs)
+            settings = [np.array([e.of(q) for q in qs], dtype=np.float32).reshape(len(qs), 2) for e in elos]
+            pending.append(self._gpu.submit(self._run_batch, batch, settings))
             if len(pending) > 2:
-                out.extend(pending.pop(0).result())
+                drain(pending.pop(0))
         for f in pending:
-            out.extend(f.result())
+            drain(f)
         return out
 
     # -- internals ---------------------------------------------------------
 
-    def _encode(self, queries: list[Query]):
+    def _encode(self, queries: list[Query], elo: Elo | None = None):
+        """Tokens, ratings, moves and move indices for one batch (used by tests and the bench)."""
         tokens, moves, idxs = self._encoder.encode(queries)
-        elos = np.array([self.elos(q) for q in queries], dtype=np.float32).reshape(len(queries), 2)
+        e = elo or self.elo
+        elos = np.array([e.of(q) for q in queries], dtype=np.float32).reshape(len(queries), 2)
         return tokens, elos, moves, idxs
 
+    def _put(self, a: np.ndarray) -> torch.Tensor:
+        # Pinned memory keeps the copy asynchronous.
+        x = torch.from_numpy(a)
+        return x.pin_memory().to(self.device, non_blocking=True) if self.device.startswith("cuda") else x.to(self.device)
+
     @torch.no_grad()
-    def _launch(self, batch):
-        tokens, elos, _moves, idxs = batch
-        dev = self.device
-
-        def put(a: np.ndarray) -> torch.Tensor:
-            # Pinned memory keeps the copy asynchronous, so this returns before the previous
-            # batch has finished on the GPU and the next batch can be encoded meanwhile.
-            x = torch.from_numpy(a)
-            return x.pin_memory().to(dev, non_blocking=True) if dev.startswith("cuda") else x.to(dev)
-
-        t = put(tokens).float()
-        e = put(elos)
+    def _upload(self, batch):
+        tokens, moves, idxs = batch
         width = max((len(i) for i in idxs), default=0) or 1
         gather = np.zeros((len(idxs), width), dtype=np.int64)
         valid = np.zeros((len(idxs), width), dtype=bool)
         for r, i in enumerate(idxs):
             gather[r, : len(i)] = i
             valid[r, : len(i)] = True
-        g = put(gather)
-        v = put(valid)
+        return self._put(tokens).float(), self._put(gather), self._put(valid)
+
+    @torch.no_grad()
+    def _forward(self, uploaded, elos: np.ndarray):
+        t, g, v = uploaded
+        e = self._put(elos)
         with torch.autocast("cuda", enabled=self.amp):
             logits_move, logits_value, _ponder = self.model(t, e[:, 0], e[:, 1])
         logits = logits_move.float()
@@ -244,17 +288,20 @@ class Maia3:
         value = torch.softmax(logits_value.float(), dim=-1)   # (loss, draw, win) for the mover
         return logp, legal_mass, value
 
-    def _collect(self, batch, launched) -> list[LogPrediction]:
-        _tokens, _elos, moves, idxs = batch
+    def _collect(self, moves: list[list[str]], launched) -> list[Prediction]:
         logp, legal_mass, value = (x.cpu().numpy() for x in launched)
         out = []
         for r, ms in enumerate(moves):
             loss, draw, win = (float(x) for x in value[r])
-            out.append(LogPrediction(ms, logp[r, : len(ms)].astype(np.float32), (win, draw, loss), float(legal_mass[r])))
+            out.append(Prediction(ms, logp[r, : len(ms)].astype(np.float32), (win, draw, loss)))
             if ms:
                 self.n_predicted += 1
                 self.illegal_mass_sum += 1.0 - float(legal_mass[r])
         return out
+
+    def _run_batch(self, batch, settings: list[np.ndarray]) -> list[list[Prediction]]:
+        uploaded = self._upload(batch)
+        return [self._collect(batch[1], self._forward(uploaded, elos)) for elos in settings]
 
 
 class _Maia3Net(MAIA3Model):

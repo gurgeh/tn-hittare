@@ -20,26 +20,23 @@ class Query:
 @dataclass
 class Prediction:
     moves: list[str]          # every legal move, UCI
-    probs: np.ndarray         # float32, same order, sums to 1
+    logp: np.ndarray          # float32, same order, log probability over the legal moves
     wdl: tuple[float, float, float] | None   # win, draw, loss for the mover
+
+
+@dataclass
+class MoveValues:
+    moves: list[str]          # every legal move, UCI
+    value: np.ndarray         # float32, expected score for the mover after the move; NaN = no value within the budget
+    cp: np.ndarray            # float32, centipawns for the mover after the move; NaN where the score is a mate or missing
+    mate: np.ndarray          # int16, moves to mate, positive when the mover mates; 0 where the score is not a mate
+    wdl: tuple[float, float, float] | None   # the position itself, along the best line, for the mover
 
 
 class MoveModel(Protocol):
     name: str
 
     def predict(self, queries: list[Query]) -> list[Prediction]: ...
-
-
-@dataclass
-class MoveValues:
-    """Engine output: expected score for the mover after each legal move.
-
-    Not in DESIGN.md's interface section, which only fixes the feature-file shape
-    for engines (`value` in place of `logp`).
-    """
-    moves: list[str]          # every legal move, UCI
-    values: np.ndarray        # float32, same order, expected score in [0, 1] for the mover; NaN if the engine gave none
-    wdl: tuple[float, float, float] | None   # win, draw, loss for the mover after the engine's best move
 
 
 class ValueModel(Protocol):

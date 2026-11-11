@@ -79,9 +79,9 @@ def amp(request):
 
 @pytest.fixture(scope="module")
 def ours(size, amp):
-    from tnh.models.maia3 import Maia3
+    from tnh.models.maia3 import Elo, Maia3
     qs = fixture_positions()
-    m = Maia3(size, elo_offset=0.0, batch_size=64, amp=amp)   # offset 0: the network gets the query's own ratings
+    m = Maia3(size, Elo.offset(0.0), batch_size=64, amp=amp)   # offset 0: the network gets the query's own ratings
     preds = m.predict(qs)
     kids = [child(q, mv) for q, p in zip(qs, preds) for mv in p.moves]
     kid_preds = iter(m.predict(kids))
@@ -106,7 +106,7 @@ def test_in_process_reference(size, amp, ours):
         _, top = eng.score_moves()
         ref_p = {t["move"].uci(): t["policy"] for t in top}
         assert set(ref_p) == set(p.moves)
-        mine = dict(zip(p.moves, p.probs.astype(np.float64)))
+        mine = dict(zip(p.moves, np.exp(p.logp.astype(np.float64))))
         for mv, rp in ref_p.items():
             max_dp = max(max_dp, abs(mine[mv] - rp))
             if rp > 1e-4:
@@ -163,7 +163,7 @@ def test_uci_engine(size, amp, ours):
             ref_moves.append(mv)
             i = t.index("wdl")
             ref_wdl[mv] = tuple(int(x) for x in t[i + 1 : i + 4])
-        mine = dict(zip(p.moves, p.probs.astype(np.float64)))
+        mine = dict(zip(p.moves, np.exp(p.logp.astype(np.float64))))
         # the reference order must be our order, up to ties
         for a, b in zip(ref_moves, ref_moves[1:]):
             n_pairs += 1
@@ -189,9 +189,9 @@ def test_uci_engine(size, amp, ours):
 
 def test_fast_forward_is_bitwise_reference(size, amp):
     import torch
-    from tnh.models.maia3 import WEIGHTS, Maia3, _load
+    from tnh.models.maia3 import WEIGHTS, Elo, Maia3, _load
 
-    m = Maia3(size, elo_offset=0.0)
+    m = Maia3(size, Elo.offset(0.0))
     reference = _load(size, "cuda", WEIGHTS, True, reference=True)
     qs = fixture_positions()[:300]
     tokens, elos, _, _ = m._encode(qs)
@@ -204,11 +204,24 @@ def test_fast_forward_is_bitwise_reference(size, amp):
 
 
 def test_elo_changes_predictions(size):
-    from tnh.models.maia3 import Maia3
+    from tnh.models.maia3 import Elo, Maia3
 
     qs = fixture_positions()[20:220]
-    lo = Maia3(size, self_elo=1200, oppo_elo=1200).predict(qs)
-    hi = Maia3(size, self_elo=2500, oppo_elo=2500).predict(qs)
-    tv = np.mean([0.5 * np.abs(a.probs - b.probs).sum() for a, b in zip(lo, hi)])
+    lo, hi = Maia3(size).predict_many(qs, [Elo.fixed(1200, 1200), Elo.fixed(2500, 2500)])
+    tv = np.mean([0.5 * np.abs(np.exp(a.logp) - np.exp(b.logp)).sum() for a, b in zip(lo, hi)])
     print(f"\n{size}: mean total variation between Elo 1200 and 2500: {tv:.3f}")
     assert tv > 0.05
+
+
+def test_predict_many_equals_one_setting_at_a_time(size):
+    from tnh.models.maia3 import Elo, Maia3
+
+    qs = fixture_positions()[:300]
+    settings = [Elo.offset(0), Elo.offset(300, -100), Elo.fixed(2200, 2600)]
+    m = Maia3(size, batch_size=64)
+    many = m.predict_many(qs, settings)
+    for e, preds in zip(settings, many):
+        single = Maia3(size, e, batch_size=64).predict(qs)
+        for a, b in zip(preds, single):
+            assert a.moves == b.moves and a.wdl == b.wdl
+            np.testing.assert_array_equal(a.logp, b.logp)

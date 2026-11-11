@@ -10,7 +10,7 @@ from maia3.dataset import tokenize_board
 from maia3.utils import get_all_possible_moves, mirror_move
 
 from tnh.models.base import PositionMismatch, Query, Replayer, check_reaches
-from tnh.models.maia3 import HISTORY, Encoder, Maia3, frame, move_index
+from tnh.models.maia3 import HISTORY, Elo, Encoder, frame, move_index
 
 
 def random_games(n, seed=0, max_plies=150):
@@ -99,18 +99,22 @@ def test_replayer_checks_the_fen_and_handles_en_passant_conventions():
     assert len(r.boards(Query(b.fen(), moves, 0, 0))) == 5
 
 
-def test_elo_modes_and_clamp():
-    m = Maia3.__new__(Maia3)
-    m.elo_clamp = (0.0, 5000.0)
-    m.self_elo = m.oppo_elo = None
-    m.elo_offset = 300.0
-    assert m.elos(Query("", [], 2100, 4900)) == (2400.0, 5000.0)
-    m.elo_offset, m.self_elo, m.oppo_elo = None, 1800.0, 2600.0
-    assert m.elos(Query("", [], 2100, 4900)) == (1800.0, 2600.0)
-    m.elo_clamp = (600.0, 2600.0)
-    m.self_elo = 3000.0
-    assert m.elos(Query("", [], 0, 0)) == (2600.0, 2600.0)
+def test_elo_settings_names_and_clamp():
+    q = Query("", [], 2100, 4900)
+    assert Elo.offset(300).of(q) == (2400.0, 5000.0)                 # the network's own clamp
+    assert Elo.offset(300, -100).of(q) == (2400.0, 4800.0)
+    assert Elo.fixed(1800, 2600).of(q) == (1800.0, 2600.0)
+    assert Elo.fixed(3000, 2200, clamp=(600, 2600)).of(q) == (2600.0, 2200.0)
+    names = {
+        "offset+300": Elo.offset(300), "offset-200": Elo.offset(-200), "offset+0": Elo.offset(0),
+        "offset+300-opp+100": Elo.offset(300, 100), "offset+0-opp-100": Elo.offset(0, -100),
+        "fixed2200-2200": Elo.fixed(2200, 2200), "offset+300-clamp600-2600": Elo.offset(300, clamp=(600, 2600)),
+    }
+    for name, e in names.items():
+        assert e.name == name and Elo.parse(name) == e
     with pytest.raises(ValueError):
-        Maia3("23m", self_elo=2000, oppo_elo=2000, elo_offset=0)
+        Elo(self_elo=2000, oppo_elo=2000, mover_offset=0, opp_offset=0)
     with pytest.raises(ValueError):
-        Maia3("23m")
+        Elo(mover_offset=100)
+    with pytest.raises(ValueError):
+        Elo.parse("offset300")

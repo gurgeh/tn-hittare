@@ -42,13 +42,13 @@ def test_special_positions():
             q(chess.STARTING_FEN),
         ])
         stats = dict(sf.stats)
-    assert mate1.values[mate1.moves.index("h5f7")] == 1.0
+    assert mate1.value[mate1.moves.index("h5f7")] == 1.0
     assert mate1.wdl == (1.0, 0.0, 0.0)
     assert stalemated.moves == [] and stalemated.wdl is None
-    assert one_move.moves == ["h1g2"] and 0.0 <= one_move.values[0] <= 1.0
+    assert one_move.moves == ["h1g2"] and 0.0 <= one_move.value[0] <= 1.0
     assert sorted(start.moves) == sorted(m.uci() for m in chess.Board().legal_moves)
-    assert not np.isnan(start.values).any() and not np.isnan(mate1.values).any()
-    assert np.all((start.values >= 0) & (start.values <= 1))
+    assert not np.isnan(start.value).any() and not np.isnan(mate1.value).any()
+    assert np.all((start.value >= 0) & (start.value <= 1))
     assert stats["no legal moves"] == 1 and stats["one legal move"] == 1
 
 
@@ -62,8 +62,8 @@ def test_history_reaches_the_engine():
     with Stockfish(5_000, processes=1) as sf:
         with_history, without = sf.evaluate([q(b.fen(), moves), q(b.fen())])
     i = with_history.moves.index("f6g8")
-    assert with_history.values[i] == pytest.approx(0.5, abs=1e-6)   # draw by repetition: W 0, D 1000, L 0
-    assert without.values[without.moves.index("f6g8")] != pytest.approx(0.5, abs=1e-6)   # the start position, about +0.2 for White
+    assert with_history.value[i] == pytest.approx(0.5, abs=1e-6)   # draw by repetition: W 0, D 1000, L 0
+    assert without.value[without.moves.index("f6g8")] != pytest.approx(0.5, abs=1e-6)   # the start position, about +0.2 for White
 
 
 @needs_engine
@@ -87,5 +87,5 @@ def test_deterministic_across_processes_and_order():
         c = sf.evaluate(qs)
     for x, y, z in zip(a, b_, c):
         assert x.moves == y.moves == z.moves
-        np.testing.assert_array_equal(x.values, y.values)
-        np.testing.assert_array_equal(x.values, z.values)
+        np.testing.assert_array_equal(x.value, y.value)
+        np.testing.assert_array_equal(x.value, z.value)

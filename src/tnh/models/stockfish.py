@@ -30,6 +30,7 @@ import numpy as np
 from tnh.models.base import MoveValues, Query, Replayer
 
 STOCKFISH = Path(os.environ.get("TNH_STOCKFISH", Path.home() / ".local" / "bin" / "stockfish"))
+DEFAULT_HASH_MB = 16
 MAX_MULTIPV = 256   # Stockfish's limit; the most legal moves in a chess position is 218
 
 
@@ -127,14 +128,19 @@ class Stockfish:
 
     name = "stockfish"
 
-    def __init__(self, nodes: int, *, processes: int | None = None, hash_mb: int = 16,
+    def __init__(self, nodes: int, *, processes: int | None = None, hash_mb: int = DEFAULT_HASH_MB,
                  per_move: bool = False, deterministic: bool = True, path: Path = STOCKFISH) -> None:
         """`nodes` is the budget for the whole MultiPV search of a position, or with
         `per_move` the budget per legal move (the search gets `nodes * n_legal`).
 
-        `deterministic=False` skips `ucinewgame` between positions. That saves about 7 ms
-        per position (Stockfish 19 clears ~16 MB of history tables), but then a
-        position's values depend on what the same process searched before it.
+        `deterministic=False` skips `ucinewgame` between positions, but then a position's
+        values depend on what the same process searched before it.
+
+        `ucinewgame` clears the hash table and ~20 MB of history tables. The clears of
+        all processes compete for memory bandwidth: on the G14, under load, the pool as
+        a whole managed ~500-600 clears per second with Hash 16 and ~850 with Hash 1,
+        however many processes ran (scratch/models/scripts/sf_clear_scaling.py). That,
+        not the search, caps the deterministic mode at low node budgets.
         """
         self.nodes = nodes
         self.per_move = per_move
@@ -154,8 +160,15 @@ class Stockfish:
 
     @property
     def variant(self) -> str:
-        v = f"nodes{self.nodes}{'-per-move' if self.per_move else ''}-hash{self.hash_mb}"
-        return v if self.deterministic else v + "-noclear"
+        """`nodes10000`, with a suffix for each option that is not the default."""
+        v = f"nodes{self.nodes}"
+        if self.per_move:
+            v += "-per-move"
+        if self.hash_mb != DEFAULT_HASH_MB:
+            v += f"-hash{self.hash_mb}"
+        if not self.deterministic:
+            v += "-noclear"
+        return v
 
     def evaluate(self, queries: list[Query]) -> list[MoveValues]:
         jobs = []
@@ -174,7 +187,8 @@ class Stockfish:
         if not legal:
             with self._lock:
                 self.stats["no legal moves"] += 1
-            return MoveValues([], np.zeros(0, dtype=np.float32), None)
+            return MoveValues([], np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.float32),
+                              np.zeros(0, dtype=np.int16), None)
         engine = self._engines.get()
         try:
             lines = engine.search(position, self.nodes * len(legal) if self.per_move else self.nodes,
@@ -186,11 +200,17 @@ class Stockfish:
         if extra:
             raise EngineError(f"engine reported moves that are not legal: {sorted(extra)} after {position}")
         values = np.full(len(legal), np.nan, dtype=np.float32)
+        cp = np.full(len(legal), np.nan, dtype=np.float32)
+        mate = np.zeros(len(legal), dtype=np.int16)
         for i, mv in enumerate(legal):
             r = lines_by_move.get(mv)
             if r is not None:
                 w, d, _l = r["wdl"]
                 values[i] = (w + 0.5 * d) / 1000.0
+                if r["kind"] == "cp":
+                    cp[i] = r["score"]
+                else:
+                    mate[i] = r["score"]
         best = None
         if lines_by_move:
             first = next(iter(lines_by_move.values()))
@@ -203,7 +223,7 @@ class Stockfish:
             self.stats["bound scores"] += sum(r["bound"] is not None for r in lines_by_move.values())
             self.stats["mate scores"] += sum(r["kind"] == "mate" for r in lines_by_move.values())
             self.stats["one legal move"] += len(legal) == 1
-        return MoveValues(legal, values, best)
+        return MoveValues(legal, values, cp, mate, best)
 
     def close(self) -> None:
         self._pool.shutdown()

@@ -93,7 +93,7 @@ def positions(games: list[Game], *, min_ply: int = 20, max_ply: int = 10_000) ->
 
 def score(preds, played: list[str], result: list[float]) -> dict:
     """Top-1, mean log loss of the played move (nats), value-head log loss on the result."""
-    top1, nll, vll, legal, sign, pdraw = [], [], [], [], [], []
+    top1, nll, vll, sign, pdraw = [], [], [], [], []
     for p, mv, r in zip(preds, played, result):
         i = p.moves.index(mv)
         top1.append(int(np.argmax(p.logp)) == i)
@@ -103,13 +103,11 @@ def score(preds, played: list[str], result: list[float]) -> dict:
         pdraw.append(d)
         if r != 0.5:
             sign.append((w > l) == (r == 1.0))
-        legal.append(p.legal_mass)
     return {
         "n": len(top1),
         "top1": float(np.mean(top1)),
         "logloss": float(np.mean(nll)),
         "value_logloss": float(np.mean(vll)),
-        "illegal_mass": float(1 - np.mean(legal)),
         "value_sign": float(np.mean(sign)),
         "mean_p_draw": float(np.mean(pdraw)),
         "draw_rate": float(np.mean([r == 0.5 for r in result])),
@@ -119,26 +117,30 @@ def score(preds, played: list[str], result: list[float]) -> dict:
 def _fmt(d: dict) -> str:
     return (f"n={d['n']} top1={d['top1']:.4f} logloss={d['logloss']:.4f} "
             f"value_logloss={d['value_logloss']:.4f} value_sign={d['value_sign']:.3f} "
-            f"P(draw)={d['mean_p_draw']:.3f} (draw rate {d['draw_rate']:.3f}) illegal_mass={d['illegal_mass']:.3f}")
+            f"P(draw)={d['mean_p_draw']:.3f} (draw rate {d['draw_rate']:.3f})")
 
 
 def cmd_sanity(a) -> None:
-    from tnh.models.maia3 import Maia3
+    """Every Elo setting in one pass per size and precision."""
+    from tnh.models.maia3 import Elo, Maia3
 
     games = read_games(a.pgn)
     qs, played, result = positions(games, min_ply=a.min_ply)
     elos = [q.mover_elo for q in qs]
     print(f"{len(qs)} positions at ply >= {a.min_ply}; mover Elo mean {np.mean(elos):.0f}, "
           f"quartiles {np.percentile(elos, [25, 50, 75]).round().tolist()}")
-    settings = [("offset", float(x)) for x in a.offsets] + [("fixed", float(x)) for x in a.fixed]
+    settings = [Elo.offset(float(x)) for x in a.offsets] + [Elo.fixed(float(x), float(x)) for x in a.fixed]
     for size in a.size:
-        for (kind, x), amp in [(s, p == "fp16") for s in settings for p in a.precision]:
-            kw = {"elo_offset": x} if kind == "offset" else {"self_elo": x, "oppo_elo": x}
-            m = Maia3(size, batch_size=a.batch_size, amp=amp, **kw)
+        for prec in a.precision:
+            m = Maia3(size, batch_size=a.batch_size, amp=prec == "fp16")
             t = time.perf_counter()
-            preds = m.predict_logp(qs)
+            results = m.predict_many(qs, settings)
             dt = time.perf_counter() - t
-            print(f"{m.name} {m.variant:>16}: {_fmt(score(preds, played, result))} ({len(qs) / dt:.0f} pos/s)")
+            for e, preds in zip(settings, results):
+                print(f"{m.name} {m.variant(e):>16}: {_fmt(score(preds, played, result))}")
+            print(f"{m.name} {prec}: {len(settings)} settings x {len(qs)} positions in {dt:.0f} s "
+                  f"({len(qs) * len(settings) / dt:.0f} position-settings/s); mean illegal mass "
+                  f"{m.illegal_mass_sum / m.n_predicted:.3f}", flush=True)
             del m
 
 
@@ -148,7 +150,7 @@ def cmd_elo_effect(a) -> None:
     For each value: fit to the played moves, entropy, distance to the previous value, mean
     P(draw). Then each side alone: the mover's Elo with the opponent's fixed, and back.
     """
-    from tnh.models.maia3 import Maia3
+    from tnh.models.maia3 import Elo, Maia3
 
     games = read_games(a.pgn)
     qs, played, result = positions(games, min_ply=a.min_ply)
@@ -156,95 +158,105 @@ def cmd_elo_effect(a) -> None:
         step = max(1, len(qs) // a.limit)
         qs, played, result = qs[::step], played[::step], result[::step]
     print(f"{len(qs)} positions, mover Elo mean {np.mean([q.mover_elo for q in qs]):.0f}")
-    m = Maia3(a.size[0], self_elo=1500, oppo_elo=1500, batch_size=a.batch_size)
-
-    def at(s_, o_):
-        m.self_elo, m.oppo_elo = float(s_), float(o_)
-        return m.predict_logp(qs)
+    m = Maia3(a.size[0], batch_size=a.batch_size)
+    b = a.side_base
+    settings = ([Elo.fixed(e, e) for e in a.fixed] + [Elo.fixed(b, b)]
+                + [Elo.fixed(e, b) for e in a.side_values] + [Elo.fixed(b, e) for e in a.side_values])
+    res = dict(zip((e.name for e in settings), m.predict_many(qs, settings)))
 
     def tv(x, y):
         return float(np.mean([0.5 * np.abs(np.exp(p.logp) - np.exp(r.logp)).sum() for p, r in zip(x, y)]))
 
     prev, prev_e = None, None
     for e in a.fixed:
-        ps = at(e, e)
+        ps = res[Elo.fixed(e, e).name]
         ent = np.mean([-float(np.sum(np.exp(p.logp) * p.logp)) for p in ps])
         d = "" if prev is None else f" TV to {prev_e}: {tv(ps, prev):.4f}"
         print(f"Elo {e:>5}: {_fmt(score(ps, played, result))} entropy={ent:.3f}{d}", flush=True)
         prev, prev_e = ps, e
-    base = at(a.side_base, a.side_base)
+    base = res[Elo.fixed(b, b).name]
     for e in a.side_values:
-        s_ = at(e, a.side_base)
-        o_ = at(a.side_base, e)
-        print(f"mover {e} vs opp {a.side_base}: TV to both {a.side_base} {tv(s_, base):.4f}, "
+        s_, o_ = res[Elo.fixed(e, b).name], res[Elo.fixed(b, e).name]
+        print(f"mover {e} vs opp {b}: TV to both {b} {tv(s_, base):.4f}, "
               f"logloss {score(s_, played, result)['logloss']:.4f} | "
-              f"mover {a.side_base} vs opp {e}: TV {tv(o_, base):.4f}, logloss {score(o_, played, result)['logloss']:.4f}",
+              f"mover {b} vs opp {e}: TV {tv(o_, base):.4f}, logloss {score(o_, played, result)['logloss']:.4f}",
               flush=True)
 
 
 def cmd_history(a) -> None:
     """Reference history (each frame from its own mover's side) against alternatives."""
-    from tnh.models.maia3 import HISTORY, Maia3
+    from tnh.models.maia3 import HISTORY, Elo, Encoder, Maia3
 
     games = read_games(a.pgn)
     qs, played, result = positions(games, min_ply=a.min_ply)
 
-    class NoHistory(Maia3):
+    class NoHistory(Encoder):
         """The current position repeated, as maia3-uci does without --use-uci-history."""
-        def _encode(self, queries):
-            tokens, elos, moves, idxs = super()._encode(queries)
+        def encode(self, queries):
+            tokens, moves, idxs = super().encode(queries)
             tokens[:] = np.tile(tokens[:, :, -12:], (1, 1, HISTORY))
-            return tokens, elos, moves, idxs
+            return tokens, moves, idxs
 
-    class CurrentPerspective(Maia3):
+    class CurrentPerspective(Encoder):
         """Every frame oriented to the current mover (Lc0 convention), to test the alternative."""
-        def _encode(self, queries):
-            tokens, elos, moves, idxs = super()._encode(queries)
+        def encode(self, queries):
+            tokens, moves, idxs = super().encode(queries)
             for i in range(HISTORY - 1):
                 # frames at odd distance from the current one have the other side to move
                 if (HISTORY - 1 - i) % 2 == 1:
                     f = tokens[:, :, 12 * i: 12 * (i + 1)].reshape(-1, 8, 8, 12)[:, ::-1]
                     f = np.concatenate([f[..., 6:], f[..., :6]], axis=-1)
                     tokens[:, :, 12 * i: 12 * (i + 1)] = f.reshape(-1, 64, 12)
-            return tokens, elos, moves, idxs
+            return tokens, moves, idxs
 
     for size in a.size:
-        for cls in (Maia3, NoHistory, CurrentPerspective):
-            m = cls(size, elo_offset=0.0, batch_size=a.batch_size)
-            print(f"{m.name} {cls.__name__:>18}: {_fmt(score(m.predict_logp(qs), played, result))}")
-            del m
+        m = Maia3(size, Elo.offset(0.0), batch_size=a.batch_size)
+        for enc in (Encoder, NoHistory, CurrentPerspective):
+            m._encoder = enc()
+            print(f"{m.name} {enc.__name__:>18}: {_fmt(score(m.predict(qs), played, result))}", flush=True)
+        del m
 
 
 def cmd_throughput(a) -> None:
+    import os
+
     import torch
-    from tnh.models.maia3 import Maia3
+    from tnh.models.maia3 import Elo, Maia3
 
     games = read_games(a.pgn)
     qs, _, _ = positions(games, min_ply=0)
     qs = qs[: a.limit]
-    import os
     print(f"load average before: {os.getloadavg()}")
+    sweep = [Elo.offset(float(x)) for x in range(-200, 801, 100)]
     for size in a.size:
         for bs, prec in [(b, p) for p in a.precision for b in a.batch_sizes]:
-            m = Maia3(size, elo_offset=0.0, batch_size=bs, amp=prec == "fp16")
-            m.predict_logp(qs[: 2 * bs])  # warm-up
+            m = Maia3(size, Elo.offset(0.0), batch_size=bs, amp=prec == "fp16")
+            m.predict(qs[: 2 * bs])  # warm-up
             torch.cuda.synchronize()
             torch.cuda.reset_peak_memory_stats()
             t = time.perf_counter()
-            m.predict_logp(qs)
+            m.predict(qs)
             torch.cuda.synchronize()
             dt = time.perf_counter() - t
             # GPU-only time on pre-encoded batches, to separate it from Python encoding
-            batches = [m._encode(qs[i: i + bs]) for i in range(0, min(len(qs), 20 * bs), bs)]
+            batches = [m._encoder.encode(qs[i: i + bs]) for i in range(0, min(len(qs), 20 * bs), bs)]
+            elos = [np.array([Elo.offset(0.0).of(q) for q in qs[i: i + bs]], dtype=np.float32)
+                    for i in range(0, min(len(qs), 20 * bs), bs)]
             torch.cuda.synchronize()
             t2 = time.perf_counter()
-            for b in batches:
-                [x.cpu() for x in m._launch(b)]
+            for b, e in zip(batches, elos):
+                [x.cpu() for x in m._forward(m._upload(b), e)]
             torch.cuda.synchronize()
-            gpu = sum(len(b[2]) for b in batches) / (time.perf_counter() - t2)
+            gpu = sum(len(b[1]) for b in batches) / (time.perf_counter() - t2)
             peak = torch.cuda.max_memory_allocated() / 2**20
-            print(f"{m.name} {prec} batch {bs:>5}: {len(qs) / dt:8.0f} pos/s end to end, "
-                  f"{gpu:8.0f} pos/s GPU only, peak allocated {peak:6.0f} MiB")
+            line = (f"{m.name} {prec} batch {bs:>5}: {len(qs) / dt:8.0f} pos/s end to end, "
+                    f"{gpu:8.0f} pos/s GPU only, peak allocated {peak:6.0f} MiB")
+            if a.sweep:
+                t3 = time.perf_counter()
+                m.predict_many(qs, sweep)
+                torch.cuda.synchronize()
+                line += f"; sweep of {len(sweep)} settings: {len(qs) * len(sweep) / (time.perf_counter() - t3):8.0f} position-settings/s"
+            print(line, flush=True)
             del m, batches
             torch.cuda.empty_cache()
 
@@ -281,6 +293,7 @@ def main(argv=None) -> None:
     sp.add_argument("--batch-sizes", nargs="+", type=int, default=[128, 256, 512, 1024])
     sp.add_argument("--precision", nargs="+", default=["fp16"], choices=["fp16", "fp32"])
     sp.add_argument("--limit", type=int, default=30000)
+    sp.add_argument("--sweep", action="store_true", help="also time the 11 offsets -200..+800 in one pass")
     sp.set_defaults(fn=cmd_throughput)
 
     sp = sub.add_parser("stockfish")
@@ -332,22 +345,22 @@ def cmd_stockfish(a) -> None:
                       f"bound scores {st['bound scores'] / st['moves']:.3f}", flush=True)
                 if det:
                     results[label] = res
-                    v = np.concatenate([r.values for r in res])
+                    v = np.concatenate([r.value for r in res])
                     v = v[~np.isnan(v)]
                     print(f"    values at 0 or 1 (to 0.001): {np.mean((v <= 0.001) | (v >= 0.999)):.3f}; "
                           f"positions where all moves have the same value: "
-                          f"{np.mean([len(r.values) > 1 and np.nanmax(r.values) == np.nanmin(r.values) for r in res]):.3f}")
+                          f"{np.mean([len(r.value) > 1 and np.nanmax(r.value) == np.nanmin(r.value) for r in res]):.3f}")
     labels = list(results)
 
     def compare(x, y):
         rhos, mad, mad_near, top, regret = [], [], [], [], []
         skipped = 0
         for p, r in zip(results[x], results[y]):
-            ok = ~np.isnan(p.values) & ~np.isnan(r.values)
+            ok = ~np.isnan(p.value) & ~np.isnan(r.value)
             if ok.sum() < 3:
                 skipped += 1
                 continue
-            a_, b_ = p.values[ok].astype(np.float64), r.values[ok].astype(np.float64)
+            a_, b_ = p.value[ok].astype(np.float64), r.value[ok].astype(np.float64)
             d = np.abs(a_ - b_)
             mad.append(d.mean())
             near = b_ >= b_.max() - 0.1
