@@ -66,6 +66,7 @@ import torch
 from tnh.eval.common import (Ragged, add_common, attach, boot_counts, boot_means, check_splits, est, fit_eps,
                              mix_logp, provenance, read_meta, read_sample, window_rows, wmean, write_result)
 from tnh.eval.logit import Data, build, fit as fit_logit, parse_pairs, scores
+from tnh.eval.sample import peak_gb
 from tnh.paths import CORPUS
 
 CLOCK_EDGES_MIN = [0, 2, 5, 10, 20, 40, 10_000]
@@ -399,7 +400,9 @@ def main(argv=None) -> None:
         e = fit_eps(lpf, Df.n, Df.w)
         return model, km, kc, hist, e, -mix_logp(lpt_all[Dt.y], Dt.n, e)
 
+    print(f"  features built: peak RSS {peak_gb():.2f} GB", flush=True)
     model, km, kc, hist, eps_stack, loss_stack = run([], [], "full")
+    print(f"  after the MLP: peak RSS {peak_gb():.2f} GB", flush=True)
     results = {"stack": {"loss": loss_stack, "eps": eps_stack, "params": n_params(model), **hist}}
 
     # linear and interaction logits (unstandardised features, as in tnh.eval.logit)
@@ -431,7 +434,10 @@ def main(argv=None) -> None:
             inter_f[n] = Df.X[:, Df.names.index(c)] * np.repeat(Xcf[:, zi], np.diff(Df.offsets))
             inter_t[n] = Dt.X[:, Dt.names.index(c)] * np.repeat(Xct[:, zi], np.diff(Dt.offsets))
     Dfi, Dti = Df.with_columns(inter_f), Dt.with_columns(inter_t)
+    del inter_f, inter_t
     beta_i = fit_lin(Dfi, Dti, base + inter_names, "interactions")
+    del Dfi, Dti      # the largest arrays of the run; only the coefficients are needed from here
+    print(f"  after the interaction logit: peak RSS {peak_gb():.2f} GB", flush=True)
 
     singles = {}
     for k in logp:
@@ -495,11 +501,11 @@ def main(argv=None) -> None:
                     "tried": tried, "validation": v, "params": f"{bst.best_iteration} trees x {prm['num_leaves']} leaves",
                     "importance": imp[:25], "_booster": bst, "_km": km, "_kc": kc, "_b": b, "_products": products}
 
-        print("  trees with products, tuning")
+        print(f"  trees with products, tuning (peak RSS so far {peak_gb():.2f} GB)", flush=True)
         settings = T.grid(a.leaves, a.rates, a.min_leaf)
         tw = fit_trees([], [], True, settings, tune=True)
         chosen = tw["settings"]
-        print(f"  trees chosen: {chosen}")
+        print(f"  trees chosen: {chosen}; peak RSS {peak_gb():.2f} GB", flush=True)
         tn = fit_trees([], [], False, [chosen])
         results["trees"] = tw
         results["trees without products"] = tn

@@ -53,16 +53,25 @@ def objective(offsets: np.ndarray, y: np.ndarray, w: np.ndarray):
 
 def design(Xmove: np.ndarray, move_names: list[str], Xctx_rows: np.ndarray, ctx_names: list[str],
            offsets: np.ndarray, product_cols: list[str], products: bool) -> tuple[np.ndarray, list[str]]:
-    """Per-move matrix for the trees: move features, context repeated per move, and the products."""
+    """Per-move matrix for the trees, float32, filled in place: move features, context repeated per move,
+    and the products (no float64 temporaries of the whole matrix)."""
     lens = np.diff(offsets)
-    ctx = np.repeat(Xctx_rows, lens, axis=0)
-    cols, names = [Xmove, ctx], list(move_names) + list(ctx_names)
+    row_of = np.repeat(np.arange(len(lens)), lens)
+    names = list(move_names) + list(ctx_names)
+    prods = []
     if products:
         for c, z in itertools.product(product_cols, PRODUCT_CONTEXT):
             if c in move_names and z in ctx_names:
-                cols.append((Xmove[:, move_names.index(c)] * ctx[:, ctx_names.index(z)])[:, None])
+                prods.append((move_names.index(c), ctx_names.index(z)))
                 names.append(f"{c}*{z}")
-    return np.column_stack(cols).astype(np.float32), names
+    X = np.empty((len(row_of), len(names)), dtype=np.float32)
+    X[:, :Xmove.shape[1]] = Xmove
+    for j in range(Xctx_rows.shape[1]):
+        X[:, Xmove.shape[1] + j] = Xctx_rows[row_of, j]
+    k = Xmove.shape[1] + Xctx_rows.shape[1]
+    for i, (c, z) in enumerate(prods):
+        X[:, k + i] = Xmove[:, c] * Xctx_rows[row_of, z]
+    return X, names
 
 
 def train(X_tr, off_tr, y_tr, w_tr, init_tr, X_va, off_va, y_va, w_va, init_va, params: dict, rounds: int,
