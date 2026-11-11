@@ -108,3 +108,47 @@ def test_maia3_run_several_settings_one_pass(corpus, tmp_path):
     # the settings differ from each other
     a, b = (read_features(tmp_path / n).sort("game_id", "ply")["logp"].to_list() for n in ("offset+0", "fixed2200-2200"))
     assert max(abs(x - y) for u, v in zip(a, b) for x, y in zip(u, v)) > 0.1
+
+
+@pytest.mark.slow
+def test_lc0_run_both_kinds(corpus, tmp_path):
+    from tnh.models import lc0
+
+    if not lc0.binary().exists():
+        pytest.skip(f"no Lc0 at {lc0.LC0_HOME}")
+    _, positions = corpus
+    common = ["--positions", str(positions), "--out", str(tmp_path), "--chunk", "40", "--limit", "80"]
+    run.main(["--model", "lc0-policy"] + common)
+    run.main(["--model", "lc0-search", "--nodes", "50", "--lc0-processes", "2"] + common)
+    pol = read_features(tmp_path / "policy")
+    assert pol.schema == pl.Schema({"game_id": pl.String, "ply": pl.Int64, "moves": pl.List(pl.String),
+                                    "logp": pl.List(pl.Float32), "wdl": pl.List(pl.Float32)})
+    assert pol.height == 80
+    for logp in pol["logp"].to_list():
+        assert abs(np.exp(np.array(logp, dtype=np.float64)).sum() - 1) < 1e-4
+    val = read_features(tmp_path / "nodes50")
+    assert val.schema == pl.Schema({"game_id": pl.String, "ply": pl.Int64, "moves": pl.List(pl.String),
+                                    "value": pl.List(pl.Float32), "cp": pl.List(pl.Float32),
+                                    "mate": pl.List(pl.Int16), "wdl": pl.List(pl.Float32)})
+    assert val.height == 80
+    visited = np.concatenate([~np.isnan(np.array(v, dtype=np.float64)) for v in val["value"].to_list()])
+    assert 0 < visited.mean() < 1          # 50 nodes: some root moves are never visited
+    assert sorted(pol["game_id"] + pol["ply"].cast(pl.String)) == sorted(val["game_id"] + val["ply"].cast(pl.String))
+
+
+def test_games_file_default(tmp_path, monkeypatch):
+    from tnh.models.run import games_file
+
+    corpus_dir, samples = tmp_path / "corpus", tmp_path / "corpus" / "samples"
+    samples.mkdir(parents=True)
+    monkeypatch.setattr(run.paths, "CORPUS", corpus_dir)
+    pos = samples / "test.parquet"
+    with pytest.raises(SystemExit, match="no games file"):
+        games_file(pos, None)
+    (corpus_dir / "games.parquet").write_bytes(b"")
+    assert games_file(pos, None) == corpus_dir / "games.parquet"      # falls back to the corpus
+    (samples / "games.parquet").write_bytes(b"")
+    assert games_file(pos, None) == samples / "games.parquet"          # beside the positions wins
+    assert games_file(pos, corpus_dir / "games.parquet") == corpus_dir / "games.parquet"
+    with pytest.raises(SystemExit, match="does not exist"):
+        games_file(pos, tmp_path / "nope.parquet")

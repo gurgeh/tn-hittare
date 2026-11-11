@@ -261,6 +261,58 @@ def cmd_throughput(a) -> None:
             torch.cuda.empty_cache()
 
 
+def cmd_lc0(a) -> None:
+    """Lc0 throughput: policy alone, and searches of several node counts; GPU memory next to Maia-3."""
+    import os
+    import random
+    import subprocess as sp
+
+    import torch
+    from tnh.models import lc0
+    from tnh.models.maia3 import Elo, Maia3
+
+    def gpu_used() -> int:
+        return int(sp.run(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                          capture_output=True, text=True, check=True).stdout.split()[0])
+
+    games = read_games(a.pgn)
+    qs, _, _ = positions(games, min_ply=a.min_ply)
+    rng = random.Random(0)
+    policy_qs = qs[: a.n_policy]
+    search_qs = rng.sample(qs, a.n_search)
+    print(f"load {os.getloadavg()}; GPU memory used before: {gpu_used()} MiB")
+    maia = Maia3("79m", Elo.offset(0.0)) if a.with_maia else None
+    if maia:
+        maia.predict(qs[:2048])
+        print(f"with Maia-3 79M loaded and warmed up: {gpu_used()} MiB")
+    for backend in a.backends:
+        pol = lc0.Lc0Policy(backend=backend)
+        pol.predict(policy_qs[:100])
+        t = time.perf_counter()
+        pol.predict(policy_qs)
+        dt = time.perf_counter() - t
+        print(f"policy {backend}, batch {pol.batch_size}: {len(policy_qs) / dt:.0f} pos/s; GPU memory used {gpu_used()} MiB",
+              flush=True)
+        del pol
+    for nodes in a.nodes:
+        for procs in a.processes:
+            with lc0.Lc0Search(nodes, processes=procs) as s:
+                s.evaluate(search_qs[:procs])
+                n = max(len(search_qs) * nodes // max(a.nodes) * procs, 4 * procs)   # roughly equal time per row
+                sample = search_qs[:n] if nodes < max(a.nodes) else search_qs
+                t = time.perf_counter()
+                res = s.evaluate(sample)
+                dt = time.perf_counter() - t
+                visited = np.mean([np.mean(~np.isnan(r.value)) for r in res])
+                print(f"search {nodes:5d} nodes, {procs} processes: {len(sample) / dt:6.1f} pos/s "
+                      f"({nodes * len(sample) / dt:.0f} nodes/s) on {len(sample)} positions, share of root moves "
+                      f"visited {visited:.3f}; GPU memory used {gpu_used()} MiB", flush=True)
+    if maia:
+        t = time.perf_counter()
+        maia.predict(qs[:20000])
+        print(f"Maia-3 79M alongside, alone again: {20000 / (time.perf_counter() - t):.0f} pos/s")
+
+
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(prog="python -m tnh.models.bench")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -306,6 +358,17 @@ def main(argv=None) -> None:
     sp.add_argument("--hash-mb", type=int, default=16)
     sp.add_argument("--min-ply", type=int, default=20)
     sp.set_defaults(fn=lambda a: cmd_stockfish(a))
+
+    sp = sub.add_parser("lc0")
+    sp.add_argument("--pgn", type=Path, required=True)
+    sp.add_argument("--min-ply", type=int, default=20)
+    sp.add_argument("--n-policy", type=int, default=5000)
+    sp.add_argument("--n-search", type=int, default=200)
+    sp.add_argument("--nodes", nargs="+", type=int, default=[100, 400, 1600])
+    sp.add_argument("--processes", nargs="+", type=int, default=[1])
+    sp.add_argument("--backends", nargs="+", default=["cuda-auto"])
+    sp.add_argument("--with-maia", action="store_true", help="keep Maia-3 79M loaded on the GPU meanwhile")
+    sp.set_defaults(fn=cmd_lc0)
 
     a = p.parse_args(argv)
     a.fn(a)

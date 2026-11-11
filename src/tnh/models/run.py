@@ -12,7 +12,7 @@ Maia-3 takes any number of Elo settings (`--offsets` for both sides at once,
 them all on one encoding of each batch, writing one variant directory per setting.
 
 The games file (for `moves_uci`) defaults to `games.parquet` next to the positions
-file. Feature files go to `<out>/<variant>/`, `--out` defaulting to
+file, else `corpus/games.parquet` (samples live in `corpus/samples/` without one). Feature files go to `<out>/<variant>/`, `--out` defaulting to
 `features/<model>/`. Output is written as `part-NNNNN.parquet`, one per chunk, each
 renamed into place only when complete, so an interrupted run loses at most the chunk
 in progress. A rerun skips every `(game_id, ply)` already on disk in each variant
@@ -35,6 +35,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from tnh.models.base import Query
+from tnh import paths
 from tnh.paths import FEATURES
 
 
@@ -172,8 +173,21 @@ def maia3_settings(a) -> list:
     return unique
 
 
+def games_file(positions: Path, games: Path | None) -> Path:
+    """`--games`, else games.parquet next to the positions file, else the corpus one."""
+    if games is not None:
+        if not games.exists():
+            raise SystemExit(f"--games {games} does not exist")
+        return games
+    for candidate in (positions.parent / "games.parquet", paths.CORPUS / "games.parquet"):
+        if candidate.exists():
+            return candidate
+    raise SystemExit(f"no games file: none next to {positions} and none at {paths.CORPUS / 'games.parquet'}; "
+                     f"pass --games")
+
+
 def run(a) -> None:
-    games = a.games or a.positions.parent / "games.parquet"
+    games = games_file(a.positions, a.games)
     t0 = time.perf_counter()
     if a.model == "maia3":
         from tnh.models.maia3 import Maia3
@@ -206,7 +220,8 @@ def run(a) -> None:
         from tnh.models.lc0 import Lc0Search
         from tnh.models.maia3 import Elo
 
-        model = Lc0Search(a.nodes, a.network, wdl_elo=Elo.parse(a.wdl_elo) if a.wdl_elo else None)
+        model = Lc0Search(a.nodes, a.network, wdl_elo=Elo.parse(a.wdl_elo) if a.wdl_elo else None,
+                          processes=a.lc0_processes)
         outs = [(a.out or FEATURES / model.name) / model.variant]
         check_meta(outs[0], {"model": model.name, "variant": model.variant, "network": model.network.name,
                              "nodes": a.nodes, "wdl_elo": a.wdl_elo, "options": model.options})
@@ -255,7 +270,8 @@ def main(argv=None) -> None:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", required=True, choices=["maia3", "stockfish", "lc0-policy", "lc0-search"])
     p.add_argument("--positions", type=Path, required=True)
-    p.add_argument("--games", type=Path, help="default: games.parquet next to --positions")
+    p.add_argument("--games", type=Path,
+                   help="default: games.parquet next to --positions, else <corpus>/games.parquet")
     p.add_argument("--out", type=Path, help="parent of the variant directories; default: features/<model>")
     p.add_argument("--limit", type=int, help="at most this many positions not yet done")
     p.add_argument("--split", choices=["train", "val", "test"], help="only positions from this split")
@@ -278,6 +294,7 @@ def main(argv=None) -> None:
     g = p.add_argument_group("lc0")
     g.add_argument("--network", default="BT4-1024x15x32h-swa-6147500.pb.gz", help="file under <lc0>/networks, or a path")
     g.add_argument("--wdl-elo", help="lc0-search: calibrate to two players, e.g. offset+0 or fixed2200-2000")
+    g.add_argument("--lc0-processes", type=int, default=4, help="lc0-search: engine processes sharing the GPU")
     run(p.parse_args(argv))
 
 
