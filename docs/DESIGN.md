@@ -25,6 +25,9 @@ corpus/games.parquet
 corpus/games_extra.parquet        per-source detail behind the parsing decisions; not an input to anything downstream
 corpus/parse_stats.json           what was dropped and why
 corpus/positions.parquet
+corpus/samples/<name>.parquet     fixed subsets of positions.parquet, same schema; what features are computed on
+weights/                          downloaded model weights
+scratch/<module>/                 a developer's own experiments; nothing downstream reads it
 features/<model>/<variant>/*.parquet
 reports/*.md
 ```
@@ -146,21 +149,43 @@ class Query:
 @dataclass
 class Prediction:
     moves: list[str]          # every legal move, UCI
-    probs: np.ndarray         # float32, same order, sums to 1
+    logp: np.ndarray          # float32, same order, log probability over the legal moves
     wdl: tuple[float, float, float] | None   # win, draw, loss for the mover
+
+@dataclass
+class MoveValues:
+    moves: list[str]          # every legal move, UCI
+    value: np.ndarray         # float32, expected score for the mover after the move; NaN = no value within the budget
+    cp: np.ndarray            # float32, centipawns for the mover after the move; NaN where the score is a mate or missing
+    mate: np.ndarray          # int16, moves to mate, positive when the mover mates; 0 where the score is not a mate
+    wdl: tuple[float, float, float] | None   # the position itself, along the best line, for the mover
 
 class MoveModel(Protocol):
     name: str
     def predict(self, queries: list[Query]) -> list[Prediction]: ...
+
+class ValueModel(Protocol):
+    name: str
+    def evaluate(self, queries: list[Query]) -> list[MoveValues]: ...
 ```
+
+Log probabilities, not probabilities: float32 probabilities lose the small
+ones, and those are the ones that dominate a log loss.
 
 A model's own Elo input is a parameter of the model object, separate from
 `mover_elo` in the query, so that the Elo fed to the network can be swept
-while the player's real rating stays in the data.
+while the player's real rating stays in the data. Maia-3 takes the two
+ratings as continuous values. It was trained on Lichess blitz ratings; the
+ratings in the corpus are FIDE ratings, and the difference is what the sweep
+measures.
 
 ## Feature files
 
-`features/<model>/<variant>/part-*.parquet`, one row per `(game_id, ply)`:
+`features/<model>/<variant>/part-*.parquet`, one row per `(game_id, ply)`,
+and a `meta.json` with the options the run was made with. A run into a
+directory whose `meta.json` has other options is refused.
+
+Move models:
 
 | column | type |
 |---|---|
@@ -169,20 +194,43 @@ while the player's real rating stays in the data.
 | `logp` | list[float32], log probability per move, same order |
 | `wdl` | list[float32] of length 3, nullable |
 
-Engine features use the same shape with `value` (expected score for the mover
-after each move) in place of `logp`.
+Value models: `moves`, `value`, `cp`, `mate` and `wdl` as in `MoveValues`.
 
 A feature run is resumable: it skips `(game_id, ply)` pairs that are already
 on disk.
 
-## Evaluation (step 1, not started)
+Variant names say what was varied: `offset+300`, `fixed2200-2200`,
+`nodes10000`, with suffixes for anything else that is not the default.
 
-- Log loss of the played move, with the model mixed with a uniform
+## Evaluation (step 1)
+
+`tnh.eval`. Everything is fitted on `train` and reported on `test`. The split
+is by tournament. Rows from one game are not independent, so every interval
+is a bootstrap over tournaments.
+
+- **The sample.** Features are computed on fixed samples, not on all of
+  `positions.parquet`. A sample is drawn after `in_window`, from classical
+  games with clocks whose `tempo_source` is not `assumed`, with both ratings
+  in a band, and is stratified on the mover's rating in 100-point buckets.
+- **Log loss of the played move**, with the model mixed with a uniform
   distribution over the legal moves, `p' = (1 - eps) * p + eps / n`. `eps` is
   fitted. This keeps the score proper and stops single impossible moves from
   dominating.
-- Maia-3's Elo input swept from 1800 to 2600.
-- A conditional logit over the legal moves with model log probabilities and
-  engine values as features.
-- Log loss of the value head on `result_mover`.
-- Fit on `train`, report on `test`. The split is by tournament.
+- **The Elo sweep.** Maia-3 with both ratings offset by the same amount, from
+  -200 to +800. The first measurement on elite games had its minimum at +300
+  and broke down above about 2800 on Maia's scale. The result wanted is the
+  best offset as a function of the player's FIDE rating. The mover's and the
+  opponent's offset are also varied separately.
+- **Breakdowns** of the log loss: by the mover's rating, by ply, and by the
+  time left on the clock. The last one shows where play degrades, which is
+  what `min_clock_s` should be set from.
+- **A conditional logit** over the legal moves with model log probabilities
+  and engine values as features.
+- **The value head.** Log loss of the predicted win, draw and loss on
+  `result_mover`, one position per game. Raw, and after a recalibration
+  fitted on `train`: the first measurement gave a mean draw probability of
+  0.16 where 43 % of the games were drawn.
+- **The reference.** The same log loss for Maia-3 on Lichess blitz games at
+  the players' own ratings, from a month after its training data ends
+  (July 2025). The gap between that and the classical figure is what a model
+  made for classical play could gain.

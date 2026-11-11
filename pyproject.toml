@@ -14,6 +14,7 @@ dependencies = [
     "scipy>=1.14",
     "torch>=2.5",
     "maia3",
+    "matplotlib>=3.11.2",
 ]
 
 [dependency-groups]
