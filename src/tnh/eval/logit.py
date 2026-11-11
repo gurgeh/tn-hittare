@@ -19,7 +19,8 @@ Feature sources, each a feature directory:
   (the move is taken to be no better than the worst move the engine did value)
   and flagged by ``NAME_nan``, whose coefficient is fitted. A position where the
   engine valued no move at all is dropped from every fit and every number, and
-  counted. ``NAME_nan`` is left out when no move in the fitting sample lacks a value.
+  counted. ``NAME_nan`` is left out when fewer than ``--min-nan-played`` played moves in the
+  fitting sample lack a value: its coefficient cannot be estimated then.
 
   The expected-score loss saturates in decided positions (+5 and +9 are both
   about 1.0); the squashed centipawn loss does not, which is why both are there.
@@ -206,8 +207,8 @@ def fit(D: Data, w: np.ndarray | None = None, beta0: np.ndarray | None = None, m
         beta, gain, cur = new, val - cur, val
         if abs(gain) < tol and np.max(np.abs(t * step)) < 1e-7:
             return beta, it
-    print(f"  warning: no convergence after {max_iter} iterations for {D.names}")
-    return beta, max_iter
+    raise FeatureMismatch(f"no convergence after {max_iter} Newton iterations for {D.names} "
+                          f"(a coefficient running off to infinity: a feature separates the played moves)")
 
 
 # --- main --------------------------------------------------------------------------
@@ -243,6 +244,8 @@ def main(argv=None) -> None:
     p.add_argument("--full", help="the set to drop sources from (default: the largest)")
     p.add_argument("--boot-fit", type=int, default=100, help="refits for the coefficient intervals")
     p.add_argument("--name", default="logit", help="result file name")
+    p.add_argument("--min-nan-played", type=int, default=20,
+                   help="fit an engine's NaN indicator only when this many played moves lack a value")
     add_common(p)
     a = p.parse_args(argv)
     logp, engines = parse_pairs(a.logp), parse_pairs(a.engine)
@@ -251,8 +254,11 @@ def main(argv=None) -> None:
 
     Df, info_f = build(fitS, logp, engines)
     Dt, info_t = build(test, logp, engines)
-    # a NaN indicator that never fires in the fitting sample cannot be fitted
-    unused = [c for c in Df.names if c.endswith("_nan") and Df.X[:, Df.names.index(c)].sum() == 0]
+    # A NaN indicator is fitted only when the played move lacks a value in at least --min-nan-played
+    # fitting rows; with fewer its coefficient runs off to -inf (the played move is never one of them).
+    # Left out, those moves keep the imputed worst loss.
+    unused = [c for c in Df.names if c.endswith("_nan")
+              and Df.X[Df.y, Df.names.index(c)].sum() < a.min_nan_played]
     sources = {k: [k] for k in logp}
     for e in engines:
         sources[e] = [c for c in Df.names if c.startswith(f"{e}_") and c not in unused]

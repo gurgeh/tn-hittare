@@ -341,7 +341,8 @@ def sec_logit(w, r):
       f"test {rt['rows']} (dropped {rt['rows_dropped_no_engine_value']}). Engine moves without a value, fitting "
       f"sample: " + ", ".join(f"{k} {v['moves_without_value']} of {v['moves']}" for k, v in rf.items()
                              if isinstance(v, dict)) +
-      f". NaN indicators left out because they never fire: {r['unused_nan_indicators'] or 'none'}.\n\n")
+      f". NaN indicators left out because too few played moves lack a value to fit them (those moves keep the "
+      f"imputed worst loss): {', '.join(r['unused_nan_indicators']) or 'none'}.\n\n")
     w(table(["set", "features", "test, mixed", "test, raw", "eps", "Newton iterations"],
             [[k, ", ".join(f"`{c}`" for c in s["columns"]), f(s["test_mixed"]), f(s["test_raw"]),
               f"{s['eps']:.5f}", s["iterations"]] for k, s in r["sets"].items()]))
@@ -382,12 +383,14 @@ def sec_value(w, r, figdir, rel):
               f(m["recalibrated"]), f(m["recal_minus_raw_plus_eps"]),
               f"{m['mean_p_draw_raw']:.3f}", f"{m['mean_p_draw_recal']:.3f}",
               ", ".join(f"{v:.3f}" for v in m["recal"].values())] for m in r["models"]]))
-    w("\nCalibration by bucket of the mover's rating (test):\n\n")
     keys = [k[: -len("_p_draw")] for k in r["calibration"][0] if k.endswith("_p_draw")]
-    hdr = ["bucket", "games", "draw rate", "score"] + [f"P(draw) {k}" for k in keys] + [f"E(score) {k}" for k in keys]
-    w(table(hdr, [[c["bucket"], c["games"], f"{c['draw_rate']:.3f}", f"{c['score']:.3f}"] +
-                  [f"{c[k + '_p_draw']:.3f}" for k in keys] + [f"{c[k + '_exp_score']:.3f}" for k in keys]
-                  for c in r["calibration"]]))
+    for what, suffix, real in (("mean predicted draw probability", "_p_draw", "draw_rate"),
+                               ("mean predicted expected score (win + draw/2)", "_exp_score", "score")):
+        w(f"\nCalibration by bucket of the mover's rating (test), {what}, against the real "
+          f"{'draw rate' if real == 'draw_rate' else 'score'}:\n\n")
+        w(table(["bucket", "games", "real"] + [f"`{k}`" for k in keys],
+                [[c["bucket"], c["games"], f"{c[real]:.3f}"] + [f"{c[k + suffix]:.3f}" for k in keys]
+                 for c in r["calibration"]]))
     fig, ax = plt.subplots(figsize=(6.5, 4))
     x = [c["bucket"] + 50 for c in r["calibration"]]
     ax.plot(x, [c["draw_rate"] for c in r["calibration"]], color=INK, linewidth=2, marker="s", markersize=6,

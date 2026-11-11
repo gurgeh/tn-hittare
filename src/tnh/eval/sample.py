@@ -156,7 +156,14 @@ def main(argv=None) -> None:
         raise SystemExit("--elo-min must be a multiple of 100")
 
     games = pl.read_parquet(games_path, columns=GAME_COLS)
+    orphans = (pl.scan_parquet(a.positions).select("game_id").unique()
+               .join(games.lazy().select("game_id"), on="game_id", how="anti").select(pl.len()).collect().item())
+    if orphans:
+        raise SystemExit(f"{orphans} game_ids in {a.positions} are not in {games_path}: "
+                         f"the two files are not from the same build")
     pop = population(pl.scan_parquet(a.positions), games, a)
+    if pop.height == 0:
+        raise SystemExit("no eligible rows")
     print(f"population: {pop.height} rows of {pop.get_column('game_id').n_unique()} eligible games "
           f"(split={a.split}, both ratings {a.elo_min}-{a.elo_max}); in window: {pop.get_column('in_window').sum()}")
     s, strata = draw(pop, a)

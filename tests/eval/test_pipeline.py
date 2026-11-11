@@ -33,11 +33,15 @@ def make(tmp, split, n, rng, offset_true=100):
     # some rows outside the window, as a real sample has
     df = df.with_columns((pl.col("clock_mover_s") >= 600).alias("in_window"))
     wdl = rng.dirichlet([2, 2, 2], n)
+    # each offset also gets its own small perturbation, as the real network's outputs are not exactly
+    # a rescaling of one another (exact collinearity would leave the logit unidentified)
+    pert = {o: [rng.normal(0, 0.05, len(zz)) for zz in z] for o in OFFSETS if o != offset_true}
     for o in OFFSETS:
-        lp = [np.log(p) for p in softmax_rows([zz * (1 + o / 400) for zz in z])]
+        lp = [np.log(p) for p in softmax_rows([zz * (1 + o / 400) + (pert[o][i] if o in pert else 0)
+                                               for i, zz in enumerate(z)])]
         write_features(tmp / "maia" / f"offset{o:+d}", df, moves, {"logp": lp}, wdl=wdl, part=part,
                        meta={"model": "maia-synth", "variant": f"offset{o:+d}"})
-    for nodes, noise in ((10, 0.05), (100, 0.0)):
+    for nodes, noise in ((10, 0.05), (100, 0.01)):
         v = [np.clip(x + rng.normal(0, noise, len(x)), 0, 1) for x in values]
         cp = [400 * (x - 0.5) for x in v]
         mate = [np.zeros(len(x), dtype=np.int16) for x in v]
