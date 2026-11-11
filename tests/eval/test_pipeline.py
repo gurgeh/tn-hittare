@@ -85,6 +85,11 @@ def test_all_commands_and_the_report(tmp_path):
     assert sw["compare"]["single_offset"] == 100
     mistakes.main(["--variants", *M, "--shallow", str(feats / "sf/nodes10"), "--deep", str(feats / "sf/nodes100"),
                    "--test", str(test), "--results", str(R), "--boot", "20", "--robust-boot", "2"])
+    mistakes.main(["--variants", *M, "--shallow", str(feats / "sf/nodes10"), "--deep", str(feats / "sf/nodes100"),
+                   "--glance", str(feats / "sf/nodes10"), "--prior", M[1], "--name", "mistakes_glance",
+                   "--test", str(test), "--results", str(R), "--boot", "10", "--robust-boot", "2"])
+    mg = json.loads((R / "mistakes_glance.json").read_text())
+    assert set(mg["glance"]["pooled"]) == {"sound", "at_a_glance", "hidden"} and len(mg["robustness_glance"]) == 15
     logit.main(["--logp", f"m0={M[1]}", "--logp", f"mbest={M[2]}", "--engine", f"sf10={feats / 'sf/nodes10'}",
                 "--engine", f"sf100={feats / 'sf/nodes100'}", "--set", "A=mbest", "--set", "B=m0,sf10,sf100",
                 "--set", "C=m0,mbest,sf10,sf100", "--full", "C", "--boot-fit", "5"] + C)

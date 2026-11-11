@@ -108,6 +108,17 @@ def allocate(available: dict, n: int) -> dict:
 NARROW = ["game_id", "ply", "pos_count", "clock_mover_s", "mover_elo", "opp_elo"]
 
 
+def drop_cache(path: Path) -> None:
+    """Drop the page cache of a file just read. A capped job's memory counts the page cache it caused, so
+    reading the 5 GB positions.parquet would otherwise look like 5 GB of memory to the cap."""
+    import os
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+
+
 def peak_gb() -> float:
     import resource
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
@@ -153,6 +164,7 @@ def candidates(positions: Path, ids: list[str], batch_games: int, annotate, stra
     keep = None
     for i in range(0, len(ids), batch_games):
         b = annotate(narrow_batch(positions, ids[i:i + batch_games]))
+        drop_cache(positions)
         b = b.with_columns(pl.Series("_key", row_keys(b.get_column("game_id"), b.get_column("ply"), seed)))
         for *k, n in b.group_by(strata).len().iter_rows():
             counts[tuple(k)] = counts.get(tuple(k), 0) + n
@@ -222,6 +234,7 @@ def fetch_wide(games_path: Path, chosen: pl.DataFrame, workers: int = 8, max_ply
     try:
         g = (pl.scan_parquet(games_path).select(REPLAY_COLS)
              .filter(pl.col("game_id").is_in(ids.implode())).collect().sort("game_id"))
+        drop_cache(games_path)
         if g.height != ids.len():
             raise RuntimeError(f"{ids.len() - g.height} chosen games are not in {games_path}")
         gp = tmp / "games.parquet"
@@ -245,6 +258,26 @@ def fetch_wide(games_path: Path, chosen: pl.DataFrame, workers: int = 8, max_ply
     return w
 
 
+def subsample(s: pl.DataFrame, n: int, seed: int) -> tuple[pl.DataFrame, list[dict]]:
+    """``n`` window rows of a sample, equal allocation over its rating buckets, smallest keys of
+    hash(seed, game_id, ply); a smaller ``n`` with the same seed gives a subset. Weights are rescaled so that
+    a weighted mean still estimates the population: population rows in the bucket / rows kept."""
+    w = s.filter(pl.col("in_window"))
+    w = w.with_columns(pl.Series("_key", row_keys(w.get_column("game_id"), w.get_column("ply").cast(pl.Int64), seed)))
+    avail = dict(w.group_by("bucket").len().iter_rows())
+    pop = dict(w.group_by("bucket").agg(pl.col("weight").sum()).iter_rows())
+    alloc = allocate(avail, n)
+    out, info = [], []
+    for b in sorted(avail):
+        k = alloc[b]
+        if k == 0:
+            continue
+        rows = w.filter(pl.col("bucket") == b).sort("_key").head(k)
+        out.append(rows.with_columns(pl.lit(pop[b] / k).alias("weight")))
+        info.append({"bucket": int(b), "population": float(pop[b]), "sampled": int(k)})
+    return pl.concat(out).drop("_key").sort("game_id", "ply"), info
+
+
 def count_orphans(positions: Path, game_ids: pl.Series) -> int:
     """Game ids in positions.parquet that games.parquet lacks, one row group at a time (a unique over all
     212 million rows at once took more than 6 GB)."""
@@ -256,6 +289,9 @@ def count_orphans(positions: Path, game_ids: pl.Series) -> int:
     for r in range(f.metadata.num_row_groups):
         ids = pl.from_arrow(f.read_row_group(r, columns=["game_id"])).unique()
         n += ids.join(known, on="game_id", how="anti").height
+        if r % 50 == 49:
+            drop_cache(positions)
+    drop_cache(positions)
     return n
 
 
@@ -324,8 +360,23 @@ def main(argv=None) -> None:
     g.add_argument("--max-ply", type=int, default=60)
     g.add_argument("--max-ply-no-clock", type=int, default=40)
     g.add_argument("--min-clock-s", type=int, default=600)
+    p.add_argument("--subsample-of", type=Path, help="draw --n window rows from this sample instead of the corpus")
     a = p.parse_args(argv)
     a.exit_counts = a.exit_counts or [a.book_count]
+    if a.subsample_of:
+        src = pl.read_parquet(a.subsample_of)
+        s, info = subsample(src, a.n, a.seed)
+        out = a.subsample_of.parent / f"{a.name}.parquet"
+        s.write_parquet(out)
+        meta = {"subsample_of": str(a.subsample_of), "n": a.n, "seed": a.seed, "rows": s.height,
+                "games": s.get_column("game_id").n_unique(), "tournaments": s.get_column("tournament_id").n_unique(),
+                "split": a.split, "strata": info,
+                **{k: v for k, v in json.loads(a.subsample_of.with_suffix(".json").read_text()).items()
+                   if k in ("elo_min", "elo_max", "book_count", "max_ply", "max_ply_no_clock", "min_clock_s",
+                            "extra_frac", "positions")}}
+        out.with_suffix(".json").write_text(json.dumps(meta, indent=1) + "\n")
+        print(f"wrote {out}: {s.height} window rows, {meta['games']} games, {meta['tournaments']} tournaments")
+        return
     games_path = a.games or a.positions.parent / "games.parquet"
     out_dir = a.out_dir or a.positions.parent / "samples"
     if a.elo_min % BUCKET:

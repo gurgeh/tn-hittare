@@ -127,6 +127,45 @@ def draw_theory(positions: Path, games: pl.DataFrame, a, batch_games: int, log=p
     return s.sort("game_id", "ply"), info, {"games": len(ids)}
 
 
+def _count_task(args):
+    """Worker: the pos_count of the wanted keys found in row groups [lo, hi) of positions.parquet."""
+    positions, keys_path, lo, hi = args
+    import pyarrow.parquet as pq
+    keys = pl.read_parquet(keys_path)
+    t = pq.ParquetFile(positions).read_row_groups(list(range(lo, hi)), columns=["pos_key", "pos_count"])
+    found = pl.from_arrow(t).join(keys, on="pos_key", how="semi")
+    from tnh.eval.sample import drop_cache
+    drop_cache(Path(positions))
+    return found.group_by("pos_key").agg(pl.col("pos_count").max().cast(pl.Int64).alias("pos_count"),
+                                         pl.col("pos_count").min().cast(pl.Int64).alias("_min"))
+
+
+def lookup_counts(positions: Path, keys: pl.DataFrame, groups_per_task: int = 12, procs: int = 2) -> pl.DataFrame:
+    """pos_count per wanted pos_key, read from positions.parquet a few row groups at a time.
+
+    Each slice of row groups is read in a fresh worker process that exits after it: memory used to read
+    positions.parquet was found to stay with the process (2026-11-11), so it must not be the main one."""
+    import multiprocessing
+    import shutil
+    import tempfile
+
+    import pyarrow.parquet as pq
+
+    from tnh.paths import DATA_ROOT
+
+    n = pq.ParquetFile(positions).metadata.num_row_groups
+    tmp = Path(tempfile.mkdtemp(prefix="lookup-", dir=DATA_ROOT / "scratch"))
+    try:
+        kp = tmp / "keys.parquet"
+        keys.write_parquet(kp)
+        tasks = [(str(positions), str(kp), lo, min(lo + groups_per_task, n)) for lo in range(0, n, groups_per_task)]
+        with multiprocessing.get_context("spawn").Pool(procs, maxtasksperchild=1) as pool:
+            parts = pool.map(_count_task, tasks, chunksize=1)
+    finally:
+        shutil.rmtree(tmp)
+    return pl.concat(parts).group_by("pos_key").agg(pl.col("pos_count").max(), pl.col("_min").min())
+
+
 def with_continuations(s: pl.DataFrame, positions: Path) -> pl.DataFrame:
     """Add the continuation counts: each legal move's resulting position looked up by pos_key."""
     import chess
@@ -143,12 +182,7 @@ def with_continuations(s: pl.DataFrame, positions: Path) -> pl.DataFrame:
             b.pop()
             played.append(m.uci() == uci)
     kids = pl.DataFrame({"_r": rows, "pos_key": keys, "_played": played})
-    # one streaming pass over positions.parquet's two narrow columns; only the distinct children are held
-    counts = (pl.scan_parquet(positions).select("pos_key", "pos_count")
-              .join(kids.lazy().select("pos_key").unique(), on="pos_key", how="semi")
-              .group_by("pos_key").agg(pl.col("pos_count").max().cast(pl.Int64).alias("pos_count"),
-                                       pl.col("pos_count").min().cast(pl.Int64).alias("_min"))
-              .collect(engine="streaming"))
+    counts = lookup_counts(positions, kids.select("pos_key").unique())
     counts = counts.with_columns((pl.col("pos_count") != pl.col("_min")).alias("_n")).drop("_min")
     if counts.get_column("_n").any():
         raise SystemExit("a pos_key with two different pos_count values in positions.parquet")
@@ -358,6 +392,7 @@ def main(argv=None) -> None:
     sp.add_argument("--elo-max", type=int, default=2500)
     sp.add_argument("--seed", type=int, default=1)
     sp.add_argument("--batch-games", type=int, default=20_000, help="games read at a time (memory)")
+    sp.add_argument("--tournament-frac", type=float, default=1.0, help="draw this share of tournaments first")
     sp.add_argument("--positions", type=Path, default=CORPUS / "positions.parquet")
     sp.add_argument("--games", type=Path)
     sp.add_argument("--out-dir", type=Path)

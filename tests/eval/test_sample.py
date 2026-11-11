@@ -180,3 +180,17 @@ def test_continuation_counts(tmp_path):
     assert out.get_column("played_ends_game").to_list() == [False, False, True]   # game c has one ply
     assert out.get_column("max_other_child_count").to_list() == [500, 500, 500]
     assert out.get_column("n_other_at_max").to_list() == [1, 2, 2]
+
+
+def test_subsample_is_nested_and_reweighted(tmp_path):
+    from tnh.eval.sample import subsample
+    path, games = corpus(tmp_path, np.random.default_rng(7))
+    s, _, _ = draw_main(path, games, args(n=1400), 40, quiet)
+    a, ia = subsample(s, 300, 9)
+    b, _ = subsample(s, 600, 9)
+    assert a.height == 300 and a.get_column("in_window").all()
+    assert set(map(tuple, a.select("game_id", "ply").rows())) <= set(map(tuple, b.select("game_id", "ply").rows()))
+    w = s.filter(pl.col("in_window"))
+    for st in ia:   # weights still sum to the population of each bucket
+        assert np.isclose(a.filter(pl.col("bucket") == st["bucket"]).get_column("weight").sum(),
+                          w.filter(pl.col("bucket") == st["bucket"]).get_column("weight").sum())

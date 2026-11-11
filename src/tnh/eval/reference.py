@@ -97,6 +97,7 @@ def main(argv=None) -> None:
     p.add_argument("--min-clock-s", type=int, default=600)
     p.add_argument("--max-ply-no-clock", type=int, default=40)
     add_common(p, fit=False)
+    p.add_argument("--name", default="reference", help="result file name (without .json)")
     a = p.parse_args(argv)
     bz = pl.read_parquet(a.blitz_positions).with_columns(pl.col("ply").cast(pl.Int64))
     n0 = bz.height
@@ -113,7 +114,7 @@ def main(argv=None) -> None:
             at0 = row.get("loss_at_0", {}).get("est", float("nan"))
             print(f"{name:>9} {row['bucket']}: rows={row['rows']:>7} games={row['games']:>6} at 0 {at0:.4f}; "
                   f"best {row['best_loss']['est']:.4f} at {row['best_offset']:+g}")
-    write_result(a.results, "reference", {
+    write_result(a.results, a.name, {
         "what": "raw log loss of Maia-3 on Lichess blitz and on classical games, common window",
         "rule": {"blitz": "ply 20-59, clock >= 30 s", "classical": f"ply 20-59, clock >= {a.min_clock_s} s "
                  f"or no clock and ply < {a.max_ply_no_clock}; both sample parts, weighted"},

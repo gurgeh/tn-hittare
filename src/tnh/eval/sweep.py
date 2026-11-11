@@ -105,6 +105,7 @@ def main(argv=None) -> None:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--variants", type=Path, nargs="+", required=True)
     add_common(p)
+    p.add_argument("--name", default="sweep", help="result file name (without .json)")
     a = p.parse_args(argv)
     test, fit = window_rows(read_sample(a.test)), window_rows(read_sample(a.fit))
     check_splits(test, fit)
@@ -212,7 +213,7 @@ def main(argv=None) -> None:
             sep["best_per_bucket"].append({"bucket": int(b), "mover": cells[j][0], "opp": cells[j][1],
                                            "loss": means[j], "boot_share": float(wins[j])})
 
-    write_result(a.results, "sweep", {
+    write_result(a.results, a.name, {
         "what": "Maia-3 Elo sweep, mixed log loss on window rows",
         "rows": {"test": test.height, "fit": fit.height}, "boot": a.boot,
         "offsets": offs.tolist(), "per_offset": per_offset, "per_bucket": per_bucket,

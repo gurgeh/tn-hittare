@@ -140,6 +140,7 @@ def main(argv=None) -> None:
     p.add_argument("--model", type=Path, nargs="+", required=True)
     p.add_argument("--pick", choices=["random", "first"], default="random")
     add_common(p)
+    p.add_argument("--name", default="value", help="result file name (without .json)")
     a = p.parse_args(argv)
     test = one_per_game(window_rows(read_sample(a.test)), a.pick, a.seed)
     fit = one_per_game(window_rows(read_sample(a.fit)), a.pick, a.seed)
@@ -186,7 +187,7 @@ def main(argv=None) -> None:
     # a reference with no model: the fitting sample's outcome frequencies
     freq = np.bincount(yf, minlength=3) / len(yf)
     base = nll_rows(np.tile(freq, (len(yt), 1)), yt)
-    write_result(a.results, "value", {
+    write_result(a.results, a.name, {
         "what": "value-head log loss on the result, one window row per game; recalibration fitted on the fitting sample",
         "pick": a.pick, "games": {"test": test.height, "fit": fit.height},
         "draw_rate": {"test": float(np.mean(yt == 1)), "fit": float(np.mean(yf == 1))},

@@ -455,10 +455,67 @@ def sec_theory(w, r, figdir, rel):
     w(f"\n![Where theory ends]({rel}/theory.png)\n\n")
 
 
-def sec_logit(w, r):
-    w("## The conditional logit\n\n")
+def mistake_tables(w, r, kinds, ref_offsets):
+    """Per kind of class: pooled observed share and Maia-3 mass at each offset, and by rating bucket the
+    ratio of mass to observed share at the reference offsets."""
+    offs = r["offsets"]
+    for kind in kinds:
+        if kind not in r:
+            continue
+        rows = []
+        for c, x in r[kind]["pooled"].items():
+            co = x["calibrated_offset"]
+            rows.append([c, f"{x['observed']:.4f}"] + [f"{p_:.4f}" for p_ in x["predicted"]] +
+                        [f"none ({x['side']})" if co is None else f"{co:+.0f} {cross_ci(x)}"])
+        w(f"**{kind}**, pooled: observed share of played moves and Maia-3's mass on each class:\n\n")
+        w(table(["class", "observed"] + [f"mass at {o:+g}" for o in offs] + ["calibrated at"], rows) + "\n")
+        refs = [o for o in ref_offsets if o in offs]
+        hdr = ["bucket", "rows"] + [f"{c} at {o:+g}" for c in r[kind]["pooled"] for o in refs]
+        rows = []
+        for b, xb in zip(r["buckets"], r[kind]["by_bucket"]):
+            row = [b, xb["rows"]]
+            for c in r[kind]["pooled"]:
+                for o in refs:
+                    ratio = xb[c]["ratio"]
+                    row.append("" if ratio is None else f"{ratio[offs.index(o)]:.2f}")
+            rows.append(row)
+        w(f"**{kind}**, Maia-3 mass / observed share by bucket of the mover's rating (1 = calibrated):\n\n")
+        w(table(hdr, rows) + "\n")
+
+
+def sec_mistakes_extra(w, r, title, note, ref_offsets):
+    w(f"{title}\n\n")
     if not r:
-        w("_No `logit.json`._\n\n"); return
+        w("_Not run._\n\n"); return
+    t = r["thresholds"]
+    w(f"{note} Shallow `{r['shallow']}`, deep `{r['deep']}`" + (f", at a glance `{r['glance']}`" if r.get("glance") else "")
+      + (f", prior `{r['prior']}`" if r.get("prior") else "") + f". Sound: deep loss <= {t['sound']}. "
+      f"{r['rows']} rows kept; dropped {r['dropped_missing_value']} with a move without a value, "
+      f"{r['dropped_decided']} decided.\n\n")
+    if r.get("glance_def"):
+        w(f"At a glance: a deep-budget mistake whose loss Lc0's raw child value already shows "
+          f"({r['glance_def'][0]} >= {r['glance_def'][1]} against Lc0's best child); hidden: one it does not. "
+          f"In mind: a deep-budget mistake with Lc0 policy prior >= {r.get('prior_p')}.\n\n")
+    mistake_tables(w, r, ["visibility", "size", "glance", "prior"], ref_offsets)
+    rg = r.get("robustness_glance") or []
+    if rg:
+        z = r["offsets"].index(0.0) if 0.0 in r["offsets"] else 0
+        rows = []
+        for x in rg:
+            row = [x["glance_def"] and f"{x['glance_def'][0]} {x['glance_def'][1]:g}", x["prior_p"]]
+            for kind, cs in (("glance", ["at_a_glance", "hidden"]), ("prior", ["in_mind", "not_in_mind"])):
+                for c in cs:
+                    v = (x.get(kind) or {}).get(c)
+                    row.append("" if not v or v["ratio"] is None else f"{v['ratio'][z]:.2f} (obs {v['observed']:.3f})")
+            rows.append(row)
+        w("Robustness of the glance and prior classes, Maia-3 mass / observed at offset +0 (pooled):\n\n")
+        w(table(["glance definition", "prior p", "at a glance", "hidden", "in mind", "not in mind"], rows) + "\n")
+
+
+def sec_logit(w, r, title="## The conditional logit"):
+    w(f"{title}\n\n")
+    if not r:
+        w("_Not run._\n\n"); return
     src = r["sources"]
     w("Sources: " + ", ".join(f"`{k}` = `{v}`" for k, v in {**src["logp"], **src["engine"]}.items()) + ".\n\n")
     rf, rt = r["rows"]["fit"], r["rows"]["test"]
@@ -490,10 +547,10 @@ def sec_logit(w, r):
     w("\n")
 
 
-def sec_stack(w, r):
-    w("## Non-linear stacks: boosted trees and an MLP\n\n")
+def sec_stack(w, r, title="## Non-linear stacks: boosted trees and an MLP"):
+    w(f"{title}\n\n")
     if not r:
-        w("_No `stack.json`._\n\n"); return
+        w("_Not run._\n\n"); return
     o = r["options"]
     rows = r["rows"]
     w(f"A score per legal move from its own features and the position's context, softmax over the legal moves, "
@@ -549,10 +606,10 @@ def sec_stack(w, r):
     w("\n")
 
 
-def sec_value(w, r, figdir, rel):
-    w("## The value head\n\n")
+def sec_value(w, r, figdir, rel, title="## The value head", figname="value.png"):
+    w(f"{title}\n\n")
     if not r:
-        w("_No `value.json`._\n\n"); return
+        w("_Not run._\n\n"); return
     w(f"One window row per game (`--pick {r['pick']}`; median ply {r['ply_quartiles_test'][1]:.0f}), "
       f"result from the mover's side. Test {r['games']['test']} games, draw rate {r['draw_rate']['test']:.3f}; "
       f"fitting {r['games']['fit']} games, draw rate {r['draw_rate']['fit']:.3f}. A model that only knows the "
@@ -587,9 +644,9 @@ def sec_value(w, r, figdir, rel):
     ax.legend(fontsize=7, frameon=False)
     style(ax)
     fig.tight_layout()
-    fig.savefig(figdir / "value.png", dpi=130)
+    fig.savefig(figdir / figname, dpi=130)
     plt.close(fig)
-    w(f"\n![Value head calibration]({rel}/value.png)\n\n")
+    w(f"\n![Value head calibration]({rel}/{figname})\n\n")
 
 
 def sec_reference(w, r):
@@ -640,7 +697,8 @@ def main(argv=None) -> None:
     p.add_argument("--out", type=Path, default=REPORTS / "step1.md")
     p.add_argument("--note", help="a paragraph put at the top (e.g. that this is a rehearsal)")
     a = p.parse_args(argv)
-    names = ["logloss", "sweep", "mistakes", "logit", "stack", "breakdown", "book", "theory", "value", "reference"]
+    names = ["logloss", "sweep", "mistakes", "mistakes_1m", "mistakes_100k_sub15k", "mistakes_glance", "logit",
+             "stack", "logit_sub", "stack_sub", "breakdown", "book", "theory", "value", "value_wdl", "reference"]
     R = {n: load(a.results, n) for n in names}
     rel = Path(a.results).resolve().relative_to(Path(a.out).resolve().parent) \
         if Path(a.results).resolve().is_relative_to(Path(a.out).resolve().parent) else Path(a.results).resolve()
@@ -658,9 +716,25 @@ def main(argv=None) -> None:
     sec_breakdown(w, R["breakdown"], a.results, rel)
     sec_book(w, R["book"], a.results, rel)
     sec_theory(w, R["theory"], a.results, rel)
+    best = (R["sweep"] or {}).get("compare", {}).get("single_offset")
+    refs = [0.0] + ([best] if best is not None and best != 0 else [])
+    if R["mistakes"]:
+        w("### Ratios by rating bucket\n\n")
+        mistake_tables(w, R["mistakes"], ["visibility", "size"], refs)
+    sec_mistakes_extra(w, R["mistakes_1m"], "### The mistake classes with deeper labels",
+                       "The same classes on a 15,000-row subsample of the test window rows, with Stockfish at 1,000,000 "
+                       "nodes as the deep budget.", refs)
+    sec_mistakes_extra(w, R["mistakes_100k_sub15k"], "### The same subsample with the 100,000-node labels",
+                       "For comparison on the same rows.", refs)
+    sec_mistakes_extra(w, R["mistakes_glance"], "### Mistakes visible at a glance",
+                       "On a 100,000-row subsample of the test window rows, with Lc0's raw child values (no search) "
+                       "and its policy prior.", refs)
     sec_logit(w, R["logit"])
     sec_stack(w, R["stack"])
+    sec_logit(w, R["logit_sub"], "## The conditional logit with Lc0's search and children, on the subsample")
+    sec_stack(w, R["stack_sub"], "## The stacks with Lc0's search and children, on the subsample")
     sec_value(w, R["value"], a.results, rel)
+    sec_value(w, R["value_wdl"], a.results, rel, "## Lc0 with WDLCalibrationElo", "value_wdl.png")
     sec_reference(w, R["reference"])
     provenance_section(w, R)
     a.out.parent.mkdir(parents=True, exist_ok=True)

@@ -116,6 +116,7 @@ def main(argv=None) -> None:
     p.add_argument("--sizes", type=float, nargs=2, default=[0.10, 0.25])
     p.add_argument("--decided", type=float, default=0.97)
     add_common(p)
+    p.add_argument("--name", default="book", help="result file name (without .json)")
     a = p.parse_args(argv)
     s = window_rows(read_sample(a.test))
     fit = window_rows(read_sample(a.fit))
@@ -216,7 +217,7 @@ def main(argv=None) -> None:
             print(f"plies since exit {c['group']:>6}: rows={c['rows']:>6} offset {c['offset']['est']:+.0f} "
                   f"deep loss {c['deep_loss']['est']:.4f} mistakes {1 - c['sound']['est']:.3f} "
                   f"obs/Maia {c['ratio_mistake']['est']:.2f}")
-    write_result(a.results, "book", {
+    write_result(a.results, a.name, {
         "what": "engine mistakes, mistakes against Maia-3 and the matched offset by plies since leaving book, "
                 "within ply bands; window rows of the test sample",
         "book_count": a.book_count,

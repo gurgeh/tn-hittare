@@ -67,6 +67,7 @@ def main(argv=None) -> None:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", type=Path, nargs="+", required=True, help="move-model feature directories")
     add_common(p)
+    p.add_argument("--name", default="logloss", help="result file name (without .json)")
     a = p.parse_args(argv)
     test, fit = window_rows(read_sample(a.test)), window_rows(read_sample(a.fit))
     check_splits(test, fit)
@@ -77,7 +78,7 @@ def main(argv=None) -> None:
         print(f"{r['label']}: eps={r['eps']:.5f} raw={pl_['raw']['est']:.4f} mixed={pl_['mixed']['est']:.4f} "
               f"[{pl_['mixed']['lo']:.4f}, {pl_['mixed']['hi']:.4f}] top1={pl_['top1']['est']:.4f}")
         models.append(r)
-    write_result(a.results, "logloss", {
+    write_result(a.results, a.name, {
         "what": "log loss of the played move, window rows; eps fitted on the fitting sample",
         "rows": {"test": test.height, "fit": fit.height},
         "tournaments": {"test": test.get_column("tournament_id").n_unique(),

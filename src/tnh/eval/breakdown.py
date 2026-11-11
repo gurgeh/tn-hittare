@@ -58,6 +58,7 @@ def main(argv=None) -> None:
     p.add_argument("--model", type=Path, required=True)
     p.add_argument("--max-ply", type=int, default=60)
     add_common(p)
+    p.add_argument("--name", default="breakdown", help="result file name (without .json)")
     a = p.parse_args(argv)
     full = read_sample(a.test)
     fit = window_rows(read_sample(a.fit))
@@ -97,7 +98,7 @@ def main(argv=None) -> None:
         print(f"clock {r['group']:>6} min: rows={r['rows']:>7} mixed={r['mixed']['est']:.4f} "
               f"[{r['mixed']['lo']:.4f}, {r['mixed']['hi']:.4f}] entropy={r['entropy']['est']:.3f}")
     n_out = ext.filter(~pl.col("in_window")).height
-    write_result(a.results, "breakdown", {
+    write_result(a.results, a.name, {
         "what": "mixed log loss by ply (window rows) and by clock (out-of-book rows with a clock, weighted)",
         "model": label(a.model), "eps": eps, "boot": a.boot, "max_ply": a.max_ply,
         "rows": {"window": win.height, "clock_rows": ext.height, "clock_rows_outside_window": n_out},

@@ -311,6 +311,7 @@ def main(argv=None) -> None:
                    help="share of the training tournaments used to choose the tree settings")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     add_common(p)
+    p.add_argument("--name", default="stack", help="result file name (without .json)")
     a = p.parse_args(argv)
     logp, engines = parse_pairs(a.logp), parse_pairs(a.engine)
     deep_name = a.deep or (list(engines)[-1] if engines else None)
@@ -602,7 +603,7 @@ def main(argv=None) -> None:
         print(f"  trees without {g:>10}: rise {v['rise']['est']:+.4f} [{v['rise']['lo']:+.4f}, {v['rise']['hi']:+.4f}]")
     for g, v in out_ablation.items():
         print(f"  without {g:>10}: rise {v['rise']['est']:+.4f} [{v['rise']['lo']:+.4f}, {v['rise']['hi']:+.4f}]")
-    write_result(a.results, "stack", {
+    write_result(a.results, a.name, {
         "what": "a small MLP over per-move and context features, softmax over the legal moves, against the linear "
                 "logit, an interaction logit and Maia-3 alone; window rows, fitted on the fitting sample",
         "rows": {"fit": len(Df.w), "train": len(rows_train), "validation": len(rows_val), "test": len(Dt.w),

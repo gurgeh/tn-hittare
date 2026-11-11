@@ -49,6 +49,8 @@ from tnh.eval.common import (Ragged, add_common, attach, boot_counts, boot_means
 from tnh.eval.logit import nanmax_segments
 
 VIS = ["sound", "visible", "deep_only"]
+GLANCE = ["sound", "at_a_glance", "hidden"]
+PRIOR = ["sound", "in_mind", "not_in_mind"]
 SIZE = ["sound", "small", "medium", "large"]
 
 
@@ -132,8 +134,13 @@ def main(argv=None) -> None:
     p.add_argument("--visible", type=float, default=0.03)
     p.add_argument("--sizes", type=float, nargs=2, default=[0.10, 0.25])
     p.add_argument("--decided", type=float, default=0.97)
+    p.add_argument("--glance", type=Path, help="value features of the children without search (lc0-children)")
+    p.add_argument("--glance-cp", type=float, default=100.0, help="glance-visible: Lc0 child cp loss at least this")
+    p.add_argument("--prior", type=Path, help="policy features (lc0-policy): did the move come to mind")
+    p.add_argument("--prior-p", type=float, default=0.05, help="in mind: policy probability at least this")
     p.add_argument("--robust-boot", type=int, default=20, help="replicates per threshold set in the robustness grid (only point estimates are reported)")
     add_common(p, fit=False)
+    p.add_argument("--name", default="mistakes", help="result file name (without .json)")
     a = p.parse_args(argv)
     test = window_rows(read_sample(a.test))
     if set(test.get_column("split").unique()) != {"test"}:
@@ -156,11 +163,28 @@ def main(argv=None) -> None:
 
     r = ragged(dp, "value")
     vd, vsh = r.values, ragged(sh, "value").values
-    nan_row = np.add.reduceat((np.isnan(vd) | np.isnan(vsh)).astype(int), r.offsets[:-1]) > 0
+    nan_move = np.isnan(vd) | np.isnan(vsh)
+    glance_cp = glance_rank = prior = None
+    if a.glance:
+        gl = attach(test, a.glance, ["value", "cp", "mate"])
+        same_moves(sh, gl, "glance against the engine")
+        gv, gc, gm = ragged(gl, "value").values, ragged(gl, "cp").values, ragged(gl, "mate").values
+        eff = np.where(gm != 0, np.sign(gm) * (10_000 - 100 * np.abs(gm)), gc)
+        eff = np.where(np.isnan(gv), np.nan, eff)
+        nan_move |= np.isnan(eff)
+        glance_cp = np.repeat(nanmax_segments(r, eff), r.lengths) - eff
+        # rank among the children by Lc0's value: 0 for the best, ties share the better rank
+        rank_df = pl.DataFrame({"row": r.row_of, "v": np.nan_to_num(gv, nan=-1.0)})
+        glance_rank = rank_df.select(pl.col("v").rank("min", descending=True).over("row") - 1).to_series().to_numpy()
+    if a.prior:
+        pr = attach(test, a.prior, ["logp"])
+        same_moves(sh, pr, "prior against the engine")
+        prior = np.exp(ragged(pr, "logp").values)
+    nan_row = np.add.reduceat(nan_move.astype(int), r.offsets[:-1]) > 0
     bd = nanmax_segments(r, vd)
     bs = nanmax_segments(r, vsh)
 
-    def run(sound, visible, sizes, decided, B, seed):
+    def run(sound, visible, sizes, decided, B, seed, glance_def=("cp", a.glance_cp), prior_p=a.prior_p):
         dec = (bd > decided) | (bd < 1 - decided)
         keep = ~nan_row & ~dec
         mk = np.repeat(keep, r.lengths)
@@ -185,12 +209,24 @@ def main(argv=None) -> None:
                "dropped_decided": int((dec & ~nan_row).sum()), "buckets": ub.tolist(),
                "visibility": analyse(offs, P, vis[played], vis, rk, w, cl, counts, g, len(ub), 3, VIS),
                "size": analyse(offs, P, size[played], size, rk, w, cl, counts, g, len(ub), 4, SIZE)}
+        if glance_cp is not None:
+            kind, thr = glance_def
+            flag = (glance_cp[mk] >= thr) if kind == "cp" else (glance_rank[mk] >= thr)
+            gcls = np.where(Ld <= sound, 0, np.where(flag, 1, 2))
+            res["glance"] = analyse(offs, P, gcls[played], gcls, rk, w, cl, counts, g, len(ub), 3, GLANCE)
+            res["glance_def"] = list(glance_def)
+        if prior is not None:
+            pcls = np.where(Ld <= sound, 0, np.where(prior[mk] >= prior_p, 1, 2))
+            res["prior"] = analyse(offs, P, pcls[played], pcls, rk, w, cl, counts, g, len(ub), 3, PRIOR)
+            res["prior_p"] = prior_p
         return res
 
     main_res = run(a.sound, a.visible, tuple(a.sizes), a.decided, a.boot, a.seed)
     print(f"rows {main_res['rows']}, dropped: {main_res['dropped_missing_value']} with a move without a value, "
           f"{main_res['dropped_decided']} decided")
-    for kind in ("visibility", "size"):
+    for kind in ("visibility", "size", "glance", "prior"):
+        if kind not in main_res:
+            continue
         for c, x in main_res[kind]["pooled"].items():
             co = x["calibrated_offset"]
             print(f"  {kind:>10} {c:>9}: observed {x['observed']:.4f}; calibrated at "
@@ -207,7 +243,22 @@ def main(argv=None) -> None:
                            "visibility_side": {c: x["side"] for c, x in rr["visibility"]["pooled"].items()},
                            "size": {c: x["calibrated_offset"] for c, x in rr["size"]["pooled"].items()},
                            "size_side": {c: x["side"] for c, x in rr["size"]["pooled"].items()}})
-    write_result(a.results, "mistakes", {
+    robust_glance = []
+    if glance_cp is not None or prior is not None:
+        defs = [("cp", 50.0), ("cp", 100.0), ("cp", 200.0), ("rank", 2), ("rank", 4)] if glance_cp is not None else [None]
+        ps = [0.02, 0.05, 0.10] if prior is not None else [None]
+        for gd, pp in itertools.product(defs, ps):
+            rr = run(a.sound, a.visible, tuple(a.sizes), a.decided, a.robust_boot, a.seed,
+                     glance_def=gd or ("cp", a.glance_cp), prior_p=pp or a.prior_p)
+            rec = {"glance_def": list(gd) if gd else None, "prior_p": pp}
+            for kind in ("glance", "prior"):
+                if kind in rr:
+                    rec[kind] = {c: {"observed": x["observed"], "ratio": x["ratio"], "calibrated": x["calibrated_offset"],
+                                     "side": x["side"]} for c, x in rr[kind]["pooled"].items()}
+            robust_glance.append(rec)
+    write_result(a.results, a.name, {
+        "glance": label(a.glance) if a.glance else None, "prior": label(a.prior) if a.prior else None,
+        "robustness_glance": robust_glance,
         "what": "Maia-3 probability mass per kind of mistake against the played moves, per offset; test window rows",
         "thresholds": {"sound": a.sound, "visible": a.visible, "sizes": a.sizes, "decided": a.decided},
         "shallow": label(a.shallow), "deep": label(a.deep), "offsets": offs.tolist(),
