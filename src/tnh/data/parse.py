@@ -30,6 +30,7 @@ import re
 import time
 import unicodedata
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 
 import chess
@@ -102,22 +103,45 @@ def _is_san_token(tok: str) -> bool:
         and bool(ANNOT_RE.sub("", MOVENUM_RE.sub("", tok)))
 
 
-def parse_movetext(
-    movetext: str, board: chess.Board | None = None
-) -> tuple[list[str], list[int | None], str | None, bool]:
-    """Mainline moves as UCI, the clock after each ply, the result token, and whether the game was cut.
+CENTRE = {chess.D4, chess.D5, chess.E4, chess.E5}
+_SAN_DEST_RE = re.compile(r"([a-h][1-8])[+#]?$")
+
+
+def _central_king_san(san: str) -> bool:
+    """SAN of a king move to d4, d5, e4 or e5 ("Ke4", "Kxd5+")."""
+    m = _SAN_DEST_RE.search(san)
+    return san.startswith("K") and m is not None and chess.parse_square(m.group(1)) in CENTRE
+
+
+@dataclass
+class Movetext:
+    ucis: list[str]
+    clocks: list[int | None]
+    result_token: str | None
+    cut_illegal_king: bool  # cut before an illegal king move to the centre
+    stripped: int  # legal king moves to the centre removed from the end (0-2)
+
+
+def parse_movetext(movetext: str, board: chess.Board | None = None) -> Movetext:
+    """Mainline moves as UCI, the clock after each ply and the result token.
 
     Variations are skipped. A comment belongs to the ply before it; the first
     ``%clk`` in the comments after a ply is that ply's clock. Raises
-    ``GameError`` on an illegal, ambiguous or unreadable move, with one
-    exception: an illegal king move followed by at most one more move ends
-    the game there (``cut`` is True). That is the DGT board after the game,
-    when the arbiter puts both kings in the centre to signal the result; the
-    game before it is complete and its result is right.
+    ``GameError`` on an illegal, ambiguous or unreadable move, except for the
+    arbiter's signal at the end of a broadcast game, when both kings are put
+    in the centre of the DGT board to show the result:
+
+    - an illegal king move to d4, d5, e4 or e5 followed by at most one more
+      move ends the game there (``cut_illegal_king``);
+    - then, while the last move is a king move to one of those squares, legal
+      or not, it is removed, at most twice (``stripped``).
+
+    ``board`` is left at the final position after both.
     """
     board = board or chess.Board()
     ucis: list[str] = []
     clocks: list[int | None] = []
+    central: list[bool] = []
     result_token = None
     depth = 0
     cut = False
@@ -152,7 +176,7 @@ def parse_movetext(
             move = board.parse_san(san)
         except chess.IllegalMoveError as e:
             rest = sum(_is_san_token(x) for x in _depth0(tokens[t_i + 1:]))
-            if san.startswith("K") and rest <= 1 and ucis:
+            if _central_king_san(san) and rest <= 1 and ucis:
                 cut = True
                 continue
             raise GameError("illegal_move", str(e)) from None
@@ -160,12 +184,20 @@ def parse_movetext(
             raise GameError("ambiguous_move", str(e)) from None
         except chess.InvalidMoveError as e:
             raise GameError("invalid_san", str(e)) from None
+        central.append(board.piece_type_at(move.from_square) == chess.KING and move.to_square in CENTRE)
         ucis.append(move.uci())
         clocks.append(None)
         board.push(move)
     if depth:
         raise GameError("malformed_movetext", "unclosed (")
-    return ucis, clocks, result_token, cut
+    stripped = 0
+    while stripped < 2 and central and central[-1]:
+        board.pop()
+        ucis.pop()
+        clocks.pop()
+        central.pop()
+        stripped += 1
+    return Movetext(ucis, clocks, result_token, cut, stripped)
 
 
 def _depth0(tokens: list[str]) -> list[str]:
@@ -266,7 +298,8 @@ def parse_game(text: str, source: Source) -> dict:
         raise GameError("result_not_final" if result == "*" else "result_other", result)
 
     board = chess.Board()
-    ucis, clocks, token, cut = parse_movetext(movetext, board)
+    mt = parse_movetext(movetext, board)
+    ucis, clocks, token = mt.ucis, mt.clocks, mt.result_token
     if not ucis:
         raise GameError("no_moves")
     if token is not None and token != result:
@@ -317,7 +350,8 @@ def parse_game(text: str, source: Source) -> dict:
         "_game_url": h.get("GameURL") or h.get("BroadcastURL"),
         "_result_token_missing": token is None,
         "_round_key": source.round_key(h),
-        "_cut_king_ending": cut,
+        "_cut_king_ending": mt.cut_illegal_king,
+        "_stripped_central_king": mt.stripped,
     }
     row["_n_tags"] = sum(row[c] is not None for c in TAG_COLUMNS)
     return row
@@ -369,6 +403,7 @@ ROW_SCHEMA = {
     "_result_token_missing": pl.Boolean,
     "_round_key": pl.String,
     "_cut_king_ending": pl.Boolean,
+    "_stripped_central_king": pl.Int32,
     "_n_tags": pl.Int32,
     "_file": pl.String,
 }
@@ -498,7 +533,8 @@ def assemble(df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame, int]:
         pl.col("_n_copies").alias("n_copies"),
         pl.col("_copy_sources").alias("copy_sources"),
         pl.col("_result_token_missing").alias("result_token_missing"),
-        pl.col("_cut_king_ending").alias("cut_king_ending"),
+        pl.col("_cut_king_ending").alias("cut_illegal_central_king"),
+        pl.col("_stripped_central_king").alias("stripped_central_king_moves"),
     )
     return games, extra, n_dup, info
 
@@ -538,6 +574,16 @@ def near_copy_links(kept: pl.DataFrame) -> pl.DataFrame:
                     pairs.append((ids[x], ids[y]))
     trunc = pl.DataFrame(pairs, schema={"i": pl.UInt32, "j": pl.UInt32}, orient="row").with_columns(kind=pl.lit("truncated"))
     return pl.concat([same.select("i", "j", "kind"), trunc])
+
+
+def king_signal_counts(games: pl.DataFrame, extra: pl.DataFrame) -> dict:
+    """Games cut at an illegal central king move, and games with legal ones stripped, by source."""
+    x = extra.join(games.select("game_id", "source"), on="game_id")
+    return {
+        "cut_at_illegal_central_king_move": dict(x.filter(pl.col("cut_illegal_central_king")).group_by("source").len().iter_rows()),
+        "stripped_legal_central_king_move": dict(
+            x.filter(pl.col("stripped_central_king_moves") > 0).group_by("source").len().iter_rows()),
+    }
 
 
 def build(sources: list[str], workers: int, limit_files: int | None) -> None:
@@ -599,9 +645,8 @@ def build(sources: list[str], workers: int, limit_files: int | None) -> None:
         "drop_examples": examples,
         "tournaments": games["tournament_id"].n_unique(),
         "games_before_dedup": before.to_dicts(),
-        # kept, not dropped: cut before an illegal king move at the end (both kings to the centre)
-        "cut_illegal_king_ending": dict(extra.join(games.select("game_id", "source"), on="game_id")
-                                        .filter(pl.col("cut_king_ending")).group_by("source").len().iter_rows()),
+        # kept, not dropped: the arbiter's kings-to-the-centre signal at the end of a game
+        **king_signal_counts(games, extra),
         **info,
         "seconds": round(time.time() - t0),
     }

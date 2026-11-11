@@ -39,28 +39,43 @@ def test_movetext_clocks_variations_and_annotations():
         "2. Nf3?! { [%eval 0.1] } { Inaccuracy. } { [%clk 1:29:00] } (2. f4 exf4 { [%clk 0:00:01] }) "
         "2... Nc6 3. Bb5 { [%clk 1:28:00.5] } 1-0"
     )
-    ucis, clocks, token, cut = parse_movetext(mt)
-    assert ucis == ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5"]
-    assert clocks == [5443, 5442, 5340, None, 5280]
-    assert token == "1-0" and not cut
+    m = parse_movetext(mt)
+    assert m.ucis == ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5"]
+    assert m.clocks == [5443, 5442, 5340, None, 5280]
+    assert m.result_token == "1-0" and not m.cut_illegal_king and m.stripped == 0
 
 
 def test_movetext_illegal_move_raises():
     with pytest.raises(GameError) as e:
         parse_movetext("1. e4 e5 2. Nf6 Nc6 1-0")
     assert e.value.reason == "illegal_move"
-    # an illegal king move with two more moves after it is not the kings-to-the-centre ending
+    # an illegal king move off the centre is not the signal
     with pytest.raises(GameError):
-        parse_movetext("1. e4 e5 2. Ke3 Nc6 3. d4 1-0")
+        parse_movetext("1. e4 e5 2. Ke3 Nc6 1-0")
+    # nor is an illegal central king move with two more moves after it
+    with pytest.raises(GameError):
+        parse_movetext("1. e4 e5 2. Ke4 Nc6 3. d4 1-0")
 
 
-def test_final_illegal_king_move_cuts_the_game():
+def test_illegal_central_king_move_cuts_the_game():
     # the arbiter puts both kings in the centre: Ke4 (illegal) and Ke5 follow the last real move
-    ucis, clocks, token, cut = parse_movetext("1. e4 { [%clk 1:30:00] } e5 2. Nf3 Nc6 3. Ke4 { [%clk 1:00:00] } Ke5 1-0")
-    assert ucis == ["e2e4", "e7e5", "g1f3", "b8c6"] and cut and token == "1-0"
-    assert clocks == [5400, None, None, None]
-    ucis, _, _, cut = parse_movetext("1. e4 e5 2. Nf3 Nc6 3. Ke4 1/2-1/2")
-    assert len(ucis) == 4 and cut
+    m = parse_movetext("1. e4 { [%clk 1:30:00] } e5 2. Nf3 Nc6 3. Ke4 { [%clk 1:00:00] } Ke5 1-0")
+    assert m.ucis == ["e2e4", "e7e5", "g1f3", "b8c6"] and m.cut_illegal_king and m.result_token == "1-0"
+    assert m.clocks == [5400, None, None, None] and m.stripped == 0
+    m = parse_movetext("1. e4 e5 2. Nf3 Nc6 3. Kd4 1/2-1/2")
+    assert len(m.ucis) == 4 and m.cut_illegal_king
+
+
+def test_legal_central_king_move_at_the_end_is_stripped():
+    m = parse_movetext("1. e3 e6 2. Ke2 Ke7 3. Kd3 Kd6 4. Kd4 Kc6 5. Ke5 1-0")
+    assert len(m.ucis) == 8 and m.stripped == 1 and not m.cut_illegal_king
+    assert m.ucis[-1] == "d6c6"
+    # a legal Kd4, then the illegal Ke5 next to it: cut at Ke5, then Kd4 stripped
+    m = parse_movetext("1. e3 e6 2. Ke2 Ke7 3. Kd3 Kd6 4. Kd4 Ke5 1-0")
+    assert m.cut_illegal_king and m.stripped == 1 and len(m.ucis) == 6
+    # a king move to the centre that is not the last move stays
+    m = parse_movetext("1. e3 e6 2. Ke2 Ke7 3. Kd3 Kd6 4. Kd4 Kc6 1-0")
+    assert len(m.ucis) == 8 and m.stripped == 0
 
 
 def test_drops_are_counted(parsed):
@@ -69,7 +84,7 @@ def test_drops_are_counted(parsed):
     assert drops["illegal_move"] == 1  # "Nf6" in game g0000012
     assert drops["result_not_final"] == 1
     assert n_dup == 1
-    assert len(games) == 8  # g0000009 is kept, cut before its final "Ke3"
+    assert len(games) == 8  # g0000009 is kept, cut before its final "Ke4"
 
 
 def test_dedup_keeps_the_copy_with_clocks(parsed):
@@ -155,4 +170,4 @@ def test_kings_to_the_centre_game_is_kept_and_marked(parsed):
     _, _, games, extra, _ = parsed
     g = by_url(games, extra, "g0000009")
     assert g["moves_uci"] == "e2e4 e7e5" and g["result"] == "1-0"
-    assert extra.filter(extra["game_url"].str.ends_with("g0000009"))["cut_king_ending"][0] is True
+    assert extra.filter(extra["game_url"].str.ends_with("g0000009"))["cut_illegal_central_king"][0] is True
