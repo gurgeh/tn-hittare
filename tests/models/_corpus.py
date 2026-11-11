@@ -82,7 +82,9 @@ def build(out: Path, pgn: Path = FIXTURES / "games.pgn", *, max_ply: int = 80, s
             fide = lambda k: int(h[k]) if h.get(k, "").isdigit() else None
             has_clock = sum(c is not None for c in clocks) >= 0.8 * len(clocks)
             games.append({
-                "game_id": _sha16(source, h["White"], h["Black"], date_raw, " ".join(moves)),
+                # GUESS at the byte layout of "both surnames, the year and the moves"
+                "game_id": _sha16(h["White"].split(",")[0].strip(), h["Black"].split(",")[0].strip(),
+                                  date_raw[:4], " ".join(moves)),
                 "source": source,
                 "tournament_id": tournament_id,
                 "event": h.get("Event", ""), "site": h.get("Site", ""), "round": h.get("Round", ""),
@@ -117,13 +119,15 @@ def build(out: Path, pgn: Path = FIXTURES / "games.pgn", *, max_ply: int = 80, s
         moves, clocks = g["moves_uci"].split(), g["clocks_s"] or [None] * g["n_plies"]
         for ply, uci in enumerate(moves[:max_ply]):
             white = board.turn == chess.WHITE
-            # GUESS: "before the move" = the mover's clock after his previous move (base time
-            # before his first), the opponent's clock after the opponent's last move.
-            mover_before = clocks[ply - 2] if ply >= 2 else g["base_s"]
-            opp_before = clocks[ply - 1] if ply >= 1 else g["base_s"]
+            # "before the move" = the mover's clock after his previous move, the opponent's
+            # after the opponent's last move; null before a side's first move (DESIGN.md).
+            mover_before = clocks[ply - 2] if ply >= 2 else None
+            opp_before = clocks[ply - 1] if ply >= 1 else None
             spent = None
             if mover_before is not None and clocks[ply] is not None and g["inc_s"] is not None:
-                spent = mover_before - clocks[ply] + g["inc_s"]   # GUESS: wrong at a time-control boundary
+                spent = mover_before - clocks[ply] + g["inc_s"]
+                if spent < -2:   # an unknown bonus at a time control
+                    spent = None
             r = RESULTS[g["result"]]
             rows.append({
                 "game_id": g["game_id"], "ply": ply, "fen": board.fen(), "played_uci": uci,
