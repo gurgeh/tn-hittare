@@ -305,13 +305,7 @@ _TIEBREAK_WORDS = re.compile(
 _CLASSICAL_WORDS = re.compile(r"\bclassical\b|\bklassisch|\bclásic|\bclassique\b", re.IGNORECASE)
 
 
-def tempo_from_names(names: list[str]) -> str | None:
-    """``blitz``, ``rapid``, ``classical``, ``tiebreak`` or None from event names.
-
-    A name with both rapid and blitz words ("World Rapid & Blitz") says nothing.
-    ``tiebreak`` means "not classical, speed unknown".
-    """
-    text = " || ".join(n for n in names if n)
+def _tempo_from_text(text: str) -> str | None:
     blitz = bool(_BLITZ_WORDS.search(text))
     rapid = bool(_RAPID_WORDS.search(text))
     if blitz and rapid:
@@ -324,6 +318,23 @@ def tempo_from_names(names: list[str]) -> str | None:
         return "tiebreak"
     if _CLASSICAL_WORDS.search(text):
         return "classical"
+    return None
+
+
+def tempo_from_names(names: list[str]) -> str | None:
+    """``blitz``, ``rapid``, ``classical``, ``tiebreak`` or None from event names.
+
+    Each name is read from its most specific part: "Polish Youth Rapid &
+    Blitz 2026 | Blitz | G16" is blitz, from "Blitz". A part with both rapid
+    and blitz words ("World Rapid & Blitz") says nothing, and the next part
+    is read. The first name that says something decides.
+    ``tiebreak`` means "not classical, speed unknown".
+    """
+    for name in names:
+        for part in reversed((name or "").split("|")):
+            t = _tempo_from_text(part)
+            if t is not None:
+                return t
     return None
 
 

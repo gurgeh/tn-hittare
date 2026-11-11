@@ -95,6 +95,8 @@ def test_names():
     assert tempo_from_names(["Norway Chess 2025 | Armageddon"]) == "blitz"
     assert tempo_from_names(["British Rapidplay Championship"]) == "rapid"
     assert tempo_from_names(["World Rapid & Blitz 2024"]) is None
+    assert tempo_from_names(["Polish Youth Rapid & Blitz Championships 2026 | Blitz | G16"]) == "blitz"
+    assert tempo_from_names(["World Rapid & Blitz 2024 | Rapid Open"]) == "rapid"
     assert tempo_from_names(["Some Open", "Tiebreaks"]) == "tiebreak"
     assert tempo_from_names(["Tata Steel Masters"]) is None
 
