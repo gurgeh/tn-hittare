@@ -212,7 +212,7 @@ REPLAY_COLS = ["game_id", "source", "white_elo", "black_elo", "tempo", "moves_uc
                "tempo_source", "inc_s", "result", "split"]
 
 
-def fetch_wide(games_path: Path, chosen: pl.DataFrame, workers: int = 8, max_ply: int = 80) -> pl.DataFrame:
+def fetch_wide(games_path: Path, chosen: pl.DataFrame, workers: int = 2, max_ply: int = 80) -> pl.DataFrame:
     """The positions-schema columns of the chosen (game_id, ply) rows, rebuilt by replaying only the chosen
     games with the data developer's own row builder (``tnh.data.positions.process_chunk``).
 
