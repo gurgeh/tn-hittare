@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing
+import os
 import shutil
 import time
 from collections.abc import Iterable, Iterator
@@ -78,6 +79,12 @@ EDGES_SCHEMA = {
     "sum_mover_elo": pl.UInt64,
     "sum_opp_elo": pl.UInt64,
     "n_rated": pl.UInt32,
+}
+PARENTS_SCHEMA = {
+    "child_hash": pl.UInt64,
+    "pos_hash": pl.UInt64,
+    "move": pl.String,
+    "n": pl.UInt32,
 }
 POS_INDEX_SCHEMA = {
     "pos_hash": pl.UInt64,
@@ -349,17 +356,59 @@ def _match(col: str, value: Filter) -> pl.Expr:
     return pl.col(col) == value
 
 
-class EdgeDB:
-    """Queries on edges.parquet and pos_index.parquet. Lookups read one row group, not the table.
+PERFORMANCE_CAP = 800
 
-        db = EdgeDB()                     # corpus/edges.parquet, corpus/pos_index.parquet
-        db = EdgeDB(name="dev")           # corpus/edges_dev.parquet, pos_index_dev.parquet
+
+def performance(score: pl.Expr, opp_elo: pl.Expr) -> pl.Expr:
+    """Rating performance: the logistic inverse ``opp - 400 * log10(1 / score - 1)``.
+
+    The one definition used everywhere here. The difference to the opponents'
+    mean is capped at +-800 (FIDE's table stops there too), which is reached
+    at a score of 100/101 or 1/101; 100 % and 0 % give exactly +-800. Null
+    where ``opp_elo`` is null (no rated games).
+    """
+    lo = 1 / (1 + 10 ** (PERFORMANCE_CAP / 400))
+    s = score.clip(lo, 1 - lo)
+    return opp_elo - 400 * (1 / s - 1).log10()
+
+
+def parents_from_edges(edges: pl.DataFrame) -> pl.DataFrame:
+    """The parents table from the edges table: one row per (child, parent, move), all years,
+    bands and tempi summed, sorted by ``child_hash``. ``n`` is the games that played the move."""
+    return (
+        edges.group_by("child_hash", "pos_hash", "move")
+        .agg(pl.col("n").sum())
+        .select([pl.col(c).cast(t) for c, t in PARENTS_SCHEMA.items()])
+        .sort("child_hash", "pos_hash", "move")
+    )
+
+
+_EMPTY_MOVES = {"move": pl.String, "child_hash": pl.UInt64, "n": pl.UInt32}
+_SUMS = ["n", "white_wins", "draws", "black_wins", "sum_mover_elo", "sum_opp_elo", "n_rated"]
+_MOVE_COLS = ["n", "share", "white_wins", "draws", "black_wins", "score", "n_rated", "mover_elo", "opp_elo", "performance"]
+
+
+class EdgeDB:
+    """Queries on edges.parquet, pos_index.parquet and parents.parquet.
+
+        db = EdgeDB()                     # corpus/edges.parquet, pos_index.parquet, parents.parquet
+        db = EdgeDB(name="dev")           # corpus/edges_dev.parquet, ...
         db = EdgeDB.from_frames(e, p)     # the output of tables_from_games, for tests
 
     ``pos`` is a hash, a ``chess.Board`` or a FEN/EPD. Filters: ``years``
     (``year`` 0 is unknown), ``elo_bands`` (the floor of the mean rating to
     200, 0 when a rating is missing) and ``tempi``; each takes a value, an
     inclusive ``(lo, hi)`` tuple or a list.
+
+    The files are sorted by their lookup key (``pos_hash``, ``child_hash`` for
+    parents) and written in small row groups, so a lookup reads the one or
+    two row groups whose min/max statistics contain the key.
+
+    Counting: a position's ``n`` (``total``, ``child_n``) is games that
+    reached it. A move's ``n`` is games that played that move from it, each
+    game once per (position, move). A game that comes back to a position and
+    plays another move the second time counts for both moves, so the moves'
+    ``n`` can add up to more than the games that went on from the position.
     """
 
     def __init__(self, name: str = "full", directory: Path | None = None):
@@ -367,82 +416,132 @@ class EdgeDB:
         suffix = "" if name == "full" else f"_{name}"
         self._edges = pl.scan_parquet(d / f"edges{suffix}.parquet")
         self._pos = pl.scan_parquet(d / f"pos_index{suffix}.parquet")
+        self._parents = pl.scan_parquet(d / f"parents{suffix}.parquet")
 
     @classmethod
-    def from_frames(cls, edges: pl.DataFrame, pos_index: pl.DataFrame) -> EdgeDB:
+    def from_frames(cls, edges: pl.DataFrame, pos_index: pl.DataFrame, parents: pl.DataFrame | None = None) -> EdgeDB:
         db = cls.__new__(cls)
         db._edges, db._pos = edges.lazy(), pos_index.lazy()
+        db._parents = (parents if parents is not None else parents_from_edges(edges)).lazy()
         return db
 
-    def total(self, pos) -> dict | None:
-        """The position's row in pos_index (all years, bands, tempi), or None below two games.
+    # -- single lookups --
 
-        ``n`` counts every game that reached the position, including those that
-        ended there or reached it at ply 80; the moves' ``n`` count the games that
-        went on from it.
-        """
+    def total(self, pos) -> dict | None:
+        """The position's row in pos_index (all years, bands, tempi), or None below two games."""
         rows = self._pos.filter(pl.col("pos_hash") == _key(pos)).collect()
         return rows.row(0, named=True) if rows.height else None
 
-    def moves(self, pos, *, years: Filter = None, elo_bands: Filter = None, tempi: Filter = None) -> pl.DataFrame:
-        """The moves played from the position under the filters, most played first.
-
-        Columns: ``move``, ``child_hash``, ``n``, ``share`` (of the games here
-        under these filters), ``white_wins``, ``draws``, ``black_wins``,
-        ``score`` (for the side to move), ``mover_elo`` and ``opp_elo`` (means
-        over the rated games), ``performance`` (``opp_elo + 800 * (score -
-        0.5)``, the linear approximation; null without rated games),
-        ``last_year`` (the last year the move was played, year 0 ignored; null
-        when only games of unknown year played it).
-        """
-        return self._moves(pos, years, elo_bands, tempi, by=[])
-
-    def moves_by_year(self, pos, *, years: Filter = None, elo_bands: Filter = None, tempi: Filter = None) -> pl.DataFrame:
-        """As ``moves``, one row per move and year, sorted by year then games.
-
-        ``share`` is the move's share of that year's games from the position;
-        year 0 (unknown) is a row like any other.
-        """
-        return self._moves(pos, years, elo_bands, tempi, by=["year"])
-
-    def _moves(self, pos, years: Filter, elo_bands: Filter, tempi: Filter, by: list[str]) -> pl.DataFrame:
-        h = _key(pos)
-        total = self.total(h)
-        if total is None:
-            return pl.DataFrame(schema={"move": pl.String, "child_hash": pl.UInt64, "n": pl.UInt32})
-        white = total["epd"].split()[1] == "w"
-        df = (
+    def _rows(self, h: int, years: Filter, elo_bands: Filter, tempi: Filter) -> pl.DataFrame:
+        """The position's edge rows under the filters: one scan."""
+        return (
             self._edges.filter(pl.col("pos_hash") == h)
             .filter(_match("year", years) & _match("elo_band", elo_bands) & _match("tempo", tempi))
-            .group_by(["move", "child_hash", *by])
-            .agg(pl.col("n", "white_wins", "draws", "black_wins", "sum_mover_elo", "sum_opp_elo", "n_rated").sum(),
-                 pl.col("year").filter(pl.col("year") > 0).max().alias("last_year"))
             .collect()
         )
-        wins = pl.col("white_wins") if white else pl.col("black_wins")
+
+    def _child_totals(self, child_hashes: pl.Series) -> pl.DataFrame:
+        return self._pos.filter(pl.col("pos_hash").is_in(child_hashes.implode())).select(
+            pl.col("pos_hash").alias("child_hash"), pl.col("n").alias("child_n")).collect()
+
+    @staticmethod
+    def _summarise(rows: pl.DataFrame, white_to_move: bool, by: list[str]) -> pl.DataFrame:
+        """Edge rows -> one row per move (and per ``by``), with the derived columns."""
+        df = rows.group_by(["move", "child_hash", *by]).agg(
+            pl.col(_SUMS).sum(), pl.col("year").filter(pl.col("year") > 0).max().alias("last_year"))
+        wins = pl.col("white_wins") if white_to_move else pl.col("black_wins")
         rated = pl.col("n_rated").cast(pl.Float64)
         df = df.with_columns(
             share=(pl.col("n") / pl.col("n").sum().over(by)) if by else (pl.col("n") / pl.col("n").sum()),
             score=(wins + 0.5 * pl.col("draws")) / pl.col("n"),
             mover_elo=pl.when(rated > 0).then(pl.col("sum_mover_elo") / rated),
             opp_elo=pl.when(rated > 0).then(pl.col("sum_opp_elo") / rated),
-        ).with_columns(performance=pl.col("opp_elo") + 800 * (pl.col("score") - 0.5))
-        cols = ["move", "child_hash", *by, "n", "share", "white_wins", "draws", "black_wins", "score",
-                "mover_elo", "opp_elo", "performance", *([] if by else ["last_year"])]
+        ).with_columns(performance=performance(pl.col("score"), pl.col("opp_elo")))
         if by:
-            return df.select(cols).sort([*by, "n", "move"], descending=[False, True, False])
-        return df.select(cols).sort("n", "move", descending=[True, False])
+            return df.select("move", "child_hash", *by, *_MOVE_COLS).sort([*by, "n", "move"], descending=[False, True, False])
+        return df.select("move", "child_hash", *_MOVE_COLS, "last_year").sort("n", "move", descending=[True, False])
+
+    def moves(self, pos, *, years: Filter = None, elo_bands: Filter = None, tempi: Filter = None) -> pl.DataFrame:
+        """The moves played from the position under the filters, most played first.
+
+        Columns: ``move``, ``child_hash``, ``n``, ``share`` (of the games here
+        under these filters), ``white_wins``, ``draws``, ``black_wins``,
+        ``score`` (for the side to move), ``n_rated`` (games with both
+        ratings, which the next three rest on), ``mover_elo`` and ``opp_elo``
+        (means), ``performance`` (see ``performance``), ``last_year`` (the
+        last year the move was played, year 0 ignored; null when only games
+        of unknown year played it).
+        """
+        h = _key(pos)
+        total = self.total(h)
+        if total is None:
+            return pl.DataFrame(schema=_EMPTY_MOVES)
+        return self._summarise(self._rows(h, years, elo_bands, tempi), total["epd"].split()[1] == "w", [])
+
+    def moves_by_year(self, pos, *, years: Filter = None, elo_bands: Filter = None, tempi: Filter = None) -> pl.DataFrame:
+        """As ``moves`` without ``last_year``, one row per move and year, sorted by year then games.
+
+        ``share`` is the move's share of that year's games from the position;
+        year 0 (unknown) is a row like any other.
+        """
+        h = _key(pos)
+        total = self.total(h)
+        if total is None:
+            return pl.DataFrame(schema=_EMPTY_MOVES)
+        return self._summarise(self._rows(h, years, elo_bands, tempi), total["epd"].split()[1] == "w", ["year"])
 
     def children(self, pos, *, years: Filter = None, elo_bands: Filter = None, tempi: Filter = None) -> pl.DataFrame:
         """Each move from the position with its games under the filters (``n``) and the
-        child position's own total over all games from pos_index (``child_n``, null when
-        fewer than two games reached it, which also means it is not in edges.parquet)."""
+        child position's own total over all games (``child_n``, null below two games)."""
         m = self.moves(pos, years=years, elo_bands=elo_bands, tempi=tempi).select("move", "child_hash", "n")
         if m.height == 0:
             return m.with_columns(child_n=pl.lit(None, pl.UInt32))
-        kids = self._pos.filter(pl.col("pos_hash").is_in(m["child_hash"].implode())).select(
-            pl.col("pos_hash").alias("child_hash"), pl.col("n").alias("child_n")).collect()
-        return m.join(kids, on="child_hash", how="left", maintain_order="left")
+        return m.join(self._child_totals(m["child_hash"]), on="child_hash", how="left", maintain_order="left")
+
+    def panel(self, pos, *, years: Filter = None, elo_bands: Filter = None, tempi: Filter = None) -> dict:
+        """Everything the database panel shows, from one scan of the position's rows.
+
+        Returns ``{"total": total(pos), "moves": moves(...) plus child_n,
+        "by_year": moves_by_year(...)}``; ``moves`` and ``by_year`` are empty
+        frames and ``total`` None below two games. Three reads: the position's
+        pos_index row, its edge rows, and its children's pos_index rows.
+        """
+        h = _key(pos)
+        total = self.total(h)
+        if total is None:
+            empty = pl.DataFrame(schema=_EMPTY_MOVES)
+            return {"total": None, "moves": empty.with_columns(child_n=pl.lit(None, pl.UInt32)), "by_year": empty}
+        white = total["epd"].split()[1] == "w"
+        rows = self._rows(h, years, elo_bands, tempi)
+        moves = self._summarise(rows, white, [])
+        if moves.height:
+            moves = moves.join(self._child_totals(moves["child_hash"]), on="child_hash", how="left", maintain_order="left")
+        else:
+            moves = moves.with_columns(child_n=pl.lit(None, pl.UInt32))
+        return {"total": total, "moves": moves, "by_year": self._summarise(rows, white, ["year"])}
+
+    def parents(self, pos, *, years: Filter = None, elo_bands: Filter = None, tempi: Filter = None) -> pl.DataFrame:
+        """The positions that lead into this one: parent ``pos_hash``, ``move``, ``n``
+        (games that played it, under the filters) and the parent's ``epd``, most played first.
+
+        Without filters it is one lookup in parents.parquet (sorted by
+        ``child_hash``); with filters the parents' edge rows are read too.
+        Only parents reached by two or more games are listed, as in edges.
+        """
+        h = _key(pos)
+        par = self._parents.filter(pl.col("child_hash") == h).collect()
+        if par.height and not (years is None and elo_bands is None and tempi is None):
+            par = (
+                self._edges.filter(pl.col("pos_hash").is_in(par["pos_hash"].implode()) & (pl.col("child_hash") == h))
+                .filter(_match("year", years) & _match("elo_band", elo_bands) & _match("tempo", tempi))
+                .group_by("pos_hash", "move").agg(pl.col("n").sum())
+                .collect()
+            )
+        if par.height == 0:
+            return pl.DataFrame(schema={"pos_hash": pl.UInt64, "move": pl.String, "n": pl.UInt32, "epd": pl.String})
+        epd = self._pos.filter(pl.col("pos_hash").is_in(par["pos_hash"].implode())).select("pos_hash", "epd").collect()
+        return par.select("pos_hash", "move", "n").join(epd, on="pos_hash", how="left").sort(
+            "n", "pos_hash", descending=[True, False])
 
 
 # --- the full build ----------------------------------------------------------------
@@ -480,6 +579,7 @@ def iter_game_batches(path: Path, batch_games: int, fraction: float | None, sinc
                 buf[c].extend(sub.column(c).to_pylist())
             buf["row"].extend((row + idx).tolist())
         row += rb.num_rows
+        _drop_cache(path)
         if len(buf["row"]) >= batch_games:
             yield k, buf
             k += 1
@@ -488,14 +588,52 @@ def iter_game_batches(path: Path, batch_games: int, fraction: float | None, sinc
         yield k, buf
 
 
+# Small row groups for point lookups: a lookup decodes the row groups whose min/max contain
+# the key. pos_index and parents are read at scattered keys (a position's children, its
+# parents), edges at one key whose rows lie together.
+ROWS_PER_GROUP = {"edges": 32_768, "pos_index": 8_192, "parents": 8_192}
+
+
+def _drop_cache(path: Path) -> None:
+    """Write a file's dirty pages and drop it from the page cache.
+
+    Under tnh-run the page cache of files a job reads and writes is charged to
+    the job's memory; without this the partial files of a large build count
+    against the cap as they accumulate.
+    """
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+
+
+def _write(df: pl.DataFrame, path: Path, **kw) -> None:
+    df.write_parquet(path, **kw)
+    _drop_cache(path)
+
+
 def _bucket(df: pl.DataFrame) -> pl.Series:
     return pl.Series((df["pos_hash"].to_numpy() >> np.uint64(BUCKET_SHIFT)).astype(np.uint8))
 
 
-def process_batch(args: tuple[int, dict, str, int]) -> tuple[int, int, int, int]:
+def _rss_mb() -> int:
+    """Resident memory of this process now, MB."""
+    with open("/proc/self/statm") as f:
+        return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") // 2**20
+
+
+def _peak_mb() -> int:
+    import resource
+
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
+
+
+def process_batch(args: tuple[int, dict, str, int]) -> tuple[int, int, int, int, int]:
     """Worker, pass 1: aggregate one batch and write it split into buckets.
 
-    Returns (batch, games, edge rows written, position rows written).
+    Returns (batch, games, edge rows written, position rows written, this process's peak MB).
     """
     k, cols, work, max_ply = args
     rows = cols.pop("row")
@@ -512,8 +650,8 @@ def process_batch(args: tuple[int, dict, str, int]) -> tuple[int, int, int, int]
         for (b,), part in df.partition_by("_b", as_dict=True).items():
             d = Path(work) / name / f"b{b:02d}"
             d.mkdir(parents=True, exist_ok=True)
-            part.drop("_b").write_parquet(d / f"k{k:05d}.parquet", compression="lz4")
-    return k, len(rows), edges.height, positions.height
+            _write(part.drop("_b"), d / f"k{k:05d}.parquet", compression="lz4")
+    return k, len(rows), edges.height, positions.height, _peak_mb()
 
 
 def merge_bucket(args: tuple[int, str, int]) -> tuple[int, int, int, int]:
@@ -543,21 +681,26 @@ def merge_bucket(args: tuple[int, str, int]) -> tuple[int, int, int, int]:
         shutil.rmtree(w / "edges" / f"b{b:02d}")
     else:  # only final positions fell in this bucket
         edges = pl.DataFrame(schema=EDGES_SCHEMA)
-    edges.write_parquet(w / "merged" / f"edges_b{b:02d}.parquet", row_group_size=65_536)
-    kept.sort("pos_hash").write_parquet(w / "merged" / f"pos_b{b:02d}.parquet")
+    _write(edges, w / "merged" / f"edges_b{b:02d}.parquet")
+    _write(kept.sort("pos_hash"), w / "merged" / f"pos_b{b:02d}.parquet")
     (w / "merged" / f"hist_b{b:02d}.json").write_text(json.dumps(hist))
     shutil.rmtree(w / "positions" / f"b{b:02d}")
     return b, hist["ge2"], kept.height, edges.height
 
 
 def build(*, name: str, out_dir: Path, fraction: float | None, since_year: int | None,
-          batch_games: int, workers: int, max_ply: int = MAX_PLY, min_games: int = MIN_GAMES) -> None:
+          batch_games: int, workers: int, max_ply: int = MAX_PLY, min_games: int = MIN_GAMES,
+          polars_threads: int = 1) -> None:
     t0 = time.time()
     games_path = CORPUS / "games.parquet"
     work = DATA_ROOT / "scratch" / "edges" / f"work_{name}"
     if work.exists():
         shutil.rmtree(work)
     work.mkdir(parents=True)
+    # Workers are spawned, so they read this before polars starts its thread pool. One thread
+    # each: the process count is the CPU budget, and every polars thread keeps its own arena,
+    # which at 16 threads was most of a worker's memory.
+    os.environ["POLARS_MAX_THREADS"] = str(polars_threads)
     ctx = multiprocessing.get_context("spawn")
 
     def log(msg: str) -> None:
@@ -565,7 +708,8 @@ def build(*, name: str, out_dir: Path, fraction: float | None, since_year: int |
 
     log(f"pass 1: games in batches of {batch_games}, {workers} workers -> {work}")
     n_games = 0
-    with ctx.Pool(workers) as pool:
+    # a fresh process per batch: memory a worker keeps after a batch does not add up
+    with ctx.Pool(workers, maxtasksperchild=1) as pool:
         pending = []
         batches = iter_game_batches(games_path, batch_games, fraction, since_year)
         done = False
@@ -578,15 +722,16 @@ def build(*, name: str, out_dir: Path, fraction: float | None, since_year: int |
                     break
                 k, cols = nxt
                 pending.append(pool.apply_async(process_batch, ((k, cols, str(work), max_ply),)))
-            k, g, er, pr = pending.pop(0).get()
+            k, g, er, pr, peak = pending.pop(0).get()
             n_games += g
-            log(f"  batch {k}: {g} games, {er:,} edge rows, {pr:,} position rows; {n_games:,} games so far")
+            log(f"  batch {k}: {g} games, {er:,} edge rows, {pr:,} position rows; {n_games:,} games so far; "
+                f"worker peak {peak} MB, main {_rss_mb()} MB")
     partial_bytes = sum(f.stat().st_size for f in work.rglob("*.parquet"))
     log(f"pass 1 done: {n_games:,} games, partials {partial_bytes / 1e9:.2f} GB")
 
     log("pass 2: merge buckets")
     kept_pos = kept_edges = 0
-    with ctx.Pool(workers) as pool:
+    with ctx.Pool(workers, maxtasksperchild=4) as pool:
         for b, _, kp, ke in pool.imap_unordered(merge_bucket, [(b, str(work), min_games) for b in range(N_BUCKETS)]):
             kept_pos += kp
             kept_edges += ke
@@ -612,17 +757,26 @@ def build(*, name: str, out_dir: Path, fraction: float | None, since_year: int |
         for (bb,), sub in part.partition_by("_b", as_dict=True).items():
             d = work / "epd" / f"b{bb:02d}"
             d.mkdir(parents=True, exist_ok=True)
-            sub.drop("_b").write_parquet(d / f"k{k:05d}.parquet", compression="lz4")
+            _write(sub.drop("_b"), d / f"k{k:05d}.parquet", compression="lz4")
         n_epd += i1 - i0
-        log(f"  batch {k}: {i1 - i0:,} EPDs")
+        log(f"  batch {k}: {i1 - i0:,} EPDs; main {_rss_mb()} MB")
     del reps, hashes
     if n_epd != kept_pos:
         raise RuntimeError(f"{n_epd:,} EPDs for {kept_pos:,} kept positions")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     suffix = "" if name == "full" else f"_{name}"
-    edges_out, pos_out = out_dir / f"edges{suffix}.parquet", out_dir / f"pos_index{suffix}.parquet"
-    ew = pw = None
+    edges_out = out_dir / f"edges{suffix}.parquet"
+    pos_out = out_dir / f"pos_index{suffix}.parquet"
+    par_out = out_dir / f"parents{suffix}.parquet"
+    writers: dict[str, pq.ParquetWriter] = {}
+
+    def append(key: str, path: Path, df: pl.DataFrame, rows_per_group: int) -> None:
+        t = df.to_arrow()
+        if key not in writers:
+            writers[key] = pq.ParquetWriter(str(path) + ".tmp", t.schema, compression="zstd")
+        writers[key].write_table(t, row_group_size=rows_per_group)
+
     hist = {"ge2": 0, "ge10": 0, "ge100": 0, "ge1000": 0}
     for b in range(N_BUCKETS):
         e = pl.read_parquet(work / "merged" / f"edges_b{b:02d}.parquet")
@@ -636,19 +790,29 @@ def build(*, name: str, out_dir: Path, fraction: float | None, since_year: int |
         p = p.select([pl.col(c).cast(t) for c, t in POS_INDEX_SCHEMA.items()])
         for k2, v in json.loads((work / "merged" / f"hist_b{b:02d}.json").read_text()).items():
             hist[k2] += v
-        te, tp = e.to_arrow(), p.to_arrow()
-        if ew is None:
-            ew = pq.ParquetWriter(str(edges_out) + ".tmp", te.schema, compression="zstd")
-            pw = pq.ParquetWriter(str(pos_out) + ".tmp", tp.schema, compression="zstd")
-        ew.write_table(te, row_group_size=65_536)
-        pw.write_table(tp, row_group_size=65_536)
-    ew.close()
-    pw.close()
-    Path(str(edges_out) + ".tmp").replace(edges_out)
-    Path(str(pos_out) + ".tmp").replace(pos_out)
+        append("edges", edges_out, e, ROWS_PER_GROUP["edges"])
+        append("pos", pos_out, p, ROWS_PER_GROUP["pos_index"])
+        # the parents table is sorted on child_hash: bucket it again on the child
+        par = parents_from_edges(e)
+        par = par.with_columns(_b=pl.Series((par["child_hash"].to_numpy() >> np.uint64(BUCKET_SHIFT)).astype(np.uint8)))
+        for (cb,), sub in par.partition_by("_b", as_dict=True).items():
+            d = work / "parents" / f"c{cb:02d}"
+            d.mkdir(parents=True, exist_ok=True)
+            _write(sub.drop("_b"), d / f"b{b:02d}.parquet", compression="lz4")
+        _drop_cache(work / "merged" / f"edges_b{b:02d}.parquet")
+    for cb in range(N_BUCKETS):
+        d = work / "parents" / f"c{cb:02d}"
+        if d.exists():
+            append("parents", par_out, pl.read_parquet(d / "*.parquet").sort("child_hash", "pos_hash", "move"),
+                   ROWS_PER_GROUP["parents"])
+    for key, path in (("edges", edges_out), ("pos", pos_out), ("parents", par_out)):
+        writers[key].close()
+        Path(str(path) + ".tmp").replace(path)
+        _drop_cache(path)
     shutil.rmtree(work)
-    log(f"wrote {edges_out} ({edges_out.stat().st_size / 1e9:.3f} GB, {kept_edges:,} rows) and "
-        f"{pos_out} ({pos_out.stat().st_size / 1e9:.3f} GB, {kept_pos:,} rows)")
+    log(f"wrote {edges_out} ({edges_out.stat().st_size / 1e9:.3f} GB, {kept_edges:,} rows), "
+        f"{pos_out} ({pos_out.stat().st_size / 1e9:.3f} GB, {kept_pos:,} rows) and "
+        f"{par_out} ({par_out.stat().st_size / 1e9:.3f} GB, {pq.ParquetFile(par_out).metadata.num_rows:,} rows)")
     log("positions with at least 2 / 10 / 100 / 1000 games: "
         f"{hist['ge2']:,} / {hist['ge10']:,} / {hist['ge100']:,} / {hist['ge1000']:,}; "
         f"games {n_games:,}; partials peaked at {partial_bytes / 1e9:.2f} GB")

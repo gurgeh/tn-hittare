@@ -180,9 +180,13 @@ def test_batched_build_matches_in_memory(tmp_path, monkeypatch, batch_games):
                     batch_games=batch_games, workers=1)
     e2 = pl.read_parquet(tmp_path / "out" / "edges_t.parquet")
     p2 = pl.read_parquet(tmp_path / "out" / "pos_index_t.parquet")
+    par2 = pl.read_parquet(tmp_path / "out" / "parents_t.parquet")
     e, p = tables_from_games(games)
     assert e2.equals(e)
     assert p2.equals(p)
+    assert par2.equals(edges_mod.parents_from_edges(e))
+    db = EdgeDB(name="t", directory=tmp_path / "out")
+    assert db.moves(chess.Board()).equals(EdgeDB.from_frames(e, p).moves(chess.Board()))
 
 
 def test_moves_by_year_and_last_year():
@@ -197,3 +201,47 @@ def test_moves_by_year_and_last_year():
     assert db.moves_by_year(chess.Board(), years=(2022, 2024))["n"].sum() == 3
     only_unknown = db.moves(chess.Board(), years=0)
     assert only_unknown["last_year"].to_list() == [None]
+
+
+def test_panel_matches_the_small_calls():
+    games = games_frame(["e2e4 e7e5", "e2e4 c7c5", "d2d4 d7d5", "e2e4 e7e5"], years=[2023, 2024, 2024, 2024],
+                        results=["1-0", "0-1", "1/2-1/2", "1-0"])
+    db = EdgeDB.from_frames(*tables_from_games(games))
+    b = chess.Board()
+    panel = db.panel(b, years=(2023, 2024))
+    assert panel["total"] == db.total(b)
+    assert panel["moves"].drop("child_n").equals(db.moves(b, years=(2023, 2024)))
+    assert panel["by_year"].equals(db.moves_by_year(b, years=(2023, 2024)))
+    assert panel["moves"].select("move", "child_n").equals(db.children(b, years=(2023, 2024)).select("move", "child_n"))
+    assert "n_rated" in panel["moves"].columns
+    empty = db.panel("8/8/8/8/8/8/8/K6k w - -")
+    assert empty["total"] is None and empty["moves"].height == 0
+
+
+def test_parents_and_move_orders():
+    # three move orders into the position after 1. e4 e5 2. Nf3 Nc6, through two parents:
+    # 1. Nf3 Nc6 2. e4 and 1. e4 Nc6 2. Nf3 are the same position
+    games = games_frame(
+        ["e2e4 e7e5 g1f3 b8c6", "e2e4 e7e5 g1f3 b8c6", "g1f3 b8c6 e2e4 e7e5", "g1f3 b8c6 e2e4 e7e5",
+         "e2e4 b8c6 g1f3 e7e5", "e2e4 b8c6 g1f3 e7e5"],
+        years=[2020, 2024, 2024, 2024, 2024, 2024])
+    db = EdgeDB.from_frames(*tables_from_games(games))
+    target = chess.Board()
+    for m in ["e4", "e5", "Nf3", "Nc6"]:
+        target.push_san(m)
+    par = db.parents(target)
+    assert sorted(par.select("move", "n").rows()) == [("b8c6", 2), ("e7e5", 4)]
+    assert par["epd"].null_count() == 0
+    assert sorted(db.parents(target, years=2024).select("move", "n").rows()) == [("b8c6", 1), ("e7e5", 4)]
+    assert db.parents(chess.Board()).height == 0
+
+
+def test_performance_definition():
+    from tnh.data.edges import performance
+
+    df = pl.DataFrame({"s": [0.5, 0.75, 0.9, 1.0, 0.0], "opp": [2000.0] * 5})
+    out = df.select(performance(pl.col("s"), pl.col("opp")))["opp"].to_list()
+    assert out[0] == pytest.approx(2000)
+    assert out[1] == pytest.approx(2000 + 400 * 0.4771, abs=0.1)  # 400 * log10(3)
+    assert out[2] == pytest.approx(2000 + 400 * 0.9542, abs=0.1)  # 400 * log10(9)
+    assert out[3] == pytest.approx(2800) and out[4] == pytest.approx(1200)  # capped at +-800
