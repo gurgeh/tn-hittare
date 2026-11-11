@@ -647,9 +647,16 @@ def _rss_mb() -> int:
 
 
 def _peak_mb() -> int:
-    import resource
+    """Peak resident memory of this process, MB: VmHWM, which starts afresh at exec.
 
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
+    Not getrusage's ru_maxrss: a spawned worker inherits the parent's figure
+    across the fork and exec, so it would report the parent's peak.
+    """
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith("VmHWM:"):
+                return int(line.split()[1]) // 1024
+    raise RuntimeError("no VmHWM in /proc/self/status")
 
 
 def count_batch(args: tuple[int, dict, str, int]) -> tuple[int, int, int, int]:
