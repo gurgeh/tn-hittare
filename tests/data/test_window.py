@@ -33,7 +33,7 @@ def test_book_count_threshold_and_never_out_of_book():
 
 
 def test_max_ply():
-    df = frame([("g", p, 1 if p >= 2 else 100, None) for p in range(70)])
+    df = frame([("g", p, 1 if p >= 2 else 100, 3000) for p in range(70)])
     rows = kept(df, max_ply=60)
     assert rows[0] == ("g", 2) and rows[-1] == ("g", 59)
 
@@ -41,6 +41,21 @@ def test_max_ply():
 def test_clock_rule_and_missing_clocks():
     df = frame([("g", 0, 100, 5400), ("g", 1, 1, 5400), ("g", 2, 1, 700), ("g", 3, 1, 599), ("g", 4, 1, 600), ("g", 5, 1, None)])
     assert kept(df, min_clock_s=600) == [("g", 1), ("g", 2), ("g", 4), ("g", 5)]
+
+
+def test_rows_without_clock_stop_at_max_ply_no_clock():
+    # no clock at all: plies 2..39 count, 40 does not
+    df = frame([("n", p, 100 if p < 2 else 1, None) for p in range(60)])
+    rows = kept(df)
+    assert rows[0] == ("n", 2) and rows[-1] == ("n", 39)
+    # with a clock, the same plies run on to max_ply as long as the clock is >= min_clock_s
+    df = frame([("c", p, 100 if p < 2 else 1, 3000) for p in range(70)])
+    rows = kept(df)
+    assert rows[0] == ("c", 2) and rows[-1] == ("c", 59)
+    # mixed: a missing reading at ply 45 is excluded, readings around it count
+    df = frame([("m", p, 1, None if p == 45 else 3000) for p in range(50)])
+    assert ("m", 45) not in kept(df) and ("m", 44) in kept(df) and ("m", 46) in kept(df)
+    assert kept(df, max_ply_no_clock=60)[-1] == ("m", 49)
 
 
 def test_works_on_lazy_frames():

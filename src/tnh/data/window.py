@@ -14,7 +14,9 @@ import polars as pl
 REQUIRED = ("game_id", "ply", "pos_count", "clock_mover_s")
 
 
-def in_window(positions, *, book_count: int = 5, max_ply: int = 60, min_clock_s: int = 600) -> pl.Expr:
+def in_window(
+    positions, *, book_count: int = 5, max_ply: int = 60, max_ply_no_clock: int = 40, min_clock_s: int = 600
+) -> pl.Expr:
     """Boolean expression: the row is out of book, not too late, not in time trouble.
 
     - Out of book: the game leaves book at its first ply with
@@ -23,7 +25,9 @@ def in_window(positions, *, book_count: int = 5, max_ply: int = 60, min_clock_s:
       has no row in the window.
     - Not too late: ``ply < max_ply``.
     - Not in time trouble: ``clock_mover_s >= min_clock_s`` where the clock is
-      known; rows without a clock rely on ``max_ply`` alone.
+      known; rows without a clock must have ``ply < max_ply_no_clock``. Step 0
+      measured 9.3 % of classical moves at plies 40-49 made with under ten
+      minutes left, 25.1 % at plies 50-59.
 
     ``positions`` is the frame the expression will be used on (DataFrame or
     LazyFrame). It is only used to check that the needed columns are there.
@@ -38,5 +42,9 @@ def in_window(positions, *, book_count: int = 5, max_ply: int = 60, min_clock_s:
     )
     out_of_book = (pl.col("ply") >= first_rare_ply).fill_null(False)
     not_late = pl.col("ply") < max_ply
-    no_time_trouble = pl.col("clock_mover_s").is_null() | (pl.col("clock_mover_s") >= min_clock_s)
+    no_time_trouble = (
+        pl.when(pl.col("clock_mover_s").is_null())
+        .then(pl.col("ply") < max_ply_no_clock)
+        .otherwise(pl.col("clock_mover_s") >= min_clock_s)
+    )
     return out_of_book & not_late & no_time_trouble
