@@ -391,8 +391,21 @@ class EdgeDB:
         under these filters), ``white_wins``, ``draws``, ``black_wins``,
         ``score`` (for the side to move), ``mover_elo`` and ``opp_elo`` (means
         over the rated games), ``performance`` (``opp_elo + 800 * (score -
-        0.5)``, the linear approximation; null without rated games).
+        0.5)``, the linear approximation; null without rated games),
+        ``last_year`` (the last year the move was played, year 0 ignored; null
+        when only games of unknown year played it).
         """
+        return self._moves(pos, years, elo_bands, tempi, by=[])
+
+    def moves_by_year(self, pos, *, years: Filter = None, elo_bands: Filter = None, tempi: Filter = None) -> pl.DataFrame:
+        """As ``moves``, one row per move and year, sorted by year then games.
+
+        ``share`` is the move's share of that year's games from the position;
+        year 0 (unknown) is a row like any other.
+        """
+        return self._moves(pos, years, elo_bands, tempi, by=["year"])
+
+    def _moves(self, pos, years: Filter, elo_bands: Filter, tempi: Filter, by: list[str]) -> pl.DataFrame:
         h = _key(pos)
         total = self.total(h)
         if total is None:
@@ -401,20 +414,24 @@ class EdgeDB:
         df = (
             self._edges.filter(pl.col("pos_hash") == h)
             .filter(_match("year", years) & _match("elo_band", elo_bands) & _match("tempo", tempi))
-            .group_by("move", "child_hash")
-            .agg(pl.col("n", "white_wins", "draws", "black_wins", "sum_mover_elo", "sum_opp_elo", "n_rated").sum())
+            .group_by(["move", "child_hash", *by])
+            .agg(pl.col("n", "white_wins", "draws", "black_wins", "sum_mover_elo", "sum_opp_elo", "n_rated").sum(),
+                 pl.col("year").filter(pl.col("year") > 0).max().alias("last_year"))
             .collect()
         )
         wins = pl.col("white_wins") if white else pl.col("black_wins")
         rated = pl.col("n_rated").cast(pl.Float64)
         df = df.with_columns(
-            share=pl.col("n") / pl.col("n").sum(),
+            share=(pl.col("n") / pl.col("n").sum().over(by)) if by else (pl.col("n") / pl.col("n").sum()),
             score=(wins + 0.5 * pl.col("draws")) / pl.col("n"),
             mover_elo=pl.when(rated > 0).then(pl.col("sum_mover_elo") / rated),
             opp_elo=pl.when(rated > 0).then(pl.col("sum_opp_elo") / rated),
         ).with_columns(performance=pl.col("opp_elo") + 800 * (pl.col("score") - 0.5))
-        return df.select("move", "child_hash", "n", "share", "white_wins", "draws", "black_wins", "score",
-                         "mover_elo", "opp_elo", "performance").sort("n", "move", descending=[True, False])
+        cols = ["move", "child_hash", *by, "n", "share", "white_wins", "draws", "black_wins", "score",
+                "mover_elo", "opp_elo", "performance", *([] if by else ["last_year"])]
+        if by:
+            return df.select(cols).sort([*by, "n", "move"], descending=[False, True, False])
+        return df.select(cols).sort("n", "move", descending=[True, False])
 
     def children(self, pos, *, years: Filter = None, elo_bands: Filter = None, tempi: Filter = None) -> pl.DataFrame:
         """Each move from the position with its games under the filters (``n``) and the

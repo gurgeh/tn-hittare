@@ -183,3 +183,17 @@ def test_batched_build_matches_in_memory(tmp_path, monkeypatch, batch_games):
     e, p = tables_from_games(games)
     assert e2.equals(e)
     assert p2.equals(p)
+
+
+def test_moves_by_year_and_last_year():
+    games = games_frame(["e2e4", "e2e4", "d2d4", "e2e4", "d2d4"], years=[2022, 2024, 2024, None, 2021])
+    db = EdgeDB.from_frames(*tables_from_games(games))
+    m = db.moves(chess.Board())
+    assert dict(m.select("move", "last_year").iter_rows()) == {"e2e4": 2024, "d2d4": 2024}
+    y = db.moves_by_year(chess.Board())
+    assert y.select("move", "year", "n").rows() == [
+        ("e2e4", 0, 1), ("d2d4", 2021, 1), ("e2e4", 2022, 1), ("d2d4", 2024, 1), ("e2e4", 2024, 1)]
+    assert y.filter(pl.col("year") == 2024)["share"].to_list() == [0.5, 0.5]
+    assert db.moves_by_year(chess.Board(), years=(2022, 2024))["n"].sum() == 3
+    only_unknown = db.moves(chess.Board(), years=0)
+    assert only_unknown["last_year"].to_list() == [None]
