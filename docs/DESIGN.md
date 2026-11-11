@@ -25,11 +25,15 @@ corpus/games.parquet
 corpus/games_extra.parquet        per-source detail behind the parsing decisions; not an input to anything downstream
 corpus/parse_stats.json           what was dropped and why
 corpus/positions.parquet
-corpus/samples/<name>.parquet     fixed subsets of positions.parquet, same schema; what features are computed on
+corpus/samples/<name>.parquet     fixed subsets of positions.parquet with extra columns; what features are computed on
+corpus/samples/<name>.window.parquet   the same sample, window rows only
+corpus/blitz_ref/                 the blitz reference in the corpus schema
+raw/lichess_blitz_ref/            the start of one Lichess monthly dump, rated blitz, both players 1800 or more
 weights/                          downloaded model weights
 scratch/<module>/                 a developer's own experiments; nothing downstream reads it
 features/<model>/<variant>/*.parquet
 reports/*.md
+reports/step1/                    the json and figures behind step1.md
 ```
 
 ## `corpus/games.parquet`
@@ -211,7 +215,14 @@ is a bootstrap over tournaments.
 - **The sample.** Features are computed on fixed samples, not on all of
   `positions.parquet`. A sample is drawn after `in_window`, from classical
   games with clocks whose `tempo_source` is not `assumed`, with both ratings
-  in a band, and is stratified on the mover's rating in 100-point buckets.
+  in a band (inclusive; the top edge belongs to the last bucket). It is
+  stratified on the mover's rating in 100-point buckets with equal
+  allocation, a short bucket's surplus going to the others. A sample has the
+  positions schema plus `tournament_id`, `tempo_source`, `in_window`,
+  `out_of_book`, `part`, `bucket` and `weight`. `weight` is population rows
+  per sampled row, and every pooled number is weighted with it. A sample also
+  holds a smaller set of rows from outside the window, flagged by
+  `in_window`, for the clock breakdown and for the window shared with blitz.
 - **Log loss of the played move**, with the model mixed with a uniform
   distribution over the legal moves, `p' = (1 - eps) * p + eps / n`. `eps` is
   fitted. This keeps the score proper and stops single impossible moves from
@@ -229,7 +240,11 @@ is a bootstrap over tournaments.
 - **The value head.** Log loss of the predicted win, draw and loss on
   `result_mover`, one position per game. Raw, and after a recalibration
   fitted on `train`: the first measurement gave a mean draw probability of
-  0.16 where 43 % of the games were drawn.
+  0.16 where 43 % of the games were drawn. The recalibration has five
+  parameters: a temperature, a bias for win and one for draw, a draw term
+  that grows with rating, and the weight of a uniform mixture. An engine's
+  win, draw and loss come in permille and are often exactly 0 for an outcome
+  that then happens, so its raw log loss is infinite and is reported as such.
 - **The reference.** The same log loss for Maia-3 on Lichess blitz games at
   the players' own ratings, from a month after its training data ends
   (July 2025). The gap between that and the classical figure is what a model
