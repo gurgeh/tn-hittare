@@ -131,6 +131,18 @@ def context(sample: pl.DataFrame, D: Data, games: pl.DataFrame, deep: Path | Non
     return np.column_stack([cols[c] for c in names]), names, groups
 
 
+def engine_cost(meta: dict) -> str:
+    """What one position's values cost to compute, from the feature directory's meta.json."""
+    m, v = meta.get("model", "?"), meta.get("variant", "?")
+    if m == "stockfish":
+        return f"Stockfish {meta.get('nodes', '?')} nodes"
+    if v == "children":
+        return f"{m}: one network evaluation per legal move, no search"
+    if meta.get("nodes"):
+        return f"{m}: {meta['nodes']}-node search"
+    return f"{m} {v}"
+
+
 # --- the network ------------------------------------------------------------------
 
 class Stack(torch.nn.Module):
@@ -339,11 +351,16 @@ def main(argv=None) -> None:
     unused = [c for c in Df.names if c.endswith("_nan") and Df.X[Df.y, Df.names.index(c)].sum() < 20]
     move_names = [c for c in Df.names if c not in unused]
     # feature groups and what they cost per position
-    groups = {"maia": [c for c in move_names if c in logp]}
-    cost = {"maia": f"{len(logp)} Maia-3 network evaluations"}
+    maia_src = [k for k, d in logp.items() if read_meta(d).get("model", "").startswith("maia")]
+    groups = {"maia": [c for c in move_names if c in maia_src]} if maia_src else {}
+    cost = {"maia": f"{len(maia_src)} Maia-3 network evaluations"} if maia_src else {}
+    for k, d in logp.items():
+        if k not in maia_src:
+            groups[k] = [k]
+            cost[k] = f"1 {read_meta(d).get('model', k)} network evaluation"
     for e, d in engines.items():
         groups[e] = [c for c in move_names if c.startswith(f"{e}_")]
-        cost[e] = f"Stockfish {read_meta(d).get('nodes', '?')} nodes"
+        cost[e] = engine_cost(read_meta(d))
     if deep_name:
         cost[deep_name] += " (also the position's value in the context)"
     if a.board_facts:
