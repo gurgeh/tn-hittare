@@ -1,0 +1,31 @@
+[project]
+name = "tn-hittare"
+version = "0.1.0"
+description = "A model of human play in classical chess, and a repertoire builder on top of it"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "chess>=1.11",
+    "numpy>=2.0",
+    "polars>=1.20",
+    "pyarrow>=18",
+    "zstandard>=0.23",
+    "httpx>=0.28",
+    "tqdm>=4.66",
+    "scipy>=1.14",
+    "torch>=2.5",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tnh"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: needs network, GPU or a built corpus"]
+addopts = "-m 'not slow'"
