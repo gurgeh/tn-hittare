@@ -15,7 +15,7 @@ SRC = SOURCES["lichess_broadcast"]
 @pytest.fixture(scope="module")
 def parsed():
     df, drops, examples = parse_texts(iter_file_games(FIXTURE), SRC, "fixture")
-    games, extra, n_dup = assemble(df)
+    games, extra, n_dup, _ = assemble(df)
     return df, drops, games, extra, n_dup
 
 

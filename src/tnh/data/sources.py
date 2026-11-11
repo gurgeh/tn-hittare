@@ -22,10 +22,11 @@ from tnh.paths import RAW
 
 # --- Events that are not over-the-board human chess --------------------------
 
-# Engine events. TCEC and CCC games carry the title BOT in most cases; the
-# names catch the rest (e.g. "TCEC Cup 14" rounds without titles).
+# Engine events. TCEC games carry the title BOT in most cases; the names catch
+# the rest (e.g. "TCEC Cup 14" rounds without titles, TWIC's "Computer Chess
+# Match Tournament"). Not "CCC": in TWIC that is a chess club ("Marshall CCC").
 ENGINE_RE = re.compile(
-    r"\btcec\b|\bccc\b|computer chess|\bengine|\bleela knight odds|\bstockfish\b|\blc0\b",
+    r"\btcec\b|\bcomputers?\b|\bengines?\b|\bleela knight odds|\bstockfish\b|\blc0\b",
     re.IGNORECASE,
 )
 SIMUL_RE = re.compile(r"\bs[z]?imul(?:tan|taneous|táneas?|tán|s)?\b|\bszimultán\b", re.IGNORECASE)
@@ -138,6 +139,27 @@ def twic_nodes(h: dict[str, str]) -> list[str]:
     return nodes
 
 
+_KO_EVENT_RE = re.compile(r"\bko\b|k\.o\.|knock.?out|world cup|\bwch ko\b", re.IGNORECASE)
+_SUBROUND_RE = re.compile(r"^\d+\.(\d+)$")
+
+
+def twic_names(h: dict[str, str]) -> list[str]:
+    """Names read for tempo words: the event, plus "KO tiebreak" for a knockout tiebreak.
+
+    In TWIC's knockout events (World Cup, "FIDE WCh KO", "ch-RUS KO") round
+    "3.1" and "3.2" are the classical games of a match and "3.3" on are the
+    rapid and blitz tiebreaks, under the same event name. Such a game is not
+    assumed classical; it becomes ``unknown`` (a final with more classical
+    games loses its later ones too, which is the safe side).
+    """
+    names = [h.get("Event", "")]
+    ko = _KO_EVENT_RE.search(h.get("Event", "")) or "k.o." in h.get("EventType", "").lower()
+    m = _SUBROUND_RE.match(h.get("Round", "").strip())
+    if ko and m and int(m.group(1)) >= 3:
+        names.append("KO tiebreak")
+    return names
+
+
 def twic_drop(h: dict[str, str]) -> str | None:
     """Online (Site "chess.com INT", "ICC INT", ...), correspondence, simul, variant, then the shared name rules."""
     site = h.get("Site", "")
@@ -196,7 +218,7 @@ SOURCES: dict[str, Source] = {
         priority=1,
         files=_twic_files,
         tournament_nodes=twic_nodes,
-        event_names=lambda h: [h.get("Event", "")],
+        event_names=twic_names,
         drop_reason=twic_drop,
         round_key=lambda h: None,
         default_tempo="classical",

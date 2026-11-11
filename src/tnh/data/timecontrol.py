@@ -296,7 +296,7 @@ def clock_consistent_with(tc: TimeControl, est: ClockEstimate) -> bool:
 
 _BLITZ_WORDS = re.compile(r"blitz|bullet|armageddon|lightning|błyskawic|bleskov", re.IGNORECASE)
 _RAPID_WORDS = re.compile(
-    r"rapid|rápid|rapide|schnellschach|snabbschack|quickplay|\ballegro\b|\bactive chess\b|szybk",
+    r"rapid|rápid|rapide|schnellschach|snabbschack|quickplay|\ballegro\b|\bactive chess\b|szybk|\bblindfold\b",
     re.IGNORECASE,
 )
 _TIEBREAK_WORDS = re.compile(

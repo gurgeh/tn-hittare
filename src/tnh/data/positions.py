@@ -11,8 +11,15 @@ a time; each chunk's rows go to a part file, so memory stays flat.
 tempo, that reach the position at any ply (the start and the final position
 included, each game counted once). The workers return a 64-bit hash of every
 ``pos_key`` those games reach; the counts are taken over all of them, and
-then joined to the rows part by part. With some 41 million distinct keys the
-chance of any hash collision is about 1 in 20 000.
+then joined to the rows part by part. With 41 million distinct keys (broadcasts
+alone) the chance of any hash collision is about 1 in 20 000; with three times
+as many, about 1 in 2 500, and a collision moves one count by a few games.
+
+Besides ``positions.parquet`` it writes ``book_exit.parquet``, for the
+report: per game, the first ply where the count is below 2, 5, 20 and 100,
+counted over all sources (``exit5_all``) and over each source alone
+(``exit5_only_lichess_broadcast``), so that the effect of adding a source on
+where games leave book can be measured without a second build.
 """
 
 from __future__ import annotations
@@ -33,6 +40,7 @@ from tnh.data.timecontrol import parse_time_control
 from tnh.paths import CORPUS
 
 COUNT_MIN_ELO = 1800
+BOOK_EXIT_COUNTS = (2, 5, 20, 100)
 RESULT_WHITE = {"1-0": 1.0, "0-1": 0.0, "1/2-1/2": 0.5}
 
 POSITIONS_SCHEMA = {
@@ -98,10 +106,16 @@ def move_times(clocks: list[int | None] | None, tc_raw: str | None, tempo_source
     return out
 
 
-def process_chunk(args: tuple[int, dict, int, str]) -> tuple[int, np.ndarray, int, int]:
-    """Worker: replay a chunk of games. Writes the rows to a part file, returns the count hashes."""
-    idx, cols, max_ply, parts_dir = args
-    hashes: list[np.ndarray] = []
+def process_chunk(args: tuple[int, str, int, str]) -> tuple[int, dict[str, np.ndarray], int, int]:
+    """Worker: replay one row group of the input games.
+
+    Writes the rows to a part file and returns, per source, the hashes of all
+    positions reached by that source's counted games (each game once per position).
+    """
+    idx, input_path, max_ply, parts_dir = args
+    table = pq.ParquetFile(input_path).read_row_group(idx)
+    cols = {c: table.column(c).to_pylist() for c in table.column_names}
+    hashes: dict[str, list[np.ndarray]] = {}
     rows: dict[str, list] = {c: [] for c in POSITIONS_SCHEMA if c != "pos_count"}
     rows["_h"] = []
     n_null_move_time = 0
@@ -146,19 +160,26 @@ def process_chunk(args: tuple[int, dict, int, str]) -> tuple[int, np.ndarray, in
             board.push_uci(uci)
         if counted:
             game_hashes.add(key_hash(pos_key(board)))
-            hashes.append(np.fromiter(game_hashes, dtype=np.uint64, count=len(game_hashes)))
+            hashes.setdefault(cols["source"][i], []).append(np.fromiter(game_hashes, dtype=np.uint64, count=len(game_hashes)))
     schema = {**{c: t for c, t in POSITIONS_SCHEMA.items() if c != "pos_count"}, "_h": pl.UInt64}
     part = pl.DataFrame(rows, schema=schema)
     part.write_parquet(os.path.join(parts_dir, f"part-{idx:05d}.parquet"))
-    all_h = np.concatenate(hashes) if hashes else np.empty(0, dtype=np.uint64)
-    return idx, all_h, len(part), n_null_move_time
+    return idx, {src: np.concatenate(hs) for src, hs in hashes.items()}, len(part), n_null_move_time
+
+
+def lookup(keys: np.ndarray, counts: np.ndarray, h: np.ndarray) -> np.ndarray:
+    """Count of each hash in ``h`` (0 where absent), from sorted unique ``keys``."""
+    if len(keys) == 0:
+        return np.zeros(len(h), dtype=np.int32)
+    pos = np.minimum(np.searchsorted(keys, h), len(keys) - 1)
+    return np.where(keys[pos] == h, counts[pos], 0).astype(np.int32)
 
 
 def build(max_ply: int, workers: int, chunk: int) -> None:
     t0 = time.time()
     games = pl.read_parquet(
         CORPUS / "games.parquet",
-        columns=["game_id", "moves_uci", "clocks_s", "white_elo", "black_elo", "tempo", "result", "split",
+        columns=["game_id", "source", "moves_uci", "clocks_s", "white_elo", "black_elo", "tempo", "result", "split",
                  "inc_s", "time_control_raw", "tempo_source", "n_plies"],
     )
     both = pl.col("white_elo").is_not_null() & pl.col("black_elo").is_not_null()
@@ -169,53 +190,70 @@ def build(max_ply: int, workers: int, chunk: int) -> None:
     est_rows = games.filter(emit).select(pl.col("n_plies").clip(upper_bound=max_ply).sum()).item()
     est_count_keys = games.filter(counted).select((pl.col("n_plies") + 1).sum()).item()
     print(
-        f"{n_emit} classical games with both ratings -> {est_rows:,} position rows (about "
+        f"{n_emit:,} classical games with both ratings -> {est_rows:,} position rows (about "
         f"{est_rows * 200 / 1e9:.1f} GB in memory if built at once; written in parts instead)\n"
-        f"{games.filter(counted).height} games with both ratings >= {COUNT_MIN_ELO} -> up to {est_count_keys:,} "
-        f"position hashes for pos_count ({est_count_keys * 8 / 1e9:.2f} GB)"
+        f"{games.filter(counted).height:,} games with both ratings >= {COUNT_MIN_ELO} -> up to {est_count_keys:,} "
+        f"position hashes for pos_count ({est_count_keys * 8 / 1e9:.2f} GB, twice that while counting)",
+        flush=True,
     )
 
     parts_dir = CORPUS / "_positions_parts"
     if parts_dir.exists():
         shutil.rmtree(parts_dir)
     parts_dir.mkdir(parents=True)
-    tasks = []
-    for idx, start in enumerate(range(0, games.height, chunk)):
-        sl = games.slice(start, chunk)
-        tasks.append((idx, {c: sl[c].to_list() for c in sl.columns}, max_ply, str(parts_dir)))
+    # the workers read their games from one row group each, so the games are not
+    # held in this process as Python objects
+    input_path = parts_dir / "games_input.parquet"
+    games.write_parquet(input_path, row_group_size=chunk)
+    n_groups = pq.ParquetFile(input_path).num_row_groups
     del games
 
-    all_hashes: list[np.ndarray] = []
+    by_source: dict[str, list[np.ndarray]] = {}
     n_rows = 0
     n_null_mt = 0
+    tasks = [(i, str(input_path), max_ply, str(parts_dir)) for i in range(n_groups)]
     # spawn, not fork: forking after polars has started its thread pool can deadlock
     with multiprocessing.get_context("spawn").Pool(workers) as pool:
-        for k, (idx, h, n, nn) in enumerate(pool.imap_unordered(process_chunk, tasks), 1):
-            all_hashes.append(h)
+        for k, (_, hs, n, nn) in enumerate(pool.imap_unordered(process_chunk, tasks), 1):
+            for src, h in hs.items():
+                by_source.setdefault(src, []).append(h)
             n_rows += n
             n_null_mt += nn
             if k % 20 == 0 or k == len(tasks):
-                print(f"  {k}/{len(tasks)} chunks, {n_rows:,} rows, {time.time() - t0:.0f} s")
-    del tasks
-    hashes = np.concatenate(all_hashes)
-    del all_hashes
-    keys, counts = np.unique(hashes, return_counts=True)
-    del hashes
-    print(f"{len(keys):,} distinct positions reached by games with both ratings >= {COUNT_MIN_ELO}")
+                print(f"  {k}/{len(tasks)} chunks, {n_rows:,} rows, {time.time() - t0:.0f} s", flush=True)
+
+    # counts over all sources (pos_count), and per source for the book-exit table
+    per_source: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for src in sorted(by_source):
+        h = np.concatenate(by_source.pop(src))
+        per_source[src] = np.unique(h, return_counts=True)
+        del h
+        print(f"  {src}: {len(per_source[src][0]):,} distinct positions", flush=True)
+    keys = np.unique(np.concatenate([k for k, _ in per_source.values()]))
+    counts = np.zeros(len(keys), dtype=np.int64)
+    for k_src, c_src in per_source.values():
+        counts[np.searchsorted(keys, k_src)] += c_src
+    print(f"{len(keys):,} distinct positions reached by games with both ratings >= {COUNT_MIN_ELO}", flush=True)
 
     out = CORPUS / "positions.parquet"
     tmp = CORPUS / "positions.parquet.tmp"
     writer = None
     written = 0
+    exits = []
     for part_path in sorted(parts_dir.glob("part-*.parquet")):
         part = pl.read_parquet(part_path)
         h = part["_h"].to_numpy()
-        pos = np.searchsorted(keys, h)
-        found = (pos < len(keys)) & (keys[np.minimum(pos, len(keys) - 1)] == h)
-        pc = np.where(found, counts[np.minimum(pos, len(keys) - 1)], 0).astype(np.int32)
-        part = part.with_columns(pl.Series("pos_count", pc, dtype=pl.Int32)).select(
-            [pl.col(c).cast(t) for c, t in POSITIONS_SCHEMA.items()]
+        part = part.with_columns(pl.Series("pos_count", lookup(keys, counts, h), dtype=pl.Int32))
+        only = {f"pc_{src}": lookup(k, c, h) for src, (k, c) in per_source.items()}
+        exits.append(
+            part.select("game_id", "ply", "pos_count").with_columns(**{k: pl.Series(v) for k, v in only.items()})
+            .group_by("game_id")
+            .agg(
+                *[pl.col("ply").filter(pl.col("pos_count") < bc).min().alias(f"exit{bc}_all") for bc in BOOK_EXIT_COUNTS],
+                *[pl.col("ply").filter(pl.col(k) < bc).min().alias(f"exit{bc}_only_{k[3:]}") for k in only for bc in BOOK_EXIT_COUNTS],
+            )
         )
+        part = part.select([pl.col(c).cast(t) for c, t in POSITIONS_SCHEMA.items()])
         table = part.to_arrow()
         if writer is None:
             writer = pq.ParquetWriter(tmp, table.schema, compression="zstd")
@@ -224,9 +262,12 @@ def build(max_ply: int, workers: int, chunk: int) -> None:
     if writer is not None:
         writer.close()
     tmp.replace(out)
+    pl.concat(exits).sort("game_id").write_parquet(CORPUS / "book_exit.parquet")
     shutil.rmtree(parts_dir)
     print(f"wrote {written:,} rows to {out} ({out.stat().st_size / 1e9:.2f} GB), "
-          f"{n_null_mt:,} rows with a clock but no move time, {time.time() - t0:.0f} s")
+          f"{n_null_mt:,} rows with a clock after the move but no move time "
+          f"(each side's first move among them: no clock before it, by design), "
+          f"{time.time() - t0:.0f} s", flush=True)
 
 
 def main(argv: list[str] | None = None) -> None:

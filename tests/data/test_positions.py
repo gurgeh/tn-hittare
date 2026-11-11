@@ -98,3 +98,13 @@ def test_row_fields(built):
     assert r2["move_time_s"] == 150
     assert r3["move_time_s"] == 5425 - 5000 + 30
     assert r0["move_time_s"] is None
+
+
+def test_book_exit_table(built, tmp_path):
+    be = pl.read_parquet(tmp_path / "book_exit.parquet")
+    g6 = be.filter(pl.col("game_id") == "g6").row(0, named=True)
+    # g6's counts by ply: 4, 3, 3, 2, 3, 1 -> first below 2 at ply 5, below 5 at ply 0
+    assert g6["exit2_all"] == 5 and g6["exit5_all"] == 0
+    # all counted games are from source "test", so the source-only count is the same
+    assert g6["exit5_only_test"] == g6["exit5_all"]
+    assert sorted(be["game_id"]) == ["g1", "g3", "g6"]

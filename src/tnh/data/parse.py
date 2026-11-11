@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import hashlib
+import io
 import json
 import multiprocessing
 import re
@@ -34,7 +35,13 @@ from pathlib import Path
 import chess
 import polars as pl
 
-from tnh.data.pgn import iter_file_games, split_game
+from tnh.data.pgn import (
+    decode,
+    iter_file_games,
+    iter_game_texts,
+    read_bytes,
+    split_game,
+)
 from tnh.data.sources import SOURCES, Source
 from tnh.data.timecontrol import WEAK_SOURCES, decide_tempo, parse_clock
 from tnh.paths import CORPUS
@@ -303,11 +310,17 @@ def parse_texts(texts, source: Source, label: str = "") -> tuple[pl.DataFrame, C
     return df, drops, examples
 
 
-def parse_file(args: tuple[str, str]) -> tuple[str, pl.DataFrame, Counter, dict[str, list[str]]]:
-    """Worker: all games of one file."""
-    source_name, path = args
-    df, drops, examples = parse_texts(iter_file_games(Path(path)), SOURCES[source_name], Path(path).name)
-    return path, df, drops, examples
+def parse_file(args: tuple[str, str]) -> tuple[str, pl.DataFrame, Counter, dict[str, list[str]], str]:
+    """Worker: all games of one file. Also returns the file's encoding (``utf-8`` or ``latin-1``)."""
+    source_name, path_s = args
+    path = Path(path_s)
+    if path.suffix == ".zst":
+        texts, encoding = iter_file_games(path), "utf-8"
+    else:
+        text, encoding = decode(read_bytes(path))
+        texts = iter_game_texts(io.StringIO(text, newline=""))
+    df, drops, examples = parse_texts(texts, SOURCES[source_name], path.name)
+    return path_s, df, drops, examples, encoding
 
 
 ROW_SCHEMA = {
@@ -359,19 +372,21 @@ def apply_round_tempo(df: pl.DataFrame) -> pl.DataFrame:
     with a tempo from its clocks, tag or EventType has that same tempo."""
     strong = ~pl.col("tempo_source").is_in(WEAK_SOURCES)
     rounds = (
-        df.filter(pl.col("_round_key").is_not_null() & strong)
+        df.select("_round_key", "tempo", "tempo_source")
+        .filter(pl.col("_round_key").is_not_null() & strong)
         .group_by("_round_key")
         .agg(pl.col("tempo").unique().alias("_round_tempi"))
         .filter(pl.col("_round_tempi").list.len() == 1)
         .select("_round_key", pl.col("_round_tempi").list.first().alias("_round_tempo"))
     )
-    df = df.join(rounds, on="_round_key", how="left")
-    take = pl.col("_round_tempo").is_not_null() & ~strong
+    # a narrow frame in the row order of df, so that only three columns of df are replaced
+    rt = df.select("_round_key").join(rounds, on="_round_key", how="left", maintain_order="left")["_round_tempo"]
+    take = rt.is_not_null() & df["tempo_source"].is_in(WEAK_SOURCES)
     return df.with_columns(
-        tempo=pl.when(take).then(pl.col("_round_tempo")).otherwise(pl.col("tempo")),
+        tempo=pl.when(take).then(rt).otherwise(pl.col("tempo")),
         tempo_source=pl.when(take).then(pl.lit("round")).otherwise(pl.col("tempo_source")),
-        _tempo_note=pl.when(take).then(pl.col("_tempo_note") + "_then_round_" + pl.col("_round_tempo")).otherwise(pl.col("_tempo_note")),
-    ).drop("_round_tempo")
+        _tempo_note=pl.when(take).then(pl.col("_tempo_note") + "_then_round_" + rt).otherwise(pl.col("_tempo_note")),
+    )
 
 
 def assemble(df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame, int]:
@@ -380,28 +395,35 @@ def assemble(df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame, int]:
     Tempo by broadcast round first (``apply_round_tempo``), over all copies.
     De-duplication: the copy with the most clock comments wins, then the copy
     with more tags filled in, then the source priority, then the game URL and
-    file, so that the choice is stable. The
-    tournament nodes of all copies are joined; a tournament is a connected
-    component, named by its smallest node.
+    file, so that the choice is stable. The tournament nodes of all copies are
+    joined; a tournament is a connected component, named by its smallest node.
+
+    The choice is made on a narrow frame of keys and row numbers, and the wide
+    frame is gathered once, in game_id order: with TWIC the wide frame is
+    several GB, and sorting or joining it would copy it.
     """
     df = apply_round_tempo(df)
-    df = df.sort(
+    keys = df.select(
+        pl.int_range(pl.len(), dtype=pl.UInt32).alias("_i"),
+        "_dedup_key", "_clock_share", "_n_tags", "_priority", "_game_url", "_file", "_nodes", "source",
+    ).sort(
         ["_dedup_key", "_clock_share", "_n_tags", "_priority", "_game_url", "_file"],
         descending=[False, True, True, False, False, False],
         nulls_last=True,
     )
-    copies = df.group_by("_dedup_key", maintain_order=True).agg(
+    copies = keys.group_by("_dedup_key", maintain_order=True).agg(
+        pl.col("_i").first().alias("_win"),
         pl.col("_nodes").list.explode(keep_nulls=False, empty_as_null=False).alias("_all_nodes"),
         pl.len().alias("_n_copies"),
         pl.col("source").unique().sort().alias("_copy_sources"),
     )
-    n_before = len(df)
-    df = df.unique("_dedup_key", keep="first", maintain_order=True).join(copies, on="_dedup_key", how="left")
-    n_dup = n_before - len(df)
+    del keys
+    n_dup = len(df) - len(copies)
 
     uf = UnionFind()
     no_nodes = 0
-    for nodes in copies["_all_nodes"].to_list():
+    all_nodes = copies["_all_nodes"].to_list()
+    for nodes in all_nodes:
         if not nodes:
             no_nodes += 1
             continue
@@ -409,16 +431,30 @@ def assemble(df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame, int]:
             uf.union(nodes[0], other)
     if no_nodes:
         raise RuntimeError(f"{no_nodes} games have no tournament node; the source's tournament_nodes is incomplete")
-    tid = [uf.find(nodes[0]) for nodes in df["_all_nodes"].to_list()]
-    df = df.with_columns(pl.Series("tournament_id", tid, dtype=pl.String))
-    df = df.with_columns(pl.col("tournament_id").map_elements(split_of, return_dtype=pl.String).alias("split"))
 
-    if df["game_id"].n_unique() != len(df):
-        dup = df.filter(pl.col("game_id").is_duplicated()).select("game_id", "white", "black", "date", "_game_url").head(10)
+    kept = df[copies["_win"]]
+    # near copies: the same game under two keys (names spelt differently, a truncated
+    # relay). They stay two games, but their tournaments are joined so that the
+    # two copies cannot land in different splits.
+    links = near_copy_links(kept)
+    for a, b in links.select("i", "j").iter_rows():
+        uf.union(all_nodes[a][0], all_nodes[b][0])
+    info = {"near_copy_links": dict(links.group_by("kind").len().iter_rows())}
+    tid = pl.Series("tournament_id", [uf.find(nodes[0]) for nodes in all_nodes], dtype=pl.String)
+    del all_nodes, uf
+
+    kept = kept.with_columns(
+        tid,
+        tid.map_elements(split_of, return_dtype=pl.String).alias("split"),
+        copies["_n_copies"],
+        copies["_copy_sources"],
+    )
+    if kept["game_id"].n_unique() != len(kept):
+        dup = kept.filter(pl.col("game_id").is_duplicated()).select("game_id", "white", "black", "date", "_game_url").head(10)
         raise RuntimeError(f"game_id is not unique after de-duplication:\n{dup}")
 
-    games = df.select([pl.col(c).cast(t) for c, t in GAMES_SCHEMA.items()]).sort("game_id")
-    extra = df.select(
+    games = kept.select([pl.col(c).cast(t) for c, t in GAMES_SCHEMA.items()])
+    extra = kept.select(
         "game_id",
         pl.col("_broadcast_name").alias("broadcast_name"),
         pl.col("_game_url").alias("game_url"),
@@ -428,8 +464,45 @@ def assemble(df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame, int]:
         pl.col("_n_copies").alias("n_copies"),
         pl.col("_copy_sources").alias("copy_sources"),
         pl.col("_result_token_missing").alias("result_token_missing"),
-    ).sort("game_id")
-    return games, extra, n_dup
+    )
+    return games, extra, n_dup, info
+
+
+NEAR_COPY_MIN_PLIES = 20
+
+
+def near_copy_links(kept: pl.DataFrame) -> pl.DataFrame:
+    """Pairs of kept games (row numbers ``i``, ``j``) that are very likely the same game.
+
+    - ``same_date_moves``: same date and the same moves, at least 20 plies,
+      under different surnames ("Gareev,T" and "Gareyev, Timur"; "Yu Yangyi"
+      and "Yangyi Yu").
+    - ``truncated``: same date and surnames, and one move list is a prefix of
+      the other, the shorter at least 20 plies (a relay that stopped early, or
+      a last move added by hand).
+    """
+    k = kept.select(
+        pl.int_range(pl.len(), dtype=pl.UInt32).alias("i"), "date", "moves_uci", "n_plies",
+        pl.col("white").map_elements(surname, return_dtype=pl.String).alias("ws"),
+        pl.col("black").map_elements(surname, return_dtype=pl.String).alias("bs"),
+    ).filter(pl.col("date").is_not_null() & (pl.col("n_plies") >= NEAR_COPY_MIN_PLIES))
+    same = (
+        k.group_by("date", "moves_uci").agg(pl.col("i"))
+        .filter(pl.col("i").list.len() > 1)
+        .select(pl.col("i").list.first().alias("i"), pl.col("i").list.slice(1).alias("j"))
+        .explode("j")
+        .with_columns(kind=pl.lit("same_date_moves"))
+    )
+    groups = k.group_by("date", "ws", "bs").agg("i", "moves_uci").filter(pl.col("i").list.len() > 1)
+    pairs = []
+    for ids, moves in groups.select("i", "moves_uci").iter_rows():
+        order = sorted(range(len(ids)), key=lambda x: len(moves[x]))
+        for x_pos, x in enumerate(order):
+            for y in order[x_pos + 1:]:
+                if moves[y].startswith(moves[x] + " "):
+                    pairs.append((ids[x], ids[y]))
+    trunc = pl.DataFrame(pairs, schema={"i": pl.UInt32, "j": pl.UInt32}, orient="row").with_columns(kind=pl.lit("truncated"))
+    return pl.concat([same.select("i", "j", "kind"), trunc])
 
 
 def build(sources: list[str], workers: int, limit_files: int | None) -> None:
@@ -445,14 +518,19 @@ def build(sources: list[str], workers: int, limit_files: int | None) -> None:
     tasks.sort(key=lambda t: -Path(t[1]).stat().st_size)  # largest first, for load balance
     print(f"parsing {len(tasks)} files with {workers} workers")
 
+    source_of = {path: name for name, path in tasks}
     frames: list[pl.DataFrame] = []
     drops: Counter = Counter()
+    drops_by_source: dict[str, Counter] = {name: Counter() for name in sources}
+    encodings: dict[str, Counter] = {name: Counter() for name in sources}
     examples: dict[str, list[str]] = {}
     # spawn, not fork: forking after polars has started its thread pool can deadlock
     with multiprocessing.get_context("spawn").Pool(workers) as pool:
-        for k, (path, file_df, file_drops, file_ex) in enumerate(pool.imap_unordered(parse_file, tasks), 1):
+        for k, (path, file_df, file_drops, file_ex, encoding) in enumerate(pool.imap_unordered(parse_file, tasks), 1):
             frames.append(file_df)
             drops += file_drops
+            drops_by_source[source_of[path]] += file_drops
+            encodings[source_of[path]][encoding] += 1
             for r, ex in file_ex.items():
                 examples.setdefault(r, []).extend(ex[: 3 - len(examples.get(r, []))])
             if k % 10 == 0 or k == len(tasks):
@@ -462,9 +540,14 @@ def build(sources: list[str], workers: int, limit_files: int | None) -> None:
     n_read = len(df) + sum(drops.values())
 
     before = df.group_by("source", "year").len().sort("source", "year")
-    games, extra, n_dup = assemble(df)
+    kept_before = df.group_by("source").len()
+    games, extra, n_dup, info = assemble(df)
     del df
     drops["duplicate"] += n_dup
+    kept_after = dict(games.group_by("source").len().iter_rows())
+    for name, n in kept_before.iter_rows():
+        # copies of this source's games that lost to a copy from this or another source
+        drops_by_source[name]["duplicate"] += n - kept_after.get(name, 0)
 
     CORPUS.mkdir(parents=True, exist_ok=True)
     games.write_parquet(CORPUS / "games.parquet", compression="zstd")
@@ -474,9 +557,14 @@ def build(sources: list[str], workers: int, limit_files: int | None) -> None:
         "games_read": n_read,
         "games_kept": len(games),
         "dropped": dict(drops.most_common()),
+        "dropped_by_source": {name: dict(c.most_common()) for name, c in drops_by_source.items()},
+        "read_by_source": {name: sum(c.values()) + kept_before.filter(pl.col("source") == name)["len"].sum() - c["duplicate"]
+                           for name, c in drops_by_source.items()},
+        "file_encodings": {name: dict(c) for name, c in encodings.items()},
         "drop_examples": examples,
         "tournaments": games["tournament_id"].n_unique(),
         "games_before_dedup": before.to_dicts(),
+        **info,
         "seconds": round(time.time() - t0),
     }
     (CORPUS / "parse_stats.json").write_text(json.dumps(stats, indent=1, ensure_ascii=False))
@@ -491,7 +579,7 @@ def build(sources: list[str], workers: int, limit_files: int | None) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--sources", default="lichess_broadcast", help="comma-separated source names")
+    ap.add_argument("--sources", default=",".join(SOURCES), help="comma-separated source names (default: all)")
     ap.add_argument("--workers", type=int, default=None, help="default: all cores")
     ap.add_argument("--limit-files", type=int, default=None, help="only the first K files per source (testing)")
     args = ap.parse_args(argv)
