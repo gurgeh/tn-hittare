@@ -698,7 +698,7 @@ def main(argv=None) -> None:
     p.add_argument("--note", help="a paragraph put at the top (e.g. that this is a rehearsal)")
     a = p.parse_args(argv)
     names = ["logloss", "sweep", "mistakes", "mistakes_1m", "mistakes_100k_sub15k", "mistakes_glance", "logit",
-             "stack", "logit_sub", "stack_sub", "breakdown", "book", "theory", "value", "value_wdl", "reference"]
+             "stack", "logit_sub", "stack_sub", "logit_sub30", "logit_sf10k", "breakdown", "book", "theory", "value", "value_wdl", "reference"]
     R = {n: load(a.results, n) for n in names}
     rel = Path(a.results).resolve().relative_to(Path(a.out).resolve().parent) \
         if Path(a.results).resolve().is_relative_to(Path(a.out).resolve().parent) else Path(a.results).resolve()
@@ -731,8 +731,11 @@ def main(argv=None) -> None:
                        "and its policy prior.", refs)
     sec_logit(w, R["logit"])
     sec_stack(w, R["stack"])
-    sec_logit(w, R["logit_sub"], "## The conditional logit with Lc0's search and children, on the subsample")
-    sec_stack(w, R["stack_sub"], "## The stacks with Lc0's search and children, on the subsample")
+    sec_logit(w, R["logit_sub"], "## The conditional logit with Lc0's children and policy, on the 100,000-row subsample")
+    sec_stack(w, R["stack_sub"], "## The stacks with Lc0's children and policy, on the 100,000-row subsample")
+    sec_logit(w, R["logit_sub30"], "## Lc0's 100-node search against Stockfish 10k and Lc0's children, on the 30,000-row subsample")
+    if not R["logit"]:
+        sec_logit(w, R["logit_sf10k"], "## The conditional logit with Stockfish 10k only (partial, before 100k)")
     sec_value(w, R["value"], a.results, rel)
     sec_value(w, R["value_wdl"], a.results, rel, "## Lc0 with WDLCalibrationElo", "value_wdl.png")
     sec_reference(w, R["reference"])
