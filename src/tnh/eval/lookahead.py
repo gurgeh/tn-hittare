@@ -3,6 +3,7 @@
     uv run python -m tnh.eval.lookahead positions --n 2000      # the test (and fitting) positions
     uv run python -m tnh.eval.lookahead run [--mover fast|combo] [--n-lines 32] [--depth 16] [--limit N]
     uv run python -m tnh.eval.lookahead analyse [--results R]
+    uv run python -m tnh.eval.lookahead bias        # draws, calibration and recalibration by depth and mover
 
 For each test position the static result model (``tnh.eval.result``) gives a win/draw/loss for the
 side to move. Looking ahead replaces it by the same model's average over continuations drawn from
@@ -130,6 +131,61 @@ class ComboMover:
         probs = []
         for p in preds:
             e = np.exp(p.logp.astype(np.float64))
+            probs.append(e / e.sum())
+        return moves, probs, leaf
+
+    def close(self):
+        pass
+
+
+class ModelMover:
+    """The lines drawn from one of three move models of known bias toward large mistakes, the leaf the cheap
+    result model on the same Maia (+0, +600) and Lc0 policy value heads:
+
+    - ``maia600``: Maia-3 79M at + 600 alone (its own probabilities);
+    - ``trees``: ``PolicyTrees`` (the default move model's moves), value heads from its own calls;
+    - ``combo-trees``: ``Combo(prune="p0.5", trees=True)``, the leaf from one more call of its Maia and policy."""
+
+    def __init__(self, kind: str):
+        from tnh.eval.result import ResultModel
+        from tnh.models.maia3 import Elo
+
+        self.kind, self.name = kind, kind
+        self.elos = [Elo.offset(0.0), Elo.offset(600.0)]
+        self.leaf = ResultModel("cheap")
+        if kind == "maia600":
+            from tnh.models.lc0 import Lc0Policy
+            from tnh.models.maia3 import Maia3
+            self.policy = Lc0Policy()      # first: the GPU is shared, Lc0's backend wants its memory early
+            self.maia = Maia3("79m", batch_size=64)
+        elif kind == "trees":
+            from tnh.models.combo import PolicyTrees
+            self.trees = PolicyTrees(maia_batch=64)
+        elif kind == "combo-trees":
+            from tnh.models.combo import Combo
+            self.combo = Combo(prune="p0.5", trees=True, maia_batch=64)
+        else:
+            raise ValueError(kind)
+
+    def evaluate(self, queries):
+        if self.kind == "maia600":
+            m0, m6 = self.maia.predict_many(queries, self.elos)
+            pol = self.policy.predict(queries)
+            preds = m6
+        elif self.kind == "trees":
+            preds, (m0, m6, pol) = self.trees.predict_with_calls(queries)
+        else:
+            m0, m6 = self.combo.maia.predict_many(queries, self.elos)
+            pol = self.combo.policy.predict(queries)
+            preds = self.combo.predict(queries)
+        w = {"maia0": np.array([p.wdl for p in m0], float), "maia600": np.array([p.wdl for p in m6], float),
+             "lc0raw": np.array([p.wdl for p in pol], float)}
+        w = {k: v / v.sum(1, keepdims=True) for k, v in w.items()}
+        leaf = self.leaf.from_sources(w, queries)
+        moves, probs = [], []
+        for p in preds:
+            e = np.exp(p.logp.astype(np.float64))
+            moves.append(p.moves)
             probs.append(e / e.sum())
         return moves, probs, leaf
 
@@ -303,7 +359,7 @@ def cmd_run(a) -> None:
     from tnh.eval.sample import drop_cache, peak_gb
     drop_cache(CORPUS / "games.parquet")       # a capped job's memory counts the page cache it causes
     print(f"{s.height} positions to do ({out})", flush=True)
-    ev = FastMover() if a.mover == "fast" else ComboMover()
+    ev = FastMover() if a.mover == "fast" else ComboMover() if a.mover == "combo" else ModelMover(a.mover)
     rng = np.random.default_rng(a.seed)
     rows_all = []
     for start in range(0, s.height, a.chunk):
@@ -450,6 +506,118 @@ def cmd_analyse(a) -> None:
     write_result(a.results, a.name, {"what": "look-ahead with the move model against the static result model", **res})
 
 
+def cmd_bias(a) -> None:
+    """Is the look-ahead's loss with depth the move model's bias toward large mistakes? Per run and variant:
+    predicted draws and decisive mass against the observed rates, the calibration slope of the expected
+    score (score on predicted expected score, least squares; below 1 = too extreme), and the loss against
+    the static model before and after step 1's five-parameter recalibration (``tnh.eval.value.fit_recal``),
+    cross-fitted on two halves of the tournaments (each half recalibrated on the other), for the variant
+    and the static model alike. Then the movers of the bias run compared on their common positions."""
+    from tnh.eval.common import boot_counts, boot_means, cluster_codes, est, read_sample, write_result
+    from tnh.eval.result import losses
+    from tnh.eval.value import _logp, fit_recal, recal_probs
+
+    test = read_sample(a.positions).with_columns(pl.col("ply").cast(pl.Int64))
+    res, per_row = {}, {}
+
+    def recal(p, y, r, fold):
+        out = np.zeros_like(p)
+        for k in (0, 1):
+            tr, te = fold != k, fold == k
+            th = fit_recal(p[tr], y[tr], r[tr], np.ones(tr.sum()))
+            out[te] = recal_probs(th, _logp(p[te]), r[te])
+        return out
+
+    for mover in a.movers:
+        f = OUT / f"{mover}.parquet"
+        if not f.exists():
+            continue
+        d = pl.read_parquet(f).with_columns(pl.col("ply").cast(pl.Int64))
+        j = test.join(d, on=["game_id", "ply"], how="inner").sort("game_id", "ply")
+        y = np.array([{1.0: 0, 0.5: 1, 0.0: 2}[x] for x in j.get_column("result_mover").to_list()])
+        score = np.array([1.0, 0.5, 0.0])[y]
+        r = ((j.get_column("mover_elo") + j.get_column("opp_elo")).to_numpy() / 2 - 2200) / 100
+        cl = cluster_codes(j)
+        fold = cl % 2
+        counts = boot_counts(cl.max() + 1, a.boot, a.seed)
+        w = np.ones(len(y))
+        variants = ["static"] + [c for c in d.columns if c in ("exact1", "exact2") or c.startswith("mc_")]
+        P = {v: np.array(j.get_column(v).to_list()) for v in variants}
+        P = {v: p / p.sum(1, keepdims=True) for v, p in P.items()}
+        R = {v: recal(p, y, r, fold) for v, p in P.items()}
+        ll_s, llr_s = losses(P["static"], y)[0], losses(R["static"], y)[0]
+        rows = {}
+        for v in variants:
+            p, q = P[v], R[v]
+            e = p[:, 0] + 0.5 * p[:, 1]
+            ll, llr = losses(p, y)[0], losses(q, y)[0]
+            X = np.column_stack([ll - ll_s, llr - llr_s, (ll - ll_s) - (llr - llr_s), p[:, 1], 1 - p[:, 1],
+                                 q[:, 1]])
+            bm = boot_means(X, w, cl, counts)
+            A = np.column_stack([np.ones(len(y)), e])
+            slope = np.linalg.lstsq(A, score, rcond=None)[0][1]
+            bs = []
+            for b in range(min(a.boot, 300)):
+                sw = np.sqrt(counts[b][cl])
+                bs.append(np.linalg.lstsq(A * sw[:, None], score * sw, rcond=None)[0][1])
+            rows[v] = {"logloss": float(ll.mean()), "recal_logloss": float(llr.mean()),
+                       "minus_static": est(X[:, 0].mean(), bm[:, 0]),
+                       "recal_minus_recal_static": est(X[:, 1].mean(), bm[:, 1]),
+                       "removed_by_recal": est(X[:, 2].mean(), bm[:, 2]),
+                       "pred_draw": float(p[:, 1].mean()), "pred_decisive": float(1 - p[:, 1].mean()),
+                       "recal_pred_draw": float(q[:, 1].mean()),
+                       "pred_score": float(e.mean()), "score_slope": float(slope),
+                       "score_slope_ci": np.quantile(bs, [0.025, 0.975]).tolist(), "sd_expected_score": float(e.std())}
+            per_row[(mover, v)] = (j.select("game_id", "ply"), ll - ll_s, llr - llr_s)
+        cost = {k.replace("per_position_", ""): float(d.get_column(k).mean()) for k in d.columns if k.startswith("per_position_")}
+        res[mover] = {"positions": len(y), "observed_draw": float((y == 1).mean()), "observed_score": float(score.mean()),
+                      "variants": rows, "cost": cost}
+        print(f"\n{mover}: {len(y)} positions, observed draws {(y == 1).mean():.3f}, score {score.mean():.3f}")
+        print(f"{'variant':>10} | pred draw | slope E | minus static | after recal | removed")
+        for v, rr in rows.items():
+            f_ = lambda e: f"{e['est']:+.4f} [{e['lo']:+.4f}, {e['hi']:+.4f}]"   # noqa: E731
+            print(f"{v:>10} | {rr['pred_draw']:.3f} | {rr['score_slope']:.2f} [{rr['score_slope_ci'][0]:.2f}, "
+                  f"{rr['score_slope_ci'][1]:.2f}] | {f_(rr['minus_static'])} | {f_(rr['recal_minus_recal_static'])} | "
+                  f"{f_(rr['removed_by_recal'])}", flush=True)
+    # the movers of the bias run on their common positions: degradation per mover and paired between movers
+    movers = [m for m in ("maia600", "trees", "combo-trees") if m in res]
+    cmp = {}
+    if len(movers) > 1:
+        keys = None
+        for m in movers:
+            k = per_row[(m, "static")][0]
+            keys = k if keys is None else keys.join(k, on=["game_id", "ply"], how="inner")
+        sub = test.join(keys, on=["game_id", "ply"], how="inner").sort("game_id", "ply")
+        cl = cluster_codes(sub)
+        counts = boot_counts(cl.max() + 1, a.boot, a.seed)
+
+        def aligned(m, v, i):
+            k, *vals = per_row[(m, v)]
+            jj = sub.select("game_id", "ply").join(k.with_columns(pl.Series("_x", vals[i])), on=["game_id", "ply"],
+                                                   how="left", maintain_order="left")
+            return jj.get_column("_x").to_numpy()
+
+        for v in ("mc_n8_d2", "mc_n8_d4", "mc_n8_d8"):
+            cols, names = [], []
+            for i, kind in ((0, "raw"), (1, "recal")):
+                xs = {m: aligned(m, v, i) for m in movers}
+                for m in movers:
+                    cols.append(xs[m]); names.append(f"{m} {kind}")
+                for m1, m2 in list(zip(movers, movers[1:])) + ([(movers[0], movers[-1])] if len(movers) > 2 else []):
+                    cols.append(xs[m2] - xs[m1]); names.append(f"{m2} - {m1} {kind}")
+            X = np.column_stack(cols)
+            bm = boot_means(X, np.ones(len(X)), cl, counts)
+            cmp[v] = {n: est(X[:, c].mean(), bm[:, c]) for c, n in enumerate(names)}
+        print(f"\nmovers on {sub.height} common positions (minus static; differences of that):")
+        for v, rr in cmp.items():
+            for n, e in rr.items():
+                print(f"  {v} {n:>28}: {e['est']:+.4f} [{e['lo']:+.4f}, {e['hi']:+.4f}]")
+        cmp["positions"] = sub.height
+    write_result(a.results, a.name, {"what": "look-ahead degradation against the static model: draws, calibration, "
+                                     "and what a cross-fitted five-parameter recalibration removes", "runs": res,
+                                     "movers_common_positions": cmp})
+
+
 def cmd_engine(a) -> None:
     """Look-ahead by search: Lc0's calibrated WDL at 400 and 1600 nodes in place of the 50-node WDL, with the
     coefficients fitted at 50 nodes (``reports/step1/result.json``: the ``lc0w`` and ``all`` variants), on the
@@ -501,7 +669,7 @@ def main(argv=None) -> None:
     sp.set_defaults(fn=cmd_positions)
     sp = sub.add_parser("run")
     sp.add_argument("--positions", type=Path, default=POS_TEST)
-    sp.add_argument("--mover", choices=["fast", "combo"], default="fast")
+    sp.add_argument("--mover", choices=["fast", "combo", "maia600", "trees", "combo-trees"], default="fast")
     sp.add_argument("--suffix", default="")
     sp.add_argument("--n-lines", type=int, default=32)
     sp.add_argument("--depth", type=int, default=16)
@@ -511,6 +679,14 @@ def main(argv=None) -> None:
     sp.add_argument("--chunk", type=int, default=50)
     sp.add_argument("--seed", type=int, default=5)
     sp.set_defaults(fn=cmd_run)
+    sp = sub.add_parser("bias")
+    sp.add_argument("--positions", type=Path, default=POS_TEST)
+    sp.add_argument("--movers", nargs="+", default=["fast", "fast_exact", "combo", "maia600", "trees", "combo-trees"])
+    sp.add_argument("--results", type=Path, default=REPORTS / "step1")
+    sp.add_argument("--name", default="lookahead_bias")
+    sp.add_argument("--boot", type=int, default=1000)
+    sp.add_argument("--seed", type=int, default=7)
+    sp.set_defaults(fn=cmd_bias)
     sp = sub.add_parser("engine")
     sp.add_argument("--positions", type=Path, default=POS_TEST)
     sp.add_argument("--results", type=Path, default=REPORTS / "step1")
