@@ -42,6 +42,9 @@ def main(argv: list[str] | None = None) -> None:
     args = ap.parse_args(argv)
 
     with socket.socket() as s:
+        # As uvicorn binds: without SO_REUSEADDR a connection of the server just stopped, still in
+        # TIME-WAIT for a minute, made this check refuse a restart on a port that was free.
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             s.bind((HOST, args.port))
         except OSError as e:
