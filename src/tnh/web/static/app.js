@@ -383,7 +383,12 @@ function cols() {
     return [
         {k: "san", h: "Move", num: false, w: 62, t: "Move. Italic: not played in the database under these filters"},
         {k: "n", h: "Games", w: 62, t: "Games that played the move from this position, under the filters"},
-        {k: "p_mix", h: "Prob", w: 46, t: `Probability of the move: (games + κ·model 1) / (all games + κ), κ = ${sh.kappa} (not fitted yet: it needs model 1 on the sample). The database share alone in the cell's tooltip`},
+        {k: "p_mix", h: "Prob", w: 46, t: () => {
+            const r = sh.prob || {}
+            return "Probability of the move: w · database share + (1 − w) · model 1, N = the position's games under the filters. " +
+                (r.text ? `Rule (${r.fallback ? "fallback, not fitted" : "fitted " + r.fitted + " on held-out games"}): ${r.text}.` : `w = N/(N+${sh.kappa}).`) +
+                " The database share alone in the cell's tooltip"
+        }},
         {k: "p_model", h: "Model", w: 50, t: "Model 1's probability for the side to move at the header's ratings"},
         {k: "score", h: "Score", w: 50, t: () => "White's expected score, %: the move's games shrunk toward model 2 for the position after it (header ratings); until model 2 answers, toward the position's own mean." + ruleText("score")},
         {k: "draw", h: "Draw", w: 46, t: () => "Draw probability, %, shrunk the same way." + ruleText("draw")},

@@ -1,0 +1,47 @@
+{
+  "form": "tbl_hill",
+  "params": [
+    -1.505599342858641,
+    -1.326591655977868,
+    -1.3111679211170673,
+    -1.2853214518966245,
+    -1.2542879935295246,
+    -1.2475082822618908,
+    -1.5206701749655633,
+    0.7937924662313657
+  ],
+  "describe": "w by the position's games: 1: 0.18, 2: 0.22, 3: 0.27, 4-5: 0.33, 6-10: 0.40, 11-20: 0.47; above 20: N^0.22/(N^0.22+2.21)",
+  "provenance": {
+    "fitted": "2026-11-12",
+    "commit": "b70a693",
+    "sample": {
+      "table": "full",
+      "walks": 3000,
+      "seed": 7,
+      "tempi": [
+        "classical"
+      ],
+      "split_year": 2024,
+      "positions": 38439,
+      "rows": 264633,
+      "date": "2026-11-12",
+      "commit": "4d8c4d1"
+    },
+    "prior": "p_mean from tnh.web.probprior",
+    "positions": 31100,
+    "oof_logloss": {
+      "ll": 1.0117895307821183,
+      "lo": 0.9369394929010236,
+      "hi": 1.081913720674571,
+      "se": 0.013442173137548254
+    },
+    "best": "move",
+    "kappa100": {
+      "ll": 1.0179280727326143,
+      "lo": 0.944636164519582,
+      "hi": 1.0872808576803992,
+      "se": 0.015578119279495452
+    },
+    "command": "python -m tnh.web.probfit --data <collect output> --prior <probprior dir> --prior-column p_mean --write-rule"
+  }
+}
