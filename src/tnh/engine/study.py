@@ -256,22 +256,36 @@ def main(argv=None) -> None:
         if stage["rss_gb"] > a.rss_limit or exp < target:
             break
     log["history"] = list(eng.history)
+    log.setdefault("stockfish", {})
+    log.setdefault("stockfish_seconds", 0.0)
+    log.setdefault("n10", [])
+    log.setdefault("export", "not written yet")
+
+    def save():
+        # written after every step, so a failure late in the run keeps what came before
+        log["wall_seconds"] = time.perf_counter() - t0
+        Path(a.report).parent.mkdir(parents=True, exist_ok=True)
+        Path(a.report).with_suffix(".json").write_text(json.dumps(log, indent=1, default=str))
+        Path(a.report).write_text(report(log, a))
+        print(f"wrote {a.report}", flush=True)
+
+    save()
     tb = time.perf_counter()
     log["history_check"] = history_check(eng, ev.bundle(tempo))
     log["history_check_seconds"] = time.perf_counter() - tb
+    log["transpositions_merged"] = eng.stats["transpositions merged"]
     print(f"history check {log['history_check']}", flush=True)
+    save()
     last = log["stages"][-1]
+    log["n10"] = n10_table(eng, board, last)
+    save()
     sets = [x for x in last["sweep"]["prices"] + last["sweep"]["caps"] if not x.get("none")]
     tsf = time.perf_counter()
     log["stockfish"] = stockfish_losses(eng, sets, a.sf_nodes)
     log["stockfish_seconds"] = time.perf_counter() - tsf
-    log["n10"] = n10_table(eng, board, last)
+    save()
     log["export"] = write_export(eng, board, last, a.export_name, db)
-    log["wall_seconds"] = time.perf_counter() - t0
-    Path(a.report).parent.mkdir(parents=True, exist_ok=True)
-    Path(a.report).with_suffix(".json").write_text(json.dumps(log, indent=1, default=str))
-    Path(a.report).write_text(report(log, a))
-    print(f"wrote {a.report}", flush=True)
+    save()
 
 
 def n10_table(eng: Engine, board: chess.Board, stage: dict) -> list[dict]:
@@ -390,7 +404,7 @@ def report(log: dict, a) -> str:
     for e, v, n in pick:
         add(f"| {e} | {v:.4f} | {n:.4f} |")
     add("\n## Maia's history and the cache key\n")
-    add("```\n" + json.dumps(log["history_check"], indent=1) + "\n```\n")
+    add("```\n" + json.dumps(log.get("history_check", "not run yet"), indent=1) + "\n```\n")
     add("## The N=10 repertoire (cap 10): which learned moves are free\n")
     add("| line to it | learned | move model at 2200 | cost | Stockfish loss |")
     add("|---|---|---|---|---|")

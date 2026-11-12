@@ -246,7 +246,10 @@ def pgn_for(game: Game, sol: Solution, root_moves: list[str], headers: dict[str,
     items = []
     for k, mv in sol.learned.items():
         ids = game.by_key[k]
-        i = max(ids, key=lambda x: R[x])
+        # the most reached occurrence that has the move (a position can occur at two plies,
+        # one of them not expanded)
+        has = [x for x in ids if g.nodes[x].expanded and mv in g.nodes[x].moves] or ids
+        i = max(has, key=lambda x: R[x])
         n = g.nodes[i]
         items.append((paths.get(i, rel_path(n)), mv, float(sum(R[x] for x in ids)), float(V[i]),
                       game.move_cost(i, n.moves.index(mv)) if k not in game.forced else game.forced_cost))
