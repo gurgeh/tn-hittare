@@ -63,6 +63,8 @@ def white_frame(positions: pl.DataFrame, measures: pl.DataFrame, family_ply: int
         engine_cp_w=(cp_w / 100).clip(-4, 4),
         cp_w_raw=cp_w,
         elo_diff=(pl.col("white_elo") - pl.col("black_elo")) / 100,
+        elo_logistic=1 / (1 + 10 ** (-(pl.col("white_elo") - pl.col("black_elo")) / 400)),
+        elo_diff_sq=((pl.col("white_elo") - pl.col("black_elo")) / 100) ** 2,
         elo_mean=((pl.col("white_elo") + pl.col("black_elo")) / 2 - 2100) / 100,
         mean_elo=(pl.col("white_elo") + pl.col("black_elo")) / 2,
         stm_white=pl.col("stm_white").cast(pl.Float64),

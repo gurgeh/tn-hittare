@@ -80,10 +80,10 @@ def analyse(a) -> None:
     print(f"measures for {meas.height} of {positions.height} positions; {counts}", flush=True)
     meas.write_parquet(OUT / f"measures_{a.tag}.parquet")
     df, finfo = A.white_frame(positions, meas, a.family_ply)
-    setup = A.Setup(folds=a.folds, boot=a.boot, seed=a.seed)
+    setup = A.Setup(folds=a.folds, boot=a.boot, seed=a.seed, base=a.base)
     out_all = {"tag": a.tag, "budget": b.__dict__, "eps": a.eps, "family_ply": a.family_ply,
                "set_info": json.loads(info_p.read_text()), "measure_counts": counts, "frame": finfo,
-               "measures_described": A.MEASURES, "reference_described": A.REFERENCE, "base": A.BASE}
+               "measures_described": A.MEASURES, "reference_described": A.REFERENCE, "base": a.base}
     out_all["cross_family"] = cross_family_share(df, positions, moves, a.family_ply)
     # how Maia's difficulty compares with the games' own (side to move's loss and hold)
     w = df["n"].to_numpy().astype(float)
@@ -107,13 +107,13 @@ def analyse(a) -> None:
             raise SystemExit(f"unknown variant {variant}")
         res, frame = A.run(d, measures, setup, splits=groups(d), reference=reference)
         out_all[variant] = res
-        frame.write_parquet(OUT / f"frame_{a.tag}_{variant}.parquet")
+        frame.write_parquet(OUT / f"frame_{a.tag}{a.label}_{variant}.parquet")
         print(f"{variant}: {res['positions']} positions, {res['families']} families; "
               + "; ".join(f"{m} dmse {v['dmse']['est']:.2e} [{v['dmse']['lo']:.2e}, {v['dmse']['hi']:.2e}]"
                           for m, v in res["measures"].items()), flush=True)
-    out_all["lists"] = lists(pl.read_parquet(OUT / f"frame_{a.tag}_all.parquet"), out_all["all"], a)
+    out_all["lists"] = lists(pl.read_parquet(OUT / f"frame_{a.tag}{a.label}_all.parquet"), out_all["all"], a)
     out_all["seconds"] = round(time.time() - t0, 1)
-    write(f"analysis_{a.tag}", out_all)
+    write(f"analysis_{a.tag}{a.label}", out_all)
 
 
 def lists(frame: pl.DataFrame, res: dict, a) -> dict:
@@ -182,6 +182,8 @@ def main(argv: list[str] | None = None) -> None:
         ap.add_argument("--seed", type=int, default=0)
         ap.add_argument("--near-cp", type=float, default=30)
         ap.add_argument("--variants", nargs="+", default=["all", "leaves"])
+        ap.add_argument("--base", nargs="+", default=list(A.BASE), help="baseline columns")
+        ap.add_argument("--label", default="", help="suffix of the result file, e.g. _elo2")
         analyse(ap.parse_args(rest))
     elif cmd == "synth":
         ap.add_argument("--games", type=int, default=30_000)

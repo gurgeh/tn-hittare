@@ -43,6 +43,15 @@ def verdict(res: dict) -> list[str]:
                  f"{f(b['tenths']['diff'], 3)} points per game.")
     if "all_measures" in res:
         lines.append(f"All measures together: {f(res['all_measures']['share'], 3, 100)} % of the excess.")
+    for m in sorted(ms, key=lambda m: -ms[m]["dmse"]["est"]):
+        d = ms[m]["dmse"]
+        if d["est"] > 0 and d["lo"] <= 0:
+            se = (d["hi"] - d["lo"]) / 3.92
+            k = (2.8 * se / d["est"]) ** 2
+            lines.append(f"If *{NAMES[m]}*'s held-out gain is as large as its point estimate, about {k:.1f} times as "
+                         f"many independent families would put its interval above zero four times in five "
+                         f"(interval width shrinking as one over the square root of the families).")
+            break
     refs = {m: v for m, v in res["measures"].items() if v["reference"]}
     for m, v in refs.items():
         lines.append(f"For scale, the reference *{NAMES[m]}* (the games' own moves, not a predictor) explains "
@@ -174,6 +183,11 @@ def main(argv: list[str] | None = None) -> None:
         L += ["", f"Only positions with no child in the set ({an['leaves']['positions']} positions, "
                   f"{an['leaves']['families']} families):", ""]
         L += measure_table(an["leaves"])
+    rob_p = RESULTS / f"analysis_{a.tag}_elo2.json"
+    if rob_p.exists():
+        rob = json.loads(rob_p.read_text())
+        L += ["", f"Robustness, baseline with non-linear rating terms ({', '.join(rob['base'])}), all positions:", ""]
+        L += measure_table(rob["all"])
     mv = an["maia_vs_games"]
     L += ["", "## Maia's difficulty against the games' own", "",
           "Side to move, weighted by games. The games' version uses the in-filter move shares at the position.", "",
