@@ -438,16 +438,47 @@ class _Sorted:
         self.groups = np.array(self.groups, np.int64)
         self.mins, self.maxs = np.array(mins, np.uint64), np.array(maxs, np.uint64)
 
+    def row_groups(self, keys) -> list[int]:
+        """Every row group whose [min, max] holds one of the keys.
+
+        A key's rows can run over several row groups (the start position's
+        edges fill more than one), so for each key it is the whole range from
+        the first group whose max reaches it to the last whose min does.
+        """
+        k = np.unique(np.asarray(keys, np.uint64))
+        first = np.searchsorted(self.maxs, k, side="left")  # maxs and mins are sorted: the file is
+        last = np.searchsorted(self.mins, k, side="right")  # groups first .. last - 1 hold k
+        out: set[int] = set()
+        for a, b in zip(first.tolist(), last.tolist(), strict=True):
+            out.update(range(a, b))
+        return sorted(self.groups[sorted(out)].tolist()) if out else []
+
     def rows(self, keys, columns: list[str] | None = None) -> pl.DataFrame:
         k = np.unique(np.asarray(keys, np.uint64))
-        idx = np.searchsorted(self.mins, k, side="right") - 1
-        ok = (idx >= 0) & (k <= self.maxs[np.maximum(idx, 0)])
-        groups = sorted(set(self.groups[idx[ok]].tolist()))
+        groups = self.row_groups(k)
         if not groups:
             t = self.pf.schema_arrow.empty_table()
             return pl.from_arrow(t.select(columns) if columns else t)
-        df = pl.from_arrow(self.pf.read_row_groups(groups, columns=columns))
-        return df.filter(pl.col(self.key).is_in(pl.Series(k, dtype=pl.UInt64).implode()))
+        read = None if columns is None else list(dict.fromkeys([self.key, *columns]))
+        df = pl.from_arrow(self.pf.read_row_groups(groups, columns=read))
+        df = df.filter(pl.col(self.key).is_in(pl.Series(k, dtype=pl.UInt64).implode()))
+        return df if columns is None else df.select(columns)
+
+
+def check_lookups(path: Path, key: str) -> int:
+    """Check a written table against its reader: for every key at a row-group boundary, the
+    reader's rows must equal a plain count of the key column. Raises on a mismatch; returns
+    the number of keys checked. Reads only the key column (8 bytes a row)."""
+    table = _Sorted(path, key)
+    keys = np.unique(np.concatenate([table.mins, table.maxs]))
+    col = pl.from_arrow(pq.read_table(path, columns=[key]))
+    expected = col.filter(pl.col(key).is_in(pl.Series(keys, dtype=pl.UInt64).implode())).group_by(key).len()
+    got = table.rows(keys, [key]).group_by(key).len()
+    diff = expected.join(got, on=key, how="full", coalesce=True, suffix="_reader").filter(
+        pl.col("len").fill_null(0) != pl.col("len_reader").fill_null(0))
+    if diff.height:
+        raise RuntimeError(f"{path}: the reader returns other rows than the file for {diff.height} keys:\n{diff.head()}")
+    return len(keys)
 
 
 class _InMemory:
@@ -498,6 +529,22 @@ class EdgeDB:
         db._edges, db._pos = _InMemory(edges, "pos_hash"), _InMemory(pos_index, "pos_hash")
         db._parents = _InMemory(parents if parents is not None else parents_from_edges(edges), "child_hash")
         return db
+
+    def summary(self) -> dict:
+        """Games in the table and their year span, from the start position (every game has it).
+
+        ``games`` counts the kept games with at least one move; ``first_year`` and
+        ``last_year`` ignore year 0 (unknown). One lookup.
+        """
+        start = chess.Board()
+        total = self.total(start)
+        years = self._edges.rows([pos_hash(start)], ["year"])["year"]
+        known = years.filter(years > 0)
+        return {
+            "games": total["n"] if total else 0,
+            "first_year": int(known.min()) if known.len() else None,
+            "last_year": int(known.max()) if known.len() else None,
+        }
 
     # -- single lookups --
 
@@ -933,6 +980,8 @@ def build(*, name: str, out_dir: Path, fraction: float | None, since_year: int |
         writers[key].close()
         Path(str(path) + ".tmp").replace(path)
         _drop_cache(path)
+    for path, k in ((edges_out, "pos_hash"), (pos_out, "pos_hash"), (par_out, "child_hash")):
+        log(f"checked the reader on {check_lookups(path, k):,} row-group boundary keys of {path.name}")
     shutil.rmtree(work)
     log(f"wrote {edges_out} ({edges_out.stat().st_size / 1e9:.3f} GB, {kept_edges:,} rows), "
         f"{pos_out} ({pos_out.stat().st_size / 1e9:.3f} GB, {kept_pos:,} rows) and "

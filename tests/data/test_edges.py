@@ -270,3 +270,38 @@ def test_parents_many_and_totals_many():
     assert t.height == 3 and t["pos_hash"].is_sorted()
     assert t.filter(pl.col("pos_hash") == pos_hash(b))["n"].item() == 3
     assert db.parents_many([], with_epd=False).columns == ["child_hash", "pos_hash", "move", "n"]
+
+
+def test_reader_finds_a_key_spread_over_several_row_groups(tmp_path):
+    """One key in three row groups: the reader must return every row, as a plain filter does."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from tnh.data.edges import _Sorted, check_lookups
+
+    keys = [1, 2, 2, 5, 5, 5, 5, 5, 5, 9, 9, 12]  # key 5 fills groups 1, 2 and 3 at 2 rows a group
+    df = pl.DataFrame({"pos_hash": keys, "v": list(range(len(keys)))}, schema={"pos_hash": pl.UInt64, "v": pl.Int64})
+    path = tmp_path / "t.parquet"
+    with pq.ParquetWriter(path, df.to_arrow().schema) as w:
+        w.write_table(df.to_arrow(), row_group_size=2)
+    assert pq.ParquetFile(path).metadata.num_row_groups == 6
+    t = _Sorted(path, "pos_hash")
+    for k in set(keys) | {0, 3, 13}:
+        assert sorted(t.rows([k])["v"].to_list()) == df.filter(pl.col("pos_hash") == k)["v"].to_list(), k
+    assert sorted(t.rows([2, 5, 9])["v"].to_list()) == df.filter(pl.col("pos_hash").is_in([2, 5, 9]))["v"].to_list()
+    assert check_lookups(path, "pos_hash") == 5  # the distinct keys at group boundaries: 1, 2, 5, 9, 12
+    del pa
+
+
+def test_summary(tmp_path):
+    games = games_frame(["e2e4", "d2d4", "e2e4"], years=[2019, 2024, None])
+    db = EdgeDB.from_frames(*tables_from_games(games))
+    assert db.summary() == {"games": 3, "first_year": 2019, "last_year": 2024}
+
+
+def test_summary_from_files(tmp_path):
+    e, p = tables_from_games(games_frame(["e2e4", "d2d4", "e2e4"], years=[2019, 2024, None]))
+    e.write_parquet(tmp_path / "edges_s.parquet")
+    p.write_parquet(tmp_path / "pos_index_s.parquet")
+    edges_mod.parents_from_edges(e).write_parquet(tmp_path / "parents_s.parquet")
+    assert EdgeDB(name="s", directory=tmp_path).summary() == {"games": 3, "first_year": 2019, "last_year": 2024}
