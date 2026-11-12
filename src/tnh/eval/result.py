@@ -341,6 +341,11 @@ class ResultModel:
     def source_wdl(self, queries) -> dict[str, np.ndarray]:
         from tnh.models.maia3 import Elo
         out = {}
+        if "lc0raw" in self.sources:            # Lc0 first: on a shared GPU its backend wants memory early
+            if self._policy is None:
+                from tnh.models.lc0 import Lc0Policy
+                self._policy = Lc0Policy()
+            out["lc0raw"] = np.array([p.wdl for p in self._policy.predict(queries)], dtype=np.float64)
         if "maia0" in self.sources or "maia600" in self.sources:
             if self._maia is None:
                 from tnh.models.maia3 import Maia3
@@ -348,11 +353,6 @@ class ResultModel:
             m0, m6 = self._maia.predict_many(queries, [Elo.offset(0.0), Elo.offset(600.0)])
             out["maia0"] = np.array([p.wdl for p in m0], dtype=np.float64)
             out["maia600"] = np.array([p.wdl for p in m6], dtype=np.float64)
-        if "lc0raw" in self.sources:
-            if self._policy is None:
-                from tnh.models.lc0 import Lc0Policy
-                self._policy = Lc0Policy()
-            out["lc0raw"] = np.array([p.wdl for p in self._policy.predict(queries)], dtype=np.float64)
         if "lc0w" in self.sources:
             if self._search is None:
                 from tnh.models.lc0 import Lc0Search
@@ -380,19 +380,22 @@ class ResultModel:
 
 
 def cmd_check_live(a) -> None:
-    """The live model's sources against the feature files on n test positions."""
+    """The live sources against the feature files on n test positions, and the stored model's output computed
+    live against the same model on the files' values. ``--sources`` loads only those networks (an Lc0 engine is
+    about 2 GB of memory beside Maia and Lc0's policy, so the search is checked in a process of its own)."""
     from tnh.models.combo import _queries
     s, qs = _queries(a.test, a.n, 3)
-    for variant in ("cheap", "full"):
-        m = ResultModel(variant)
-        t = time.perf_counter()
-        live = m.source_wdl(qs)
-        dt = time.perf_counter() - t
-        for k, v in live.items():
-            ref = wdl_column(s, SOURCES[k])
-            print(f"{variant} {k}: max |live - file| = {np.nanmax(np.abs(v - ref)):.5f}")
-        print(f"{variant}: {len(qs) / dt:.1f} positions/s")
-        m.close()
+    m = ResultModel("full")
+    m.sources = a.sources
+    t = time.perf_counter()
+    live = m.source_wdl(qs)
+    dt = time.perf_counter() - t
+    for k in a.sources:
+        ref = wdl_column(s, SOURCES[k])
+        d = np.abs(live[k] - ref)
+        print(f"{k}: max |live - file| = {np.nanmax(d):.5f}, mean {np.nanmean(d):.5f}")
+    print(f"{'+'.join(a.sources)}: {len(qs) / dt:.1f} positions/s live")
+    m.close()
 
 
 def cmd_bench(a) -> None:
@@ -462,6 +465,7 @@ def main(argv=None) -> None:
     sp = sub.add_parser("check-live")
     sp.add_argument("--test", type=Path, default=CORPUS / "samples" / "test_value_all.parquet")
     sp.add_argument("--n", type=int, default=200)
+    sp.add_argument("--sources", nargs="+", default=["maia0", "maia600", "lc0raw"])
     sp.set_defaults(fn=cmd_check_live)
     a = p.parse_args(argv)
     a.fn(a)
