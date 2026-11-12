@@ -118,6 +118,27 @@ def main() -> None:
         assert len(page.locator("#eng option").all_inner_texts()) == 4
         expect(page.locator("#englines")).to_be_hidden()
 
+        # an engine update must not rebuild the table or replace an engine line's element
+        page.goto(BASE + "#t=all")
+        page.reload()
+        settle(page)
+        page.locator("#eng").select_option("preppy")
+        page.wait_for_function("window.tnh.state.eng.snap && window.tnh.state.eng.snap.lines.length >= 2", timeout=60000)
+        page.wait_for_function("document.querySelector('#tbl thead th[data-k=eng]') !== null")
+        page.locator("#tbl tbody tr[data-uci]").first.hover()
+        page.evaluate("""() => { window.__row = document.querySelector('#tbl tbody tr[data-uci]');
+                                window.__line = document.querySelector('#englines .eline');
+                                window.__builds = window.tnh.tableBuilds();
+                                window.__polls = 0;
+                                const f = window.fetch; window.fetch = (...a) => { if (String(a[0]).includes('/api/uci/state')) window.__polls++; return f(...a) } }""")
+        page.wait_for_function("window.__polls >= 6", timeout=20000)      # several engine updates
+        assert page.evaluate("document.contains(window.__row) && document.contains(window.__line)")
+        assert page.evaluate("window.tnh.tableBuilds()") == page.evaluate("window.__builds")
+        assert page.evaluate("window.__row.matches(':hover')")
+        assert page.locator("#tbl tbody td.engcell").count() >= 1
+        page.locator("#eng").select_option("off")
+        page.wait_for_function("document.querySelector('#tbl thead th[data-k=eng]') === null")
+
         # paste a FEN: unknown position, Maia warns that it has no history
         page.locator("#paste").fill("8/8/8/4k3/8/8/4K3/7R w - - 0 1")
         page.locator("#paste").press("Enter")

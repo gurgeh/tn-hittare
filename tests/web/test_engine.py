@@ -369,3 +369,12 @@ def test_fill_from_ratings():
     r = c.get("/api/uci/fill", params={"white": 1900, "black": 2300, "me": "black", "tempo": "classical"})
     assert r.json() == {"Contempt": "400", "WDLCalibrationElo": "2500"}
     assert c.get("/api/uci/fill", params={"white": 1900, "black": 2300, "me": "both"}).status_code == 400
+
+
+def test_preppy_line_parsing_is_lenient():
+    from tnh.web.engine import _kv, _preppy_line
+    kv = _kv("preppy multipv=1 value=0.6 net=- nonobvious=2 reach=0.1 moves=e2e4:L,e7e5:0.4 provisional=1 newkey=x")
+    d = _preppy_line(kv, ["e2e4", "e7e5"], flip=True)
+    assert d["provisional"] is True and d["white"] == pytest.approx(0.4) and d["net"] is None
+    assert d["flags"] == ["L", "0.4"] and d["other"] == {"newkey": "x"}
+    assert _preppy_line(_kv("preppy multipv=1 value=0.5"), [], flip=False)["provisional"] is False

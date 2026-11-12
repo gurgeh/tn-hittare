@@ -586,6 +586,9 @@ def _num(x: str | None) -> float | None:
         return None
 
 
+_KNOWN_LINE_KEYS = {"multipv", "value", "net", "nonobvious", "reach", "moves", "provisional", "gen"}
+
+
 def _preppy_line(kv: dict, pv: list[str], flip: bool) -> dict:
     """A preppy line's numbers. `value` is the side to move's expected score: `white` turns it
     to White's. Each move's flag: "L" my move learned, "M" my move not learned, else the
@@ -594,7 +597,11 @@ def _preppy_line(kv: dict, pv: list[str], flip: bool) -> dict:
     order = [it.split(":", 1) for it in kv.get("moves", "").split(",") if ":" in it]
     return {"value": v, "white": None if v is None else (1 - v if flip else v), "net": _num(kv.get("net")),
             "nonobvious": _num(kv.get("nonobvious")), "reach": _num(kv.get("reach")),
-            "flags": [f for _m, f in order][:len(pv)]}
+            "flags": [f for _m, f in order][:len(pv)],
+            # an early line, before preppy's solve for the position is done (shown dimmed)
+            "provisional": str(kv.get("provisional", "0")).lower() in ("1", "true", "yes"),
+            # keys this page does not know yet, passed on as they came
+            "other": {k: v for k, v in kv.items() if k not in _KNOWN_LINE_KEYS}}
 
 
 def _preppy_root(kv: dict, flip: bool) -> dict:

@@ -528,7 +528,19 @@ function render() {
     const rs = rows()
     if (state.cursor && !rs.find(r => r.uci === state.cursor)) state.cursor = null
     const body = document.querySelector("#tbl tbody")
-    body.innerHTML = rs.map(r => {
+    body.innerHTML = rs.map(r => rowHtml(r, s)).join("")
+    tableBuilds += 1
+    if (!rs.length) body.innerHTML = `<tr><td colspan="${cols().length}" class="dim">${s ? "no moves to show" : ""}</td></tr>`
+    showArrow(state.cursor)
+    renderModels()
+    renderStatus()
+}
+
+// How often the move table has been rebuilt (the browser test checks that an engine update
+// does not rebuild it).
+let tableBuilds = 0
+
+function rowHtml(r, s) {
         const cls = [r.db ? "" : "nodb", r.uci === state.cursor ? "cursor" : ""].join(" ")
         return `<tr data-uci="${r.uci}" class="${cls}">` +
             `<td class="san">${esc(r.san)}</td>` +
@@ -540,13 +552,44 @@ function render() {
             `<td class="num">${r.last_year ?? ""}</td>` +
             `<td class="num dim">${r.reach ?? ""}</td>` +
             (CHOICES.trend ? `<td>${trendCell(r, s)}</td>` : "") +
-            (CHOICES.engineColumn && engineOn() ? `<td class="num ${r.best ? "best" : ""}" title="${r.engLine ? "line " + r.engLine.multipv : ""}">${r.engLine ? scoreText(r.engLine) : ""}</td>` : "") +
+            (CHOICES.engineColumn && engineOn() ? `<td class="num engcell ${r.best ? "best" : ""}" title="${r.engLine ? "line " + r.engLine.multipv : ""}">${r.engLine ? scoreText(r.engLine) : ""}</td>` : "") +
             `</tr>`
-    }).join("")
-    if (!rs.length) body.innerHTML = `<tr><td colspan="${cols().length}" class="dim">${s ? "no moves to show" : ""}</td></tr>`
-    showArrow(state.cursor)
-    renderModels()
-    renderStatus()
+}
+
+// An engine update touches only the engine column: each cell's text, class and title are set
+// in place when they changed, a move of the engine's that has no row gets one appended, and
+// the header follows the engine's name. Hover, tooltips and clicks in the table survive it.
+function updateEngineColumn() {
+    if (!CHOICES.engineColumn || !engineOn()) return
+    const th = document.querySelector('#tbl thead th[data-k="eng"]')
+    if (!th) { render(); return }              // the column is not there yet: the engine just started
+    const s = state.eng.snap
+    const label = ((s && s.short) || "Eng") + (state.sort.key === "eng" ? (state.sort.desc ? " ▾" : " ▴") : "")
+    if (th.textContent !== label) th.textContent = label
+    const en = engineMoves() || new Map()
+    const body = document.querySelector("#tbl tbody")
+    const have = new Set([...body.querySelectorAll("tr[data-uci]")].map(tr => tr.dataset.uci))
+    const missing = [...en.keys()].filter(u => !have.has(u))
+    if (missing.length) {
+        const placeholder = body.querySelector("tr:not([data-uci])")
+        if (placeholder) placeholder.remove()
+        const all = rows()
+        for (const u of missing) {
+            const r = all.find(x => x.uci === u)
+            if (r) body.insertAdjacentHTML("beforeend", rowHtml(r, state.stats))
+        }
+    }
+    for (const tr of body.querySelectorAll("tr[data-uci]")) {
+        const td = tr.querySelector("td.engcell")
+        if (!td) continue
+        const l = en.get(tr.dataset.uci)
+        const text = l ? scoreText(l) : ""
+        const title = l ? "line " + l.multipv : ""
+        const best = !!(l && l.multipv === 1)
+        if (td.textContent !== text) td.textContent = text
+        if (td.title !== title) td.title = title
+        if (td.classList.contains("best") !== best) td.classList.toggle("best", best)
+    }
 }
 
 function renderModels() {
@@ -769,7 +812,7 @@ async function main() {
     initControls()
     initBoard()
     initEngine()
-    window.tnh = {state, play, command, render, CHOICES, engineGo}   // for the end-to-end test and the console
+    window.tnh = {state, play, command, render, CHOICES, engineGo, tableBuilds: () => tableBuilds}   // for the end-to-end test and the console
     update()
 }
 
@@ -949,7 +992,7 @@ async function pollEngine() {
             state.eng.snap = {...d, lines: [], strings: []}
         }
         renderEngine()
-        if (CHOICES.engineColumn) render()
+        updateEngineColumn()
     } catch (e) { /* the next poll tries again; a dead server shows in the other panels */ }
 }
 
@@ -1029,7 +1072,7 @@ function renderEngine() {
             set += ` <span class="dim" title="Fed from the page: me = the side at the bottom (f flips), the ratings from the White and Black boxes, Tempo blitz when only blitz games are shown">me ${f.Side} ${f.MyElo} v ${f.OppElo}${f.Tempo ? ", " + f.Tempo : ""}</span>`
         }
     }
-    if (!$("engset").contains(document.activeElement)) $("engset").innerHTML = set
+    setHtml("engset", set, true)
     let stat = ""
     if (state.eng.err) stat = `<span class="err">${esc(state.eng.err)}</span>`
     else if (s && s.error) stat = `<span class="err">${esc(s.error)}</span>`
@@ -1039,23 +1082,65 @@ function renderEngine() {
                 l.nps ? `${fmtNodes(l.nps)}/s` : ""].filter(Boolean).join(" · ")
     } else if (on && s && s.phase === "starting") stat = "loading (models load at the first isready)…"
     else if (on) stat = "starting…"
-    $("engstat").innerHTML = stat
-    if (!on) { $("englines").innerHTML = ""; $("engstrings").innerHTML = ""; return }
+    setHtml("engstat", stat)
+    if (!on) { setHtml("englines", ""); setHtml("engstrings", ""); return }
+    renderLines((s && s.lines) || [])
     const lines = (s && s.lines) || []
-    $("englines").innerHTML = lines.map(l => {
-        const wdl = l.wdl ? ` title="W ${(l.wdl[0] / 10).toFixed(1)} D ${(l.wdl[1] / 10).toFixed(1)} L ${(l.wdl[2] / 10).toFixed(1)} % (White)"` : ""
-        const dn = l.depth != null ? `d${l.depth}` : l.nodes != null ? fmtNodes(l.nodes) : ""
-        return `<div class="eline"><span class="escore"${wdl}>${scoreText(l)}</span><span class="edepth">${dn}</span><span class="epv">${sanLine(l)}</span></div>`
-    }).join("")
     const extra = lines.some(l => l.preppy) ? lines.map(l => l.preppy ? `<div>line ${l.multipv}: value White ${(100 * l.preppy.white).toFixed(1)}%` +
         (l.preppy.net != null ? ` · net (me) ${(100 * l.preppy.net).toFixed(1)}%` : "") +
-        ` · non-obvious ${l.preppy.nonobvious} · reach ${(100 * l.preppy.reach).toFixed(1)}%</div>` : "").join("") : ""
+        ` · non-obvious ${l.preppy.nonobvious} · reach ${(100 * l.preppy.reach).toFixed(1)}%` +
+        (l.preppy.provisional ? " · provisional" : "") + `</div>` : "").join("") : ""
     const r = s && s.root
     const rootLine = r ? `<div title="the search's root: value from White's side; net, price and cost for me; how much of the reach ends in stand-ins, frontier and finished positions">root: value White ${(100 * r.white).toFixed(1)}% · net ${(100 * r.net).toFixed(1)}% · price ${r.price} · cost ${r.cost}` +
         (r.cap && r.cap !== "-" ? ` (cap ${r.cap})` : "") +
         ` · stand-in ${(100 * r.stand_in).toFixed(1)}% · frontier ${(100 * r.frontier).toFixed(1)}% · finished ${(100 * r.finished).toFixed(1)}% · ${r.expanded} expanded</div>` : ""
     const other = ((s && s.strings) || []).filter(x => !x.startsWith("preppy root")).map(x => `<div>${esc(x)}</div>`).join("")
-    $("engstrings").innerHTML = rootLine + extra + other
+    setHtml("engstrings", rootLine + extra + other)
+}
+
+// Replaces an element's content only when it changed (and, with `keepFocus`, not while the
+// user is typing in it), so unchanged nodes keep their hover, tooltip and focus.
+const shown = {}
+function setHtml(id, html, keepFocus = false) {
+    if (shown[id] === html) return
+    if (keepFocus && $(id).contains(document.activeElement)) return
+    $(id).innerHTML = html
+    shown[id] = html
+}
+
+// One element per line, keyed by multipv. Score and depth are set in place; the moves are
+// rebuilt only when the line's moves (or preppy's flags) changed, so a hover or a click on a
+// move survives updates that only change the node count.
+function renderLines(lines) {
+    const box = $("englines")
+    shown.englines = null
+    const keep = new Set(lines.map(l => String(l.multipv)))
+    for (const el of [...box.children]) if (!keep.has(el.dataset.k)) el.remove()
+    lines.forEach((l, i) => {
+        let el = box.querySelector(`.eline[data-k="${l.multipv}"]`)
+        if (!el) {
+            el = document.createElement("div")
+            el.className = "eline"
+            el.dataset.k = String(l.multipv)
+            el.innerHTML = `<span class="escore"></span><span class="edepth"></span><span class="epv"></span>`
+        }
+        if (box.children[i] !== el) box.insertBefore(el, box.children[i] || null)
+        const [sc, dp, pv] = el.children
+        const score = scoreText(l)
+        if (sc.textContent !== score) sc.textContent = score
+        const wdl = l.wdl ? `W ${(l.wdl[0] / 10).toFixed(1)} D ${(l.wdl[1] / 10).toFixed(1)} L ${(l.wdl[2] / 10).toFixed(1)} % (White)` : ""
+        if (sc.title !== wdl) sc.title = wdl
+        const dn = l.depth != null ? `d${l.depth}` : l.nodes != null ? fmtNodes(l.nodes) : ""
+        if (dp.textContent !== dn) dp.textContent = dn
+        const sig = JSON.stringify([l.pv, l.preppy ? l.preppy.flags : null, state.tree.current.fen])
+        if (el.dataset.sig !== sig) {
+            pv.innerHTML = sanLine(l)
+            el.dataset.sig = sig
+        }
+        // preppy marks early lines provisional until its solve for the position is done
+        const prov = !!(l.preppy && l.preppy.provisional)
+        if (el.classList.contains("prov") !== prov) el.classList.toggle("prov", prov)
+    })
 }
 
 function fmtNodes(n) {

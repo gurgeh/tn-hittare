@@ -184,3 +184,4 @@ b.down { color: var(--down); font-size: 10px; margin-left: 2px; }
 #engstrings { font-size: 11px; max-height: 8em; overflow-y: auto; }
 a.lnk { color: inherit; text-decoration: none; }
 a.lnk:hover { text-decoration: underline; }
+.eline.prov { opacity: 0.5; }
