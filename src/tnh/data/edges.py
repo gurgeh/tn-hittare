@@ -410,6 +410,58 @@ _SUMS = ["n", "white_wins", "draws", "black_wins", "sum_mover_elo", "sum_opp_elo
 _MOVE_COLS = ["n", "share", "white_wins", "draws", "black_wins", "score", "n_rated", "mover_elo", "opp_elo", "performance"]
 
 
+class _Sorted:
+    """Point and set lookups on a parquet file sorted by ``key``, through its row-group statistics.
+
+    The row groups' key ranges are read once; a lookup reads only the row
+    groups whose range can hold one of the keys, and filters them in memory.
+    Polars' own pruning handles ``==`` well but not ``is_in`` over scattered
+    keys, which is what a position's children and parents need.
+    """
+
+    def __init__(self, path: Path, key: str):
+        self.pf = pq.ParquetFile(path)
+        self.key = key
+        col = self.pf.schema_arrow.get_field_index(key)
+        md = self.pf.metadata
+        self.groups, mins, maxs = [], [], []
+        for i in range(md.num_row_groups):
+            rg = md.row_group(i)
+            if rg.num_rows == 0:
+                continue
+            st = rg.column(col).statistics
+            if st is None or not st.has_min_max:
+                raise ValueError(f"{path}: row group {i} has no min/max for {key}; the lookups need them")
+            self.groups.append(i)
+            mins.append(st.min)
+            maxs.append(st.max)
+        self.groups = np.array(self.groups, np.int64)
+        self.mins, self.maxs = np.array(mins, np.uint64), np.array(maxs, np.uint64)
+
+    def rows(self, keys, columns: list[str] | None = None) -> pl.DataFrame:
+        k = np.unique(np.asarray(keys, np.uint64))
+        idx = np.searchsorted(self.mins, k, side="right") - 1
+        ok = (idx >= 0) & (k <= self.maxs[np.maximum(idx, 0)])
+        groups = sorted(set(self.groups[idx[ok]].tolist()))
+        if not groups:
+            t = self.pf.schema_arrow.empty_table()
+            return pl.from_arrow(t.select(columns) if columns else t)
+        df = pl.from_arrow(self.pf.read_row_groups(groups, columns=columns))
+        return df.filter(pl.col(self.key).is_in(pl.Series(k, dtype=pl.UInt64).implode()))
+
+
+class _InMemory:
+    """The same interface over a frame, for tables built in memory."""
+
+    def __init__(self, df: pl.DataFrame, key: str):
+        self.df, self.key = df, key
+
+    def rows(self, keys, columns: list[str] | None = None) -> pl.DataFrame:
+        k = pl.Series(np.unique(np.asarray(keys, np.uint64)), dtype=pl.UInt64)
+        df = self.df.filter(pl.col(self.key).is_in(k.implode()))
+        return df.select(columns) if columns else df
+
+
 class EdgeDB:
     """Queries on edges.parquet, pos_index.parquet and parents.parquet.
 
@@ -436,35 +488,31 @@ class EdgeDB:
     def __init__(self, name: str = "full", directory: Path | None = None):
         d = directory or CORPUS
         suffix = "" if name == "full" else f"_{name}"
-        self._edges = pl.scan_parquet(d / f"edges{suffix}.parquet")
-        self._pos = pl.scan_parquet(d / f"pos_index{suffix}.parquet")
-        self._parents = pl.scan_parquet(d / f"parents{suffix}.parquet")
+        self._edges = _Sorted(d / f"edges{suffix}.parquet", "pos_hash")
+        self._pos = _Sorted(d / f"pos_index{suffix}.parquet", "pos_hash")
+        self._parents = _Sorted(d / f"parents{suffix}.parquet", "child_hash")
 
     @classmethod
     def from_frames(cls, edges: pl.DataFrame, pos_index: pl.DataFrame, parents: pl.DataFrame | None = None) -> EdgeDB:
         db = cls.__new__(cls)
-        db._edges, db._pos = edges.lazy(), pos_index.lazy()
-        db._parents = (parents if parents is not None else parents_from_edges(edges)).lazy()
+        db._edges, db._pos = _InMemory(edges, "pos_hash"), _InMemory(pos_index, "pos_hash")
+        db._parents = _InMemory(parents if parents is not None else parents_from_edges(edges), "child_hash")
         return db
 
     # -- single lookups --
 
     def total(self, pos) -> dict | None:
         """The position's row in pos_index (all years, bands, tempi), or None below two games."""
-        rows = self._pos.filter(pl.col("pos_hash") == _key(pos)).collect()
+        rows = self._pos.rows([_key(pos)])
         return rows.row(0, named=True) if rows.height else None
 
     def _rows(self, h: int, years: Filter, elo_bands: Filter, tempi: Filter) -> pl.DataFrame:
         """The position's edge rows under the filters: one scan."""
-        return (
-            self._edges.filter(pl.col("pos_hash") == h)
-            .filter(_match("year", years) & _match("elo_band", elo_bands) & _match("tempo", tempi))
-            .collect()
-        )
+        return self._edges.rows([h]).filter(_match("year", years) & _match("elo_band", elo_bands) & _match("tempo", tempi))
 
     def _child_totals(self, child_hashes: pl.Series) -> pl.DataFrame:
-        return self._pos.filter(pl.col("pos_hash").is_in(child_hashes.implode())).select(
-            pl.col("pos_hash").alias("child_hash"), pl.col("n").alias("child_n")).collect()
+        return self._pos.rows(child_hashes.to_numpy(), ["pos_hash", "n"]).select(
+            pl.col("pos_hash").alias("child_hash"), pl.col("n").alias("child_n"))
 
     @staticmethod
     def _summarise(rows: pl.DataFrame, white_to_move: bool, by: list[str]) -> pl.DataFrame:
@@ -551,17 +599,16 @@ class EdgeDB:
         Only parents reached by two or more games are listed, as in edges.
         """
         h = _key(pos)
-        par = self._parents.filter(pl.col("child_hash") == h).collect()
+        par = self._parents.rows([h])
         if par.height and not (years is None and elo_bands is None and tempi is None):
             par = (
-                self._edges.filter(pl.col("pos_hash").is_in(par["pos_hash"].implode()) & (pl.col("child_hash") == h))
-                .filter(_match("year", years) & _match("elo_band", elo_bands) & _match("tempo", tempi))
+                self._edges.rows(par["pos_hash"].to_numpy())
+                .filter((pl.col("child_hash") == h) & _match("year", years) & _match("elo_band", elo_bands) & _match("tempo", tempi))
                 .group_by("pos_hash", "move").agg(pl.col("n").sum())
-                .collect()
             )
         if par.height == 0:
             return pl.DataFrame(schema={"pos_hash": pl.UInt64, "move": pl.String, "n": pl.UInt32, "epd": pl.String})
-        epd = self._pos.filter(pl.col("pos_hash").is_in(par["pos_hash"].implode())).select("pos_hash", "epd").collect()
+        epd = self._pos.rows(par["pos_hash"].to_numpy()).select("pos_hash", "epd")
         return par.select("pos_hash", "move", "n").join(epd, on="pos_hash", how="left").sort(
             "n", "pos_hash", descending=[True, False])
 
@@ -827,6 +874,8 @@ def build(*, name: str, out_dir: Path, fraction: float | None, since_year: int |
     writers: dict[str, pq.ParquetWriter] = {}
 
     def append(key: str, path: Path, df: pl.DataFrame, rows_per_group: int) -> None:
+        if df.height == 0 and key in writers:
+            return  # an empty row group would carry no min/max, which the readers need
         t = df.to_arrow()
         if key not in writers:
             writers[key] = pq.ParquetWriter(str(path) + ".tmp", t.schema, compression="zstd")
