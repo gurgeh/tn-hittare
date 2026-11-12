@@ -254,3 +254,15 @@ def test_result_reports_masses_and_history():
     assert m["stand_in"] > 0 and sum(m.values()) == pytest.approx(1.0)
     assert len(r.history) >= 3 and r.history[-1][1] == pytest.approx(r.solve.value)
     assert r.lines and r.lines[0].moves
+
+
+def test_a_position_at_two_plies_one_unexpanded():
+    # X occurs at ply 2 (expanded) and ply 4 (a leaf): costs and learning read the expanded one
+    X2 = me(("win", 0.02, 0.9, leaf(0.9)), ("usual", 0.98, 0.5, leaf(0.5)), key="X")
+    deep = opp(("t", 1.0, 0.5, me(("u", 1.0, 0.5, opp(("v", 1.0, 0.5, leaf(0.6, key="X")), key="o3")), key="m2")), key="o1")
+    g = build(me(("a", 0.5, 0.5, opp(("x", 1.0, 0.5, X2), key="oa")), ("b", 0.5, 0.5, deep), key="root"))
+    game = Game(g, Params(eps_white=1.0, cost=ObviousCost(0.85)))
+    assert len(game.by_key["X"]) == 2
+    assert game.cost_of("X", "win") == 1
+    s = solve_price(game, 0.001)
+    assert s.learned.get("X") == "win"

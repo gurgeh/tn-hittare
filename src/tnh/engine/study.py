@@ -156,7 +156,8 @@ def stockfish_losses(eng: Engine, sets: list[dict], nodes: int) -> dict:
     g, ev = eng.graph, eng.ev
     by_key = {}
     for n in g.nodes:
-        by_key.setdefault(str(n.key), n)
+        if n.children is not None and n.moves:
+            by_key.setdefault(str(n.key), n)
     want = {}
     for s in sets:
         for k, m in s["learned_set"].items():
@@ -268,7 +269,8 @@ def n10_table(eng: Engine, board: chess.Board, stage: dict) -> list[dict]:
     g = eng.graph
     by_key = {}
     for n in g.nodes:
-        by_key.setdefault(str(n.key), n)
+        if n.children is not None and n.moves:
+            by_key.setdefault(str(n.key), n)
     rows = []
     for k, m in cap10["learned_set"].items():
         n = by_key[k]
@@ -287,7 +289,8 @@ def write_export(eng: Engine, board: chess.Board, stage: dict, name: str, db) ->
     g = eng.graph
     by_key = {}
     for n in g.nodes:
-        by_key.setdefault(str(n.key), n)
+        if n.children is not None and n.moves:
+            by_key.setdefault(str(n.key), n)
     eng.set_settings(price=eng.s.price, cap=0)
     eng.solve()
     game = eng.game

@@ -360,8 +360,13 @@ class Game:
         return int(c)
 
     def cost_of(self, key: Key, move: str) -> int:
-        i = self.by_key[key][0]
-        return self.move_cost(i, self.graph.nodes[i].moves.index(move))
+        """The cost of `move` at the position `key`, read at an occurrence that has the move (a
+        position can occur at two plies, one of them not expanded)."""
+        for i in self.by_key[key]:
+            n = self.graph.nodes[i]
+            if n.expanded and move in n.moves:
+                return self.move_cost(i, n.moves.index(move))
+        raise ValueError(f"no expanded occurrence of {key} has the move {move}")
 
     def policy(self, i: int, learned: Learned) -> np.ndarray:
         n = self.graph.nodes[i]
