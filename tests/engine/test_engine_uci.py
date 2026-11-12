@@ -77,8 +77,8 @@ def test_adaptive_solve_interval():
     eng, _ = fake_engine(price=0.002, solve_every=20, solve_ratio=1e9)
     eng.set_position(C4)
     eng.search(nodes=200)
-    # evaluation never outweighs a solve by 1e9: only the 10x-floor rule solves
-    assert eng.stats["solves"] <= 200 // 200 + 3
+    # the time since a solve never reaches 1e9 times its duration: only the first and last solves
+    assert eng.stats["solves"] <= 3
     eng2, _ = fake_engine(price=0.002, solve_every=20, solve_ratio=0.0)
     eng2.set_position(C4)
     eng2.search(nodes=200)

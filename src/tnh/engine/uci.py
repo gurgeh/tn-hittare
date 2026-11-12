@@ -41,7 +41,7 @@ This docstring is the contract for a GUI (the web page's engine section).
 | PriorMin | string (float) | 0.002 | 0-1 | safety net: a move with a smaller prior is not a candidate |
 | Blunder | string (float) | 0.15 | 0-1 | safety net: a learned move's position may be at most this much worse than the one before |
 | Batch | spin | 12 | 1-512 | positions evaluated per batch |
-| SolveRatio | string (float) | 4 | >= 0 | solve again when evaluation time since the last solve is this many times its duration |
+| SolveRatio | string (float) | 4 | >= 0 | solve again when the time since the last solve is this many times its duration (solving stays about 1/(1+ratio) of the time) |
 
 ## Output
 

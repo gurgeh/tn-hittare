@@ -99,7 +99,7 @@ class Settings:
     blunder: float = 0.15             # safety net: a learned move's child at most this far below the position
     batch: int = 12
     solve_every: int = 120            # at least this many expansions between full solves
-    solve_ratio: float = 4.0          # and evaluation time since the last solve >= this x its duration
+    solve_ratio: float = 4.0          # and time since the last solve >= this x its duration
     expand_root: bool = True          # every legal move at the root is expanded once
 
     EVAL_KEYS = ("my_elo", "opp_elo", "my_side", "tempo")
@@ -182,6 +182,7 @@ class Engine:
         self.transposed: list = []              # (first path's position, another path's) for the history check
         self.eval_since_solve = 0.0
         self.last_solve_seconds = 0.0
+        self.last_solve_end = 0.0
         self.cap_mu: float | None = None
         self._node(self.ev.start(), None)
         self.graph.root = 0
@@ -480,19 +481,19 @@ class Engine:
         self.game, self.last = game, res
         self.since_solve = 0
         self.eval_since_solve = 0.0
-        self.last_solve_seconds = time.perf_counter() - t
+        self.last_solve_end = time.perf_counter()
+        self.last_solve_seconds = self.last_solve_end - t
         self.seconds["solve"] += self.last_solve_seconds
         self.stats["solves"] += 1
         return res
 
     def _due(self) -> bool:
-        """Solve when enough has been evaluated since the last solve that solving stays a small
-        share of the time, and at least `solve_every` expansions have been made."""
+        """Solve when at least `solve_every` expansions have been made and the time since the
+        last solve is at least `solve_ratio` times that solve's duration, so solving stays
+        about 1 / (1 + solve_ratio) of the time however large the graph grows."""
         if self.since_solve < self.s.solve_every:
             return False
-        if self.since_solve >= 10 * self.s.solve_every:
-            return True
-        return self.eval_since_solve >= self.s.solve_ratio * self.last_solve_seconds
+        return time.perf_counter() - self.last_solve_end >= self.s.solve_ratio * self.last_solve_seconds
 
     # -- selection ------------------------------------------------------------------------------
 

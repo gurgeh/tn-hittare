@@ -175,7 +175,7 @@ def stockfish_losses(eng: Engine, sets: list[dict], nodes: int) -> dict:
 
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(prog="python -m tnh.engine.study")
-    ap.add_argument("--stages", type=int, nargs="*", default=[2000, 10000, 50000])
+    ap.add_argument("--stages", type=int, nargs="*", default=[2000, 10000, 30000])
     ap.add_argument("--search-seconds", type=float, default=1200)
     ap.add_argument("--prices", type=float, nargs="*", default=[0.0005, 0.001, 0.002, 0.005])
     ap.add_argument("--caps", type=int, nargs="*", default=[5, 10, 20, 40])
@@ -222,7 +222,19 @@ def main(argv=None) -> None:
         if left <= 0:
             break
         ts = time.perf_counter()
-        r = eng.search(nodes=max(target - eng.stats["expanded"], 0), seconds=left)
+        import threading
+        stop = threading.Event()
+        done = threading.Event()
+
+        def watch():
+            while not done.wait(2.0):
+                if rss_gb() > a.rss_limit:
+                    log.setdefault("stopped_for_memory", rss_gb())
+                    stop.set()
+                    return
+        threading.Thread(target=watch, daemon=True).start()
+        r = eng.search(nodes=max(target - eng.stats["expanded"], 0), seconds=left, stop=stop)
+        done.set()
         searched += time.perf_counter() - ts
         exp = eng.stats["expanded"]
         sec = {k: v - prev_sec.get(k, 0.0) for k, v in eng.seconds.items()}
@@ -332,7 +344,7 @@ def write_export(eng: Engine, board: chess.Board, stage: dict, name: str, db) ->
 def report(log: dict, a) -> str:
     L = []
     add = L.append
-    add("# The repertoire engine, first real run: 1.c4 Nf6 2.g3 e6 3.Bg2 d5, White, 2200 v 2200, classical\n")
+    add("# preppy, first real run: 1.c4 Nf6 2.g3 e6 3.Bg2 d5, White, 2200 v 2200, classical\n")
     add(f"Models loaded in {log['load_seconds']:.0f} s; GPU had {log['gpu_free_mb_at_start']} MB free at start; "
         f"wall time {log['wall_seconds']:.0f} s.\n")
     for st in log["stages"]:
