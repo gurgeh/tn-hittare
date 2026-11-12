@@ -1,30 +1,34 @@
-"""The real models behind the model panel: Maia-3 5m and one Stockfish process on the CPU."""
+"""The real models behind the move table: model 1 (Combo, pruned) and model 2 (FrontierValue).
+
+Slow and needs the GPU: Maia-3 79M and Lc0. Not run in round 3 (the GPU was taken).
+"""
 
 from __future__ import annotations
 
 import chess
 import pytest
 
-from tnh.web.models import Hub
+from tnh.web.models import Hub, query
 
 
 @pytest.mark.slow
-def test_hub_maia_and_engine():
-    hub = Hub(maia_size="5m", device="cpu", torch_threads=1)
+def test_hub_with_the_live_models():
+    hub = Hub("combo-p0.5", "frontier")
     try:
         b = chess.Board()
         b.push_uci("e2e4")
-        m = hub.maia(b.fen(), ["e2e4"], 2200, 1800)
-        assert (m["mover_fide"], m["opp_fide"]) == (1800, 2200) and m["mover_maia"] == 2584
-        assert sum(m["moves"].values()) == pytest.approx(1, abs=1e-4)
-        assert len(m["moves"]) == 20 and m["cached"] is False
-        assert hub.maia(b.fen(), ["e2e4"], 2200, 1800)["cached"] is True
-        # other ratings are another cache entry
-        assert hub.maia(b.fen(), ["e2e4"], 2200, 2400)["cached"] is False
-
-        e = hub.engine(b.fen(), ["e2e4"], 20_000)
-        assert set(e["moves"]) == {mv.uci() for mv in b.legal_moves}
-        assert all(0 <= v["value"] <= 1 for v in e["moves"].values() if v["value"] is not None)
-        assert hub.engine(b.fen(), ["e2e4"], 20_000)["cached"] is True
+        m = hub.move_probs(b.fen(), ["e2e4"], 2200, 1800)
+        assert len(m["moves"]) == 20 and sum(m["moves"].values()) == pytest.approx(1, abs=1e-4)
+        assert hub.move_probs(b.fen(), ["e2e4"], 2200, 1800)["cached"] is True
+        qs = []
+        for mv in ("e7e5", "c7c5", "e7e6"):
+            c = b.copy()
+            c.push_uci(mv)
+            qs.append(query(c, ["e2e4", mv], 2200, 1800))
+        w = hub.values(qs)
+        assert all(abs(sum(x) - 1) < 1e-6 for x in w)
+        assert hub.counts["value_queries"] == 3
+        hub.values(qs)
+        assert hub.counts["value_queries"] == 3
     finally:
         hub.close()

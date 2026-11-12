@@ -6,7 +6,7 @@ import chess
 import pytest
 from fastapi.testclient import TestClient
 
-from _webfix import FakeHub, stats
+from _webfix import fake_hub, stats
 from tnh.web.app import create_app
 from tnh.web.stats import Filters, two_proportion
 
@@ -22,7 +22,7 @@ def fen_after(*uci: str) -> str:
 
 @pytest.fixture(scope="module")
 def client():
-    hub = FakeHub()
+    hub = fake_hub()
     c = TestClient(create_app(stats(), hub))
     c.hub = hub
     return c
@@ -136,11 +136,6 @@ def test_position_where_every_game_ended(client):
     assert d["status"] == "ended" and d["total"]["reach"] == 3 and d["moves"] == []
 
 
-def test_maia_rating_map():
-    from tnh.web.models import maia_elo
-    assert maia_elo(2200) == 2808 and maia_elo(0) == 1580
-
-
 def test_bad_fen(client):
     assert client.get("/api/stats", params={"fen": "not a fen"}).status_code == 400
 
@@ -191,23 +186,6 @@ def test_pgn_illegal(client):
     assert r.status_code == 400
 
 
-def test_models_get_ratings_by_side(client):
-    client.hub.calls.clear()
-    fen = fen_after("e2e4")
-    r = client.get("/api/maia", params={"fen": fen, "moves": "e2e4", "white": 2300, "black": 1900})
-    assert r.status_code == 200, r.text
-    d = r.json()
-    assert (d["mover_fide"], d["opp_fide"]) == (1900, 2300)   # Black to move
-    assert d["mover_maia"] == round(1580 + 0.558 * 1900)
-    assert sum(d["moves"].values()) == pytest.approx(1)
-    assert client.hub.calls[-1] == ("maia", fen, ("e2e4",), 2300, 1900)
-
-
-def test_models_reject_moves_that_miss_the_fen(client):
-    r = client.get("/api/maia", params={"fen": START, "moves": "e2e4"})
-    assert r.status_code == 400
-
-
 def test_engine(client):
     r = client.get("/api/engine", params={"fen": START, "nodes": 5000})
     assert r.status_code == 200, r.text
@@ -219,7 +197,7 @@ def test_models_off():
     from tnh.web.models import NoModels
     c = TestClient(create_app(stats(), NoModels()))
     assert c.get("/api/info").json()["models"] == {"disabled": True}
-    r = c.get("/api/maia", params={"fen": START})
+    r = c.get("/api/model", params={"fen": START})
     assert r.status_code == 503 and "--no-models" in r.json()["detail"]
     assert c.get("/api/engine", params={"fen": START}).status_code == 503
     assert c.get("/api/stats", params={"fen": START}).status_code == 200

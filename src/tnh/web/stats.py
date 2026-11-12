@@ -121,6 +121,45 @@ class Filters:
         return kw
 
 
+# --- shrinkage ---------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Shrink:
+    """The weights, in games, with which the move table shrinks the database toward a prior.
+
+    - `kappa`: move probability, `(count + kappa * p_model) / (n + kappa)`, as the
+      repertoire builder mixes the opponent's moves. 100 is the builder study's default;
+      nothing has been fitted for it yet (it needs model 1 on a sample).
+    - `kappa_v`: White's score and the draw rate, `(n * db + kappa_v * model2) / (n + kappa_v)`.
+      `python -m tnh.web.calibrate` on the 3,000 most common positions of the full table,
+      classical games, with the position's own mean as the prior: predicting each move's
+      2024-26 figure from the years before, the error is lowest at 10-22 (rare moves 10,
+      all moves 22; flat between). Method of moments (DerSimonian-Laird) says 105-116, but
+      it assumes one between-move variance for all moves and rare moves vary more. Model 2
+      should deserve more weight than the position mean, so 20, at the top of the
+      out-of-sample range. Refit when model 2's values exist for a sample.
+    - `k_elo`: W-Elo and B-Elo, `n_rated / (n_rated + k_elo) * (move mean - position mean)`.
+      Method of moments gives 21-22 (within-move variance 83,692, SD 289, from one row group
+      of games.parquet, an upper bound since edges hold no sums of squares; between-move
+      variance 3,760-3,963 by DerSimonian-Laird). Out of sample it is wrong: on rare moves
+      k = 22 raises the squared error of the 2024-26 mean from 35,746 to 52,279, and the
+      error falls all the way to k = 1. Players repeat their moves, so a move's own mean
+      predicts the next player well. 1.
+    """
+
+    kappa: float = 100.0
+    kappa_v: float = 20.0
+    k_elo: float = 1.0
+
+    def mix(self, n: float, db: float | None, model: float | None, kappa: float) -> float | None:
+        if model is None:
+            return db if n else None
+        if not n or db is None:
+            return model
+        return (n * db + kappa * model) / (n + kappa)
+
+
 # --- trends ------------------------------------------------------------------------
 
 
@@ -199,7 +238,14 @@ def _san(epd: str | None, uci: str) -> tuple[str, str | None]:
     return (b.san(m) if b.is_legal(m) else uci), b.fen()
 
 
-def report(stats: Stats, board: chess.Board, f: Filters, rule: TrendRule = TrendRule()) -> dict:
+def _white_black(r: dict, white_to_move: bool) -> tuple[float | None, float | None]:
+    """A move row's mean ratings of White and Black (its mover and opponent are given)."""
+    m, o = _num(r["mover_elo"]), _num(r["opp_elo"])
+    return (m, o) if white_to_move else (o, m)
+
+
+def report(stats: Stats, board: chess.Board, f: Filters, rule: TrendRule = TrendRule(),
+           shrink: Shrink = Shrink()) -> dict:
     """Everything the database panel shows for one position.
 
     `status` says what the numbers are:
@@ -226,10 +272,32 @@ def report(stats: Stats, board: chess.Board, f: Filters, rule: TrendRule = Trend
         year_totals = dict(zip(years, yt["n"].to_list()))
         move_year = {(m, y): n for m, y, n in yrows.select("move", "year", "n").iter_rows()}
 
+    white = board.turn == chess.WHITE
+    # The position's mean rating of each colour over the moves' rated games under the filters.
+    rated = sum(r["n_rated"] for r in moves.iter_rows(named=True)) if moves.height else 0
+    pos_w = pos_b = None
+    if rated:
+        pos_w = sum(r["n_rated"] * _white_black(r, white)[0] for r in moves.iter_rows(named=True) if r["n_rated"]) / rated
+        pos_b = sum(r["n_rated"] * _white_black(r, white)[1] for r in moves.iter_rows(named=True) if r["n_rated"]) / rated
+    pos_m, pos_o = (pos_w, pos_b) if white else (pos_b, pos_w)
+    pos_gap = pos_m - pos_o if rated else None
     rows = []
     for r in moves.iter_rows(named=True):
         mv = chess.Move.from_uci(r["move"])
+        w_elo, b_elo = _white_black(r, white)
+        nr = r["n_rated"] or 0
+        weight = nr / (nr + shrink.k_elo) if nr else 0.0
+        m_elo, o_elo = _num(r["mover_elo"]), _num(r["opp_elo"])
         rows.append({
+            "white_elo": w_elo, "black_elo": b_elo,
+            "w_elo_delta": weight * (w_elo - pos_w) if nr else None,
+            "b_elo_delta": weight * (b_elo - pos_b) if nr else None,
+            # The alternative form: the chooser's delta, and the move's rating gap (chooser
+            # minus opponent) against the position's gap, both shrunk the same way.
+            "mover_elo_delta": weight * (m_elo - pos_m) if nr else None,
+            "gap": m_elo - o_elo if nr else None,
+            "gap_delta": weight * ((m_elo - o_elo) - pos_gap) if nr else None,
+            "white_wins": r["white_wins"], "draws": r["draws"], "black_wins": r["black_wins"],
             "uci": r["move"], "san": board.san(mv) if board.is_legal(mv) else r["move"], "n": r["n"],
             "share": r["share"], "score": r["score"],
             "draw": r["draws"] / r["n"] if r["n"] else None,
@@ -255,7 +323,6 @@ def report(stats: Stats, board: chess.Board, f: Filters, rule: TrendRule = Trend
         status = "filtered"
     else:
         status = "ended"
-    white = board.turn == chess.WHITE
     tw, td, tb = (int(moves[c].sum()) if moves.height else 0 for c in ("white_wins", "draws", "black_wins"))
     return {
         "hash": f"{h:016x}",
@@ -266,10 +333,66 @@ def report(stats: Stats, board: chess.Board, f: Filters, rule: TrendRule = Trend
             "played": played if total else None,          # sum of the moves' games under the filters
             "white_wins": tw, "draws": td, "black_wins": tb,
             "score": ((tw if white else tb) + 0.5 * td) / played if played else None,
+            "white_score": (tw + 0.5 * td) / played if played else None,
+            "draw": td / played if played else None,
+            "white_elo": pos_w, "black_elo": pos_b, "n_rated": rated, "gap": pos_gap,
         },
+        "shrink": {"kappa": shrink.kappa, "kappa_v": shrink.kappa_v, "k_elo": shrink.k_elo},
         "moves": rows,
         "years": years,
         "year_totals": [year_totals[y] for y in years],
         "trend": trend,
         "move_orders": move_orders,
     }
+
+
+# --- the model columns -----------------------------------------------------------------
+
+
+def _white_view(wdl_mover: tuple | None, white_to_move: bool) -> tuple[float, float] | None:
+    """(White's expected score, draw probability) from a (win, draw, loss) for the mover."""
+    if wdl_mover is None:
+        return None
+    w, d, l = wdl_mover
+    return ((w if white_to_move else l) + 0.5 * d, d)
+
+
+def model_table(rep: dict, probs: dict[str, float], position_wdl: tuple | None,
+                child_wdl: dict[str, tuple | None], child_white_to_move: bool, shrink: Shrink) -> dict:
+    """The model columns of the move table from a `report`, model 1's probabilities for the
+    side to move, and model 2's (win, draw, loss) for the mover of the position and of each
+    child. Everything is from White's side; the page chooses how to show it.
+
+    - `p_mix = (count + kappa * p_model) / (n + kappa)`, n the moves' games under the filters;
+    - `score_mix`, `draw_mix` = `(n * db + kappa_v * model) / (n + kappa_v)`, n the move's games.
+    """
+    db = {m["uci"]: m for m in rep["moves"]}
+    n = (rep["total"]["played"] or 0) if rep["status"] == "ok" else 0
+    out = {}
+    for uci in set(probs) | set(db) | set(child_wdl):
+        p = probs.get(uci)
+        m = db.get(uci)
+        count = m["n"] if m else 0
+        model = _white_view(child_wdl.get(uci), child_white_to_move)
+        db_score = (m["white_wins"] + 0.5 * m["draws"]) / m["n"] if m and m["n"] else None
+        db_draw = m["draws"] / m["n"] if m and m["n"] else None
+        p_mix = (count + shrink.kappa * p) / (n + shrink.kappa) if p is not None else None
+        out[uci] = {
+            "p_model": p, "p_mix": p_mix, "p_db": count / n if n else None,
+            "delta": p_mix - p if p is not None else None,
+            "score_model": model[0] if model else None, "draw_model": model[1] if model else None,
+            "score_db": db_score, "draw_db": db_draw, "n": count,
+            "score_mix": shrink.mix(count, db_score, model[0] if model else None, shrink.kappa_v),
+            "draw_mix": shrink.mix(count, db_draw, model[1] if model else None, shrink.kappa_v),
+        }
+    pos_model = _white_view(position_wdl, rep["white_to_move"])
+    t = rep["total"]
+    position = {
+        "score_model": pos_model[0] if pos_model else None, "draw_model": pos_model[1] if pos_model else None,
+        "wdl_white": None if position_wdl is None else (
+            list(position_wdl) if rep["white_to_move"] else [position_wdl[2], position_wdl[1], position_wdl[0]]),
+        "score_db": t["white_score"], "draw_db": t["draw"], "n": n,
+        "score_mix": shrink.mix(n, t["white_score"], pos_model[0] if pos_model else None, shrink.kappa_v),
+        "draw_mix": shrink.mix(n, t["draw"], pos_model[1] if pos_model else None, shrink.kappa_v),
+    }
+    return {"moves": out, "position": position}

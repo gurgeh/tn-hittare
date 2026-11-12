@@ -1,17 +1,27 @@
-"""The model panel: Maia-3 and Stockfish, each loaded once on first use and kept.
+"""The models behind the move table, each loaded once on first use and kept.
 
-Both run on the CPU by default. Results are cached per position (and per ratings or node
-budget), so stepping back and forth costs nothing after the first visit. A model that
-fails to load or run raises; the server turns that into an error the page shows.
+- **Model 1**, the move model: any object with the `MoveModel` interface
+  (`.predict(queries) -> list[Prediction]`), e.g. `tnh.models.combo.Combo(prune="p0.5")`.
+- **Model 2**, the result model: any object with `.wdl(queries)` (an array of win, draw,
+  loss for the mover per query), e.g. `tnh.models.combo.FrontierValue()`.
+- Stockfish on demand, as before.
+
+Models are named by a spec string (`load_move_model`, `load_value_model`): a preset, or
+`import:package.module:Name` for any class built without arguments, so a better model drops
+in by a flag. Both models take FIDE ratings in `Query.mover_elo` and `Query.opp_elo`.
+
+Results are cached per position, its recent history and both ratings. A model that fails
+to load or run raises; the server turns that into an error the page shows.
 """
 
 from __future__ import annotations
 
+import importlib
 import math
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Protocol
 
 import chess
@@ -19,11 +29,71 @@ import numpy as np
 
 from tnh.models.base import Query, position_key
 
+HISTORY = 8          # positions of history a model may look at; part of the cache key
+VALUE_BATCH = 12     # queries per model-2 call; Lc0's batch size in tnh.models
+
 
 class ModelHub(Protocol):
-    def maia(self, fen: str, moves: list[str], white_elo: int, black_elo: int) -> dict: ...   # FIDE ratings
+    def move_probs(self, fen: str, moves: list[str], white: int, black: int) -> dict: ...
+    def values(self, queries: list[Query], cancelled: Callable[[], bool] = ...) -> list[tuple[float, float, float]]: ...
     def engine(self, fen: str, moves: list[str], nodes: int) -> dict: ...
     def status(self) -> dict: ...
+    def close(self) -> None: ...
+
+
+class ModelsOff(RuntimeError):
+    pass
+
+
+class Superseded(RuntimeError):
+    """A newer request for the table came in while this one waited for model 2."""
+
+
+# --- model specs ------------------------------------------------------------------------
+
+MOVE_MODELS: dict[str, Callable[[], object]] = {
+    "combo-p0.5": lambda: _combo().Combo(prune="p0.5"),
+    "combo": lambda: _combo().Combo(),
+    "fake": lambda: _fakes().FakeMoveModel(),
+}
+VALUE_MODELS: dict[str, Callable[[], object]] = {
+    "frontier": lambda: _combo().FrontierValue(),
+    "fake": lambda: _fakes().FakeValue(),
+}
+
+
+def _combo():
+    return importlib.import_module("tnh.models.combo")
+
+
+def _fakes():
+    return importlib.import_module("tnh.web.fakes")
+
+
+def _load(spec: str, presets: dict[str, Callable[[], object]], kind: str):
+    if spec in presets:
+        return presets[spec]()
+    if spec.startswith("import:"):
+        module, _, name = spec[len("import:"):].partition(":")
+        return getattr(importlib.import_module(module), name)()
+    raise ValueError(f"{kind}: {spec!r} is neither a preset ({', '.join(presets)}) nor import:module:Name")
+
+
+def load_move_model(spec: str):
+    m = _load(spec, MOVE_MODELS, "move model")
+    if not callable(getattr(m, "predict", None)):
+        raise TypeError(f"move model {spec!r} has no predict(queries)")
+    return m
+
+
+def load_value_model(spec: str):
+    m = _load(spec, VALUE_MODELS, "value model")
+    if not callable(getattr(m, "wdl", None)):
+        raise TypeError(f"value model {spec!r} has no wdl(queries)")
+    return m
+
+
+# --- helpers ---------------------------------------------------------------------------
 
 
 class _LRU:
@@ -57,83 +127,125 @@ def _board(fen: str, moves: list[str]) -> chess.Board:
     return b
 
 
-# Maia-3 was trained on Lichess blitz ratings. The rating it is given for a FIDE-rated
-# player is this linear map, measured in step 1 (2026-11-12) as the best Maia rating by
-# FIDE rating on classical games. Applied to both players.
-MAIA_INTERCEPT = 1580.0
-MAIA_SLOPE = 0.558
+def query(board: chess.Board, moves: list[str], white: int, black: int) -> Query:
+    """The query for the side to move in `board`, with both FIDE ratings."""
+    mover, opp = (white, black) if board.turn == chess.WHITE else (black, white)
+    return Query(board.fen(), list(moves), mover, opp)
 
 
-def maia_elo(fide: float) -> int:
-    """The rating fed to Maia-3 for a player with this FIDE rating."""
-    return int(round(MAIA_INTERCEPT + MAIA_SLOPE * fide))
+def _key(q: Query) -> tuple:
+    return (position_key(chess.Board(q.fen)), tuple(q.moves_uci[-HISTORY:]), len(q.moves_uci) < HISTORY,
+            q.mover_elo, q.opp_elo)
 
 
 def _num(x: float) -> float | None:
     return None if x is None or (isinstance(x, float) and math.isnan(x)) else float(x)
 
 
-@dataclass
+def terminal_wdl(board: chess.Board) -> tuple[float, float, float] | None:
+    """Win, draw, loss for the side to move where the game is over; None where it is not."""
+    out = board.outcome(claim_draw=False)
+    if out is None:
+        return None
+    if out.winner is None:
+        return (0.0, 1.0, 0.0)
+    return (1.0, 0.0, 0.0) if out.winner == board.turn else (0.0, 0.0, 1.0)
+
+
+# --- the hub -----------------------------------------------------------------------------
+
+
 class Hub:
-    """Maia-3 at `maia_size` and Stockfish with one process, created lazily."""
+    """Model 1, model 2 and Stockfish, created lazily from their specs (or given as objects)."""
 
-    maia_size: str = "5m"
-    device: str = "cpu"
-    torch_threads: int = 2
-    stockfish_processes: int = 1
-    cache_size: int = 4096
-
-    def __post_init__(self) -> None:
-        self._maia = None
+    def __init__(self, move_model: str | object = "combo-p0.5", value_model: str | object = "frontier",
+                 *, stockfish_processes: int = 1, cache_size: int = 20000) -> None:
+        self._move_spec, self._value_spec = move_model, value_model
+        self._move = None if isinstance(move_model, str) else move_model
+        self._value = None if isinstance(value_model, str) else value_model
         self._sf = None
-        self._maia_lock = threading.Lock()
-        self._sf_lock = threading.Lock()
-        self._maia_cache = _LRU(self.cache_size)
-        self._sf_cache = _LRU(self.cache_size)
+        self.stockfish_processes = stockfish_processes
+        self._move_lock, self._value_lock, self._sf_lock = threading.Lock(), threading.Lock(), threading.Lock()
+        self._move_cache, self._value_cache, self._sf_cache = _LRU(cache_size), _LRU(cache_size * 4), _LRU(cache_size)
         self.load_s: dict[str, float] = {}
+        self.counts = {"value_queries": 0, "value_cached": 0, "value_terminal": 0, "move_queries": 0}
 
-    # Maia-3 ------------------------------------------------------------------
+    @staticmethod
+    def _name(model, spec) -> str:
+        return getattr(model, "name", None) or (spec if isinstance(spec, str) else type(model).__name__)
 
-    def _get_maia(self):
-        if self._maia is None:
+    def _get_move(self):
+        if self._move is None:
             t = time.perf_counter()
-            import torch
-            from tnh.models.maia3 import Maia3
-            torch.set_num_threads(self.torch_threads)
-            self._maia = Maia3(self.maia_size, device=self.device, batch_size=1, local_files_only=True)
-            self.load_s["maia"] = time.perf_counter() - t
-        return self._maia
+            self._move = load_move_model(self._move_spec)
+            self.load_s["move_model"] = time.perf_counter() - t
+        return self._move
 
-    def maia(self, fen: str, moves: list[str], white_elo: int, black_elo: int) -> dict:
-        """Maia-3 for the side to move. `white_elo` and `black_elo` are FIDE ratings; the
-        network gets `maia_elo` of each."""
-        from tnh.models.maia3 import Elo
+    def _get_value(self):
+        if self._value is None:
+            t = time.perf_counter()
+            self._value = load_value_model(self._value_spec)
+            self.load_s["value_model"] = time.perf_counter() - t
+        return self._value
+
+    def move_probs(self, fen: str, moves: list[str], white: int, black: int) -> dict:
+        """Model 1 for the side to move: {uci: probability} over the legal moves."""
         board = _board(fen, moves)
-        mover_fide, opp_fide = (white_elo, black_elo) if board.turn == chess.WHITE else (black_elo, white_elo)
-        mover, opp = maia_elo(mover_fide), maia_elo(opp_fide)
-        # Maia sees the last 8 positions, so the key is the position plus the last 7 moves.
-        key = (position_key(board), tuple(moves[-7:]), len(moves) < 7, mover, opp)
-        hit = self._maia_cache.get(key)
+        q = query(board, moves, white, black)
+        key = _key(q)
+        hit = self._move_cache.get(key)
         if hit is not None:
             return {**hit, "cached": True}
-        with self._maia_lock:
-            model = self._get_maia()
+        with self._move_lock:
+            model = self._get_move()
             t = time.perf_counter()
-            q = Query(board.fen(), list(moves), mover, opp)
-            pred = model.predict_many([q], [Elo.fixed(mover, opp)])[0][0]
+            pred = model.predict([q])[0]
             ms = (time.perf_counter() - t) * 1000
+            self.counts["move_queries"] += 1
         p = np.exp(pred.logp.astype(np.float64))
-        win, draw, loss = pred.wdl
-        out = {
-            "model": f"Maia-3 {self.maia_size}, blitz scale",
-            "mover_fide": mover_fide, "opp_fide": opp_fide, "mover_maia": mover, "opp_maia": opp,
-            "history": len(moves),
-            "moves": {m: float(x) for m, x in zip(pred.moves, p)},
-            "wdl": [win, draw, loss],
-            "ms": ms,
-        }
-        self._maia_cache.put(key, out)
+        out = {"model": self._name(model, self._move_spec), "moves": {m: float(x) for m, x in zip(pred.moves, p)},
+               "ms": ms}
+        self._move_cache.put(key, out)
         return {**out, "cached": False}
+
+    def values(self, queries: list[Query], cancelled: Callable[[], bool] = lambda: False) -> list[tuple]:
+        """Model 2: (win, draw, loss) for the mover of each query. Cached ones are not asked
+        again; finished games are scored by their result; the rest go in batches of
+        `VALUE_BATCH`, checking `cancelled` between batches (then `Superseded`)."""
+        out: list[tuple | None] = [None] * len(queries)
+        todo = []
+        for i, q in enumerate(queries):
+            t = terminal_wdl(chess.Board(q.fen))
+            if t is not None:
+                out[i] = t
+                self.counts["value_terminal"] += 1
+                continue
+            hit = self._value_cache.get(_key(q))
+            if hit is not None:
+                out[i] = hit
+                self.counts["value_cached"] += 1
+            else:
+                todo.append(i)
+        if todo:
+            with self._value_lock:
+                model = self._get_value()
+                for start in range(0, len(todo), VALUE_BATCH):
+                    if cancelled():
+                        raise Superseded(f"{len(todo) - start} of {len(todo)} values not computed")
+                    idx = todo[start:start + VALUE_BATCH]
+                    # Another request may have filled some while this one waited for the lock.
+                    need = [i for i in idx if self._value_cache.get(_key(queries[i])) is None]
+                    if need:
+                        w = np.asarray(model.wdl([queries[i] for i in need]), dtype=np.float64)
+                        self.counts["value_queries"] += len(need)
+                        for i, row in zip(need, w):
+                            self._value_cache.put(_key(queries[i]), tuple(float(x) for x in row))
+                    for i in idx:
+                        out[i] = self._value_cache.get(_key(queries[i]))
+        return out
+
+    def value_name(self) -> str:
+        return self._name(self._value, self._value_spec) if self._value is not None else str(self._value_spec)
 
     # Stockfish ------------------------------------------------------------------
 
@@ -169,19 +281,27 @@ class Hub:
         return {**out, "cached": False}
 
     def status(self) -> dict:
-        return {"maia_loaded": self._maia is not None, "stockfish_loaded": self._sf is not None,
-                "maia_size": self.maia_size, "device": self.device, "load_s": self.load_s}
+        return {"move_model": self._name(self._move, self._move_spec) if self._move else str(self._move_spec),
+                "value_model": self.value_name(),
+                "move_loaded": self._move is not None, "value_loaded": self._value is not None,
+                "stockfish_loaded": self._sf is not None, "load_s": self.load_s, "counts": self.counts}
 
     def close(self) -> None:
         if self._sf is not None:
             self._sf.close()
             self._sf = None
+        for m in (self._move, self._value):
+            if m is not None and callable(getattr(m, "close", None)):
+                m.close()
 
 
 class NoModels:
     """The hub when the server runs with --no-models: every model call is refused."""
 
-    def maia(self, fen, moves, white_elo, black_elo):
+    def move_probs(self, fen, moves, white, black):
+        raise ModelsOff("models are off (--no-models)")
+
+    def values(self, queries, cancelled=lambda: False):
         raise ModelsOff("models are off (--no-models)")
 
     def engine(self, fen, moves, nodes):
@@ -192,7 +312,3 @@ class NoModels:
 
     def close(self) -> None:
         pass
-
-
-class ModelsOff(RuntimeError):
-    pass

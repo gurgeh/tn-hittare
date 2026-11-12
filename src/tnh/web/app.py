@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -14,11 +15,14 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from tnh.web.models import ModelHub, ModelsOff
-from tnh.web.stats import TEMPI, Filters, Stats, TrendRule, report
+from tnh.web.models import ModelHub, ModelsOff, Superseded, _LRU, query
+from tnh.web.models import _board as _models_board
+from tnh.web.stats import TEMPI, Filters, Shrink, Stats, TrendRule, model_table, report
 
 STATIC = Path(__file__).parent / "static"
 MAX_ENGINE_NODES = 5_000_000
+API_VERSION = 3      # the page checks it: an older server lacks /api/model and the Elo deltas
+P_LIST = 0.01        # model 1's moves at or above this probability are listed beside the database's
 
 
 def _filters(y0: int | None, y1: int | None, e0: int | None, e1: int | None, tempo: str | None) -> Filters:
@@ -81,7 +85,16 @@ def piece_sprite(tile: int = 40) -> str:
             + "\n".join(parts) + "\n</svg>\n")
 
 
-def create_app(stats: Stats, hub: ModelHub, *, trend_rule: TrendRule = TrendRule()) -> FastAPI:
+def _board_with(fen: str, moves: list[str]) -> chess.Board:
+    """The board after `moves` from the start (with its history), or the FEN alone."""
+    try:
+        return _models_board(fen, moves)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+def create_app(stats: Stats, hub: ModelHub, *, trend_rule: TrendRule = TrendRule(),
+               shrink: Shrink = Shrink()) -> FastAPI:
     app = FastAPI(title="tn-hittare", docs_url=None, redoc_url=None, openapi_url=None)
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
@@ -97,9 +110,22 @@ def create_app(stats: Stats, hub: ModelHub, *, trend_rule: TrendRule = TrendRule
 
     @app.get("/api/info")
     def info():
-        return {"stats": stats.info(), "models": hub.status(), "tempi": list(TEMPI),
+        return {"api": API_VERSION, "stats": stats.info(), "models": hub.status(), "tempi": list(TEMPI),
+                "p_list": P_LIST,
+                "shrink": {"kappa": shrink.kappa, "kappa_v": shrink.kappa_v, "k_elo": shrink.k_elo},
                 "trend": {"recent_years": trend_rule.recent_years, "alpha": trend_rule.alpha,
                           "min_games": trend_rule.min_games}}
+
+    reports = _LRU(2000)
+    gen, gen_lock = {"n": 0}, threading.Lock()
+
+    def cached_report(board: chess.Board, f: Filters) -> dict:
+        key = (board.epd(), f)
+        hit = reports.get(key)
+        if hit is None:
+            hit = report(stats, board, f, trend_rule, shrink)
+            reports.put(key, hit)
+        return hit
 
     @app.get("/api/stats")
     def position_stats(fen: str, y0: int | None = None, y1: int | None = None, e0: int | None = None,
@@ -107,18 +133,57 @@ def create_app(stats: Stats, hub: ModelHub, *, trend_rule: TrendRule = TrendRule
         board = _board(fen)
         f = _filters(y0, y1, e0, e1, tempo)
         t = time.perf_counter()
-        out = report(stats, board, f, trend_rule)
+        out = dict(cached_report(board, f))
         out["ms"] = (time.perf_counter() - t) * 1000
         return out
 
-    @app.get("/api/maia")
-    def maia(fen: str, moves: str = "", white: int = Query(2200, ge=0, le=4000),
-             black: int = Query(2200, ge=0, le=4000)):
-        _board(fen)
+    @app.get("/api/model")
+    def model_columns(fen: str, moves: str = "", white: int = Query(2200, ge=0, le=4000),
+                      black: int = Query(2200, ge=0, le=4000), y0: int | None = None, y1: int | None = None,
+                      e0: int | None = None, e1: int | None = None, tempo: str | None = None):
+        """The model columns of the move table: model 1 for the side to move, model 2 for the
+        position and each listed move (the database's moves under the filters and model 1's
+        moves of at least `P_LIST`), mixed with the database. A newer call supersedes this one
+        between model-2 batches (409); what was computed stays cached."""
+        board = _board(fen)
+        mv = _moves(moves)
+        f = _filters(y0, y1, e0, e1, tempo)
+        with gen_lock:
+            gen["n"] += 1
+            mine = gen["n"]
+        t0 = time.perf_counter()
+        rep = cached_report(board, f)
+        if board.is_game_over():
+            raise HTTPException(400, "game over in this position")
         try:
-            return hub.maia(fen, _moves(moves), white, black)
+            probs = hub.move_probs(fen, mv, white, black)
+            t1 = time.perf_counter()
+            listed = sorted({m["uci"] for m in rep["moves"]} | {u for u, p in probs["moves"].items() if p >= P_LIST})
+            mboard = _board_with(fen, mv)
+            queries = [query(mboard, mv, white, black)]
+            for u in listed:
+                child = mboard.copy(stack=False)
+                child.push_uci(u)
+                queries.append(query(child, mv + [u] if mv else [], white, black))
+            before = dict(hub.status().get("counts", {}))
+            vals = hub.values(queries, cancelled=lambda: gen["n"] != mine)
+            after = hub.status().get("counts", {})
         except ValueError as e:
             raise HTTPException(400, str(e)) from e
+        except Superseded as e:
+            raise HTTPException(409, f"superseded by a newer request: {e}") from e
+        t2 = time.perf_counter()
+        out = model_table(rep, probs["moves"], vals[0], dict(zip(listed, vals[1:])),
+                          board.turn == chess.BLACK, shrink)
+        out |= {
+            "move_model": probs["model"], "value_model": hub.status().get("value_model"),
+            "white": white, "black": black, "listed": listed, "shrink": rep["shrink"],
+            "cost": {"move_model_ms": probs["ms"] if not probs["cached"] else 0.0, "move_model_cached": probs["cached"],
+                     "value_queries": len(queries),
+                     "value_computed": after.get("value_queries", 0) - before.get("value_queries", 0),
+                     "value_ms": (t2 - t1) * 1000, "total_ms": (t2 - t0) * 1000},
+        }
+        return out
 
     @app.get("/api/engine")
     def engine(fen: str, moves: str = "", nodes: int = Query(200_000, ge=1000, le=MAX_ENGINE_NODES)):

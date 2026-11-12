@@ -54,36 +54,32 @@ def write_tables(corpus: Path, name: str = "dev") -> None:
         df.write_parquet(corpus / f"{t}{suffix}.parquet", row_group_size=4, statistics=True)
 
 
-class FakeHub:
-    """Deterministic stand-in for the models: uniform over the legal moves, fixed values."""
+class RecordingValue:
+    """`FakeValue` that records the size of each batch it is asked for."""
 
     def __init__(self) -> None:
-        self.calls: list[tuple] = []
+        from tnh.web.fakes import FakeValue
+        self.inner = FakeValue()
+        self.name = "fake-value"
+        self.batches: list[int] = []
 
-    def maia(self, fen, moves, white_elo, black_elo):
-        import chess
-        from tnh.web.models import _board
-        board = _board(fen, moves)
-        self.calls.append(("maia", fen, tuple(moves), white_elo, black_elo))
-        legal = [m.uci() for m in board.legal_moves]
-        p = Prediction(legal, np.full(len(legal), -np.log(len(legal)), np.float32), (0.4, 0.3, 0.3))
-        from tnh.web.models import maia_elo
-        mover = white_elo if board.turn == chess.WHITE else black_elo
-        opp = black_elo if board.turn == chess.WHITE else white_elo
-        return {"model": "fake", "mover_fide": mover, "opp_fide": opp, "mover_maia": maia_elo(mover),
-                "opp_maia": maia_elo(opp), "history": len(moves),
-                "moves": {m: float(np.exp(x)) for m, x in zip(p.moves, p.logp)}, "wdl": list(p.wdl), "ms": 0.0}
+    def wdl(self, queries):
+        self.batches.append(len(queries))
+        return self.inner.wdl(queries)
 
-    def engine(self, fen, moves, nodes):
-        from tnh.web.models import _board
-        board = _board(fen, moves)
-        self.calls.append(("engine", fen, tuple(moves), nodes))
-        legal = [m.uci() for m in board.legal_moves]
-        mv = MoveValues(legal, np.linspace(0.6, 0.4, len(legal)).astype(np.float32),
-                        np.linspace(50, -50, len(legal)).astype(np.float32), np.zeros(len(legal), np.int16), None)
-        return {"model": "fake engine", "nodes": nodes, "ms": 0.0, "wdl": None,
-                "moves": {m: {"value": float(v), "cp": float(c), "mate": 0}
-                          for m, v, c in zip(mv.moves, mv.value, mv.cp)}}
 
-    def status(self):
-        return {"fake": True}
+def fake_hub():
+    """The real `Hub` over the fake models, with a fixed stand-in for Stockfish."""
+    from tnh.web.fakes import FakeMoveModel
+    from tnh.web.models import Hub, _board
+
+    class TestHub(Hub):
+        def engine(self, fen, moves, nodes):
+            board = _board(fen, moves)
+            legal = [m.uci() for m in board.legal_moves]
+            vals = np.linspace(0.6, 0.4, len(legal))
+            return {"model": "fake engine", "nodes": nodes, "ms": 0.0, "wdl": None,
+                    "moves": {m: {"value": float(v), "cp": float(100 * (v - 0.5)), "mate": 0}
+                              for m, v in zip(legal, vals)}}
+
+    return TestHub(FakeMoveModel(), RecordingValue())

@@ -1,6 +1,6 @@
 """Serve the interface on 127.0.0.1.
 
-    uv run python -m tnh.web [--port 8765] [--table full|dev] [--maia-size 5m]
+    uv run python -m tnh.web [--port 8765] [--table full|dev] [--move-model combo-p0.5] [--value-model frontier]
 
 The position statistics come from `tnh.data.edges.EdgeDB` by table name: `--table`, else
 $TNH_WEB_TABLE, else `full` when `corpus/edges.parquet`, `pos_index.parquet` and
@@ -29,10 +29,11 @@ def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="python -m tnh.web", description=__doc__.split("\n\n")[0])
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--table", default=None, help="EdgeDB table name: full or dev (default: full if it exists)")
-    ap.add_argument("--maia-size", default="5m", choices=["5m", "23m", "79m"])
-    ap.add_argument("--device", default="cpu")
-    ap.add_argument("--torch-threads", type=int, default=2)
-    ap.add_argument("--no-models", action="store_true", help="no Maia and no engine (for a busy machine)")
+    ap.add_argument("--move-model", default="combo-p0.5",
+                    help="model 1: combo-p0.5, combo, fake, or import:module:Name (any MoveModel)")
+    ap.add_argument("--value-model", default="frontier",
+                    help="model 2: frontier, fake, or import:module:Name (any object with .wdl(queries))")
+    ap.add_argument("--no-models", action="store_true", help="the database alone: no models and no engine")
     args = ap.parse_args(argv)
 
     with socket.socket() as s:
@@ -46,7 +47,7 @@ def main(argv: list[str] | None = None) -> None:
     info = stats.info()
     print(f"table {info['table']} ({info['why']}): {info['games']} games, years {info['year_min']}-{info['year_max']}, "
           f"opened in {time.perf_counter() - t:.2f}s", file=sys.stderr)
-    hub = NoModels() if args.no_models else Hub(maia_size=args.maia_size, device=args.device, torch_threads=args.torch_threads)
+    hub = NoModels() if args.no_models else Hub(args.move_model, args.value_model)
     app = create_app(stats, hub)
     print(f"tn-hittare: http://{HOST}:{args.port}/", file=sys.stderr)
     try:
