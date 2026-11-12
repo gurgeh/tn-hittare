@@ -24,7 +24,6 @@ import chess
 import polars as pl
 
 from tnh.data.edges import EdgeDB, pos_hash
-from tnh.web import edgefix
 
 TEMPI = ("classical", "rapid", "blitz", "unknown")
 YEAR_MAX = 32767
@@ -61,7 +60,6 @@ def open_stats(flag: str | None = None, directory: Path | None = None) -> "Stats
     if missing:
         raise SystemExit(f"table {name!r} ({why}) is missing: {', '.join(missing)}")
     db = EdgeDB(name=name, directory=directory)
-    edgefix.patch(db)
     built = max(p.stat().st_mtime for p in table_files(name, directory))
     return Stats(db, name, why=why, built=datetime.fromtimestamp(built).isoformat(timespec="minutes"))
 
@@ -72,14 +70,10 @@ class Stats:
     def __init__(self, db: EdgeDB, name: str, *, why: str = "", built: str | None = None) -> None:
         self.db = db
         self.name = name
-        root = db.panel(chess.Board())
-        years = root["by_year"].filter(pl.col("year") > 0)["year"] if root["by_year"].height else pl.Series([], dtype=pl.Int16)
-        # Every game starts from the initial position, so its count is the table's game count.
+        summary = db.summary()
         self._info = {
             "table": name, "why": why, "built": built,
-            "games": root["total"]["n"] if root["total"] else 0,
-            "year_min": int(years.min()) if years.len() else None,
-            "year_max": int(years.max()) if years.len() else None,
+            "games": summary["games"], "year_min": summary["first_year"], "year_max": summary["last_year"],
         }
 
     def info(self) -> dict:

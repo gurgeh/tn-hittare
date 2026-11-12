@@ -132,23 +132,26 @@ def test_table_choice(tmp_path, monkeypatch):
         open_stats("nosuch", tmp_path)
 
 
-def _played_at_start(db) -> int:
+def test_counts_of_positions_that_straddle_row_groups(tmp_path):
+    """The page's move counts equal a plain filter of the edges table, for every position,
+    including those whose rows the four-row groups split (EdgeDB read only the last
+    group of such a position before 0373543)."""
     import chess
-    return int(db.panel(chess.Board())["moves"]["n"].sum())
+    import polars as pl
+    from _webfix import tables
+    from tnh.web.stats import Filters, open_stats, report
 
-
-@pytest.mark.xfail(strict=True, reason="EdgeDB drops rows of a position that straddles row groups; "
-                   "when this passes, delete tnh/web/edgefix.py")
-def test_edgedb_reads_a_position_across_row_groups(tmp_path):
-    from tnh.data.edges import EdgeDB
     write_tables(tmp_path, "dev")
-    assert _played_at_start(EdgeDB(name="dev", directory=tmp_path)) == 8
+    edges, index, _ = tables()
+    edges = edges.with_row_index("i")
+    spans = edges.group_by("pos_hash").agg((pl.col("i").min() // 4).alias("g0"), (pl.col("i").max() // 4).alias("g1"))
+    straddling = set(spans.filter(pl.col("g0") != pl.col("g1"))["pos_hash"].to_list())
+    assert straddling, "the fixture should have positions split across row groups"
 
-
-def test_edgefix_reads_a_position_across_row_groups(tmp_path):
-    from tnh.data.edges import EdgeDB
-    from tnh.web import edgefix
-    write_tables(tmp_path, "dev")
-    db = EdgeDB(name="dev", directory=tmp_path)
-    assert edgefix.patch(db) == 3
-    assert _played_at_start(db) == 8
+    st = open_stats("dev", tmp_path)
+    for h, epd in index.select("pos_hash", "epd").iter_rows():
+        board = chess.Board()
+        board.set_epd(epd)
+        want = dict(edges.filter(pl.col("pos_hash") == h).group_by("move").agg(pl.col("n").sum()).iter_rows())
+        got = {m["uci"]: m["n"] for m in report(st, board, Filters())["moves"]}
+        assert got == want, (epd, h in straddling)
