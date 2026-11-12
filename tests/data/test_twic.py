@@ -152,3 +152,28 @@ def test_9lx_is_a_variant():
     assert twic_drop({"Event": "Champ Showdown 9LX Blitz", "Site": "Saint Louis USA"}) == "variant"
     assert twic_drop({"Event": "Chess9LX Showdown", "Site": "Saint Louis USA"}) == "variant"
     assert twic_drop({"Event": "Champions Showdown", "Site": "Saint Louis USA"}) is None
+
+
+def test_build_on_files_matches_assemble_in_memory(tmp_path, monkeypatch):
+    """parse.build keeps the wide rows on disk; it must give what assemble gives in memory."""
+    import dataclasses
+    import json
+
+    import tnh.data.parse as parse_mod
+
+    lb_src = dataclasses.replace(SOURCES["lichess_broadcast"], files=lambda: [FIX / "broadcasts.pgn"])
+    tw_src = dataclasses.replace(SOURCES["twic"], files=lambda: [FIX / "twic_sample.pgn"])
+    monkeypatch.setattr(parse_mod, "SOURCES", {"lichess_broadcast": lb_src, "twic": tw_src})
+    monkeypatch.setattr(parse_mod, "CORPUS", tmp_path / "corpus")
+    monkeypatch.setattr(parse_mod, "DATA_ROOT", tmp_path)
+    parse_mod.build(["lichess_broadcast", "twic"], workers=1, limit_files=None)
+    games = pl.read_parquet(tmp_path / "corpus" / "games.parquet").sort("game_id")
+    extra = pl.read_parquet(tmp_path / "corpus" / "games_extra.parquet").sort("game_id")
+    lb, _, _ = parse_texts(iter_file_games(FIX / "broadcasts.pgn"), SOURCES["lichess_broadcast"], "broadcasts.pgn")
+    tw, _, _ = parse_texts(iter_file_games(FIX / "twic_sample.pgn"), SOURCES["twic"], "twic_sample.pgn")
+    g2, e2, _, _ = assemble(pl.concat([lb, tw]))
+    assert games.equals(g2.sort("game_id"))
+    assert extra.equals(e2.sort("game_id"))
+    stats = json.loads((tmp_path / "corpus" / "parse_stats.json").read_text())
+    assert stats["games_kept"] == len(games)
+    assert not (tmp_path / "scratch" / "parse" / "parts").exists()
