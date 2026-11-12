@@ -27,6 +27,7 @@ const state = {
     filters: {y0: "", y1: "", e0: "", e1: "", tempi: CHOICES.defaultTempi},
     white: 2200, black: 2200,
     showAll: false,
+    line: {name: null, clean: null},   // the saved line the tree was loaded or saved as, and the tree's JSON then
     sort: {key: "n", desc: true},
     cursor: null,     // uci of the highlighted row
     stats: null, model: null,
@@ -54,7 +55,9 @@ function readUrl() {
     if (p.get("o") === "b") state.orientation = COLOR.black
     try {
         const rootFen = p.get("fen") || START_FEN
-        state.tree = restoreTree(rootFen) || new MoveTree(rootFen)
+        const kept = restoreTree(rootFen)
+        state.tree = kept ? kept.tree : new MoveTree(rootFen)
+        if (kept && kept.line) state.line = kept.line
     } catch (e) {
         status("bad FEN in URL: " + e.message, true)
         state.tree = new MoveTree()
@@ -85,7 +88,9 @@ function writeUrl() {
 // The move tree with its comments is kept per browser (localStorage) across reloads. The URL
 // stays the authority for the position: the stored tree is restored when its root is the URL's
 // root, and the URL's moves are then played into it (followed where the tree has them, a new
-// variation where it does not). Loading another PGN or FEN replaces it.
+// variation where it does not). Loading another PGN, FEN or saved line replaces it. It also
+// keeps which saved line the tree is and the tree as saved, so "unsaved changes" survives a
+// reload.
 
 const TREE_STORE = "tnh.tree"
 let treeStoreFailed = false
@@ -108,7 +113,8 @@ function restoreTree(rootFen) {
     }
     if (!d || d.root_fen !== rootFen) return null
     try {
-        return MoveTree.fromPgn(d)
+        const line = d.line && typeof d.line === "object" ? {name: d.line.name ?? null, clean: d.line.clean ?? null} : null
+        return {tree: MoveTree.fromPgn(d), line}
     } catch (e) {
         status("the stored move tree could not be rebuilt; it is replaced: " + e.message, true)
         return null
@@ -117,11 +123,12 @@ function restoreTree(rootFen) {
 
 function saveTree() {
     try {
-        localStorage.setItem(TREE_STORE, JSON.stringify(state.tree.toJson()))
+        localStorage.setItem(TREE_STORE, JSON.stringify({...state.tree.toJson(), line: state.line}))
     } catch (e) {     // private window, blocked storage or a full quota: say so once
         if (!treeStoreFailed) status("the move tree is not kept across a reload: " + e.message, true)
         treeStoreFailed = true
     }
+    renderLineState()
 }
 
 // ---------------------------------------------------------------- formatting
@@ -798,11 +805,13 @@ async function loadText(text) {
             const defaults = ["", "w", "-", "-", "0", "1"]
             while (fen.length < 6) fen.push(defaults[fen.length])
             state.tree = new MoveTree(fen.join(" "))
+            newLine()
         } else {
             const r = await fetch("/api/pgn", {method: "POST", headers: {"Content-Type": "text/plain"}, body: text})
             const d = await r.json()
             if (!r.ok) throw new Error(d.detail || r.status)
             state.tree = MoveTree.fromPgn(d)
+            newLine()
             state.tree.end()
             commentsLost = !("comment" in d)
         }
@@ -949,9 +958,10 @@ async function main() {
     }
     initControls()
     initComments()
+    initLines()
     initBoard()
     initEngine()
-    window.tnh = {state, play, command, render, CHOICES, engineGo, tableBuilds: () => tableBuilds, pgn: treePgn}   // for the end-to-end test and the console
+    window.tnh = {state, play, command, render, CHOICES, engineGo, tableBuilds: () => tableBuilds, pgn: treePgn, lineDirty}   // for the end-to-end test and the console
     update()
 }
 
@@ -1350,4 +1360,166 @@ function bestmoveValue(p) {
     const r = state.eng.snap && state.eng.snap.root
     const next = r && r.depth_in_progress != null ? r.depth_in_progress : p.depth + 1
     return p.white_in_progress != null ? `${fin} · <span class="dim">${(100 * p.white_in_progress).toFixed(1)}% (d${next}…)</span>` : fin
+}
+
+// ---------------------------------------------------------------- saved lines
+// The whole tree, variations and comments, saved on the server as a PGN file under a name
+// (tnh.web.lines). The tree in localStorage stays the working copy between saves. Whether the
+// tree has unsaved changes is a comparison of its JSON with the JSON it had when it was saved
+// or loaded, so undoing a change undoes "unsaved" too.
+
+const treeJson = () => JSON.stringify(state.tree.toJson())
+
+function lineDirty() {
+    if (state.line.clean != null) return treeJson() !== state.line.clean
+    const r = state.tree.root      // never saved: anything in it is unsaved
+    return r.children.length > 0 || !!r.comment
+}
+
+// A tree that is no saved line (a pasted PGN or FEN).
+function newLine() {
+    state.line = {name: null, clean: null}
+    $("linename").value = ""
+}
+
+function renderLineState() {
+    const el = $("linestate"), dirty = lineDirty(), n = state.line.name
+    const text = n ? `line "${n}": ${dirty ? "unsaved changes" : "saved"}` : dirty ? "not saved as a line" : ""
+    if (el.textContent !== text) el.textContent = text
+    el.classList.toggle("warn", dirty)
+}
+
+async function linesApi(method, url, body) {
+    const opt = {method}
+    if (body) {
+        opt.headers = {"Content-Type": "application/json"}
+        opt.body = JSON.stringify(body)
+    }
+    const r = await fetch(url, opt)
+    const d = await r.json()
+    if (!r.ok) {
+        const det = d.detail
+        const msg = det && typeof det === "object" ? det.message
+            : det === "Not Found" ? "the server is older than this page: restart it" : det || String(r.status)
+        const e = new Error(msg)
+        e.code = det && typeof det === "object" ? det.code : null
+        throw e
+    }
+    return d
+}
+
+let savedLines = []     // the server's list, as last fetched
+
+async function refreshLines(select = null) {
+    let d
+    try {
+        d = await linesApi("GET", "/api/lines")
+    } catch (e) {
+        status("saved lines: " + e.message, true)
+        return
+    }
+    savedLines = d.lines
+    const el = $("linelist")
+    el.title = "Saved lines, in " + d.dir
+    el.innerHTML = `<option value="">${d.lines.length ? `saved lines (${d.lines.length})` : "no saved lines"}</option>` +
+        d.lines.map(l => {
+            const tip = `saved ${l.saved} · ${l.file}` + (l.error ? ` · ${l.error}` : "")
+            const what = l.plies == null ? " · unreadable" : ` · ${l.plies} plies` + (l.preview ? ` · ${l.preview}` : "")
+            return `<option value="${esc(l.name)}" title="${esc(tip)}">${esc(l.name + what)}</option>`
+        }).join("")
+    const want = select ?? state.line.name
+    el.value = want && d.lines.some(l => l.name === want) ? want : ""
+}
+
+async function saveLine() {
+    const name = $("linename").value.trim()
+    if (!name) {
+        status("save: give the line a name", true)
+        $("linename").focus()
+        return
+    }
+    const tree = state.tree.toJson()
+    const sent = JSON.stringify(tree)
+    const ask = () => {
+        const yes = confirm(`A saved line named "${name}" exists. Overwrite it with the tree shown?`)
+        if (!yes) status(`not saved: "${name}" exists`)
+        return yes
+    }
+    // Asked before the request when the list has the name; the server refuses an overwrite
+    // that was not asked for, so a list that is out of date still gets the question.
+    const known = savedLines.some(l => l.name === name)
+    if (known && !ask()) return
+    try {
+        let d
+        try {
+            d = await linesApi("POST", "/api/lines/save", {...tree, name, overwrite: known})
+        } catch (e) {
+            if (e.code !== "exists") throw e
+            if (!ask()) return
+            d = await linesApi("POST", "/api/lines/save", {...tree, name, overwrite: true})
+        }
+        // what was saved, unless the tree changed while the request ran
+        state.line = {name, clean: sent}
+        $("linename").value = name
+        saveTree()
+        status(`saved "${name}" as ${d.file}`)
+        refreshLines(name)
+    } catch (e) {
+        status("save: " + e.message, true)
+    }
+}
+
+async function loadLine() {
+    const name = $("linelist").value
+    if (!name) {
+        status("load: choose a saved line", true)
+        return
+    }
+    if (lineDirty()) {
+        const what = state.line.name ? `"${state.line.name}" has unsaved changes` : "The tree shown is not saved as a line"
+        if (!confirm(`${what}. Replace it with "${name}"?`)) return
+    }
+    try {
+        const d = await linesApi("GET", "/api/lines/load?name=" + encodeURIComponent(name))
+        state.tree = MoveTree.fromPgn(d)
+        state.line = {name, clean: treeJson()}
+        $("linename").value = name
+        update()
+        status(`loaded "${name}"`)
+    } catch (e) {
+        status("load: " + e.message, true)
+    }
+}
+
+async function deleteLine() {
+    const name = $("linelist").value
+    if (!name) {
+        status("delete: choose a saved line", true)
+        return
+    }
+    if (!confirm(`Delete the saved line "${name}"? Its file on the server is removed.`)) return
+    try {
+        await linesApi("DELETE", "/api/lines?name=" + encodeURIComponent(name))
+    } catch (e) {
+        status("delete: " + e.message, true)
+        return
+    }
+    if (state.line.name === name) {      // the tree shown stays, as a tree not saved
+        state.line = {name: null, clean: null}
+        saveTree()
+    }
+    status(`deleted "${name}"`)
+    refreshLines()
+}
+
+function initLines() {
+    $("linename").value = state.line.name || ""
+    $("linesave").addEventListener("click", saveLine)
+    $("lineload").addEventListener("click", loadLine)
+    $("linedel").addEventListener("click", deleteLine)
+    $("linename").addEventListener("keydown", e => {
+        if (e.key === "Enter") { e.preventDefault(); saveLine() }
+        else if (e.key === "Escape") { e.preventDefault(); $("board").focus({preventScroll: true}) }
+    })
+    refreshLines()
 }

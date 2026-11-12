@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import io
 import os
 import re
 import threading
@@ -11,7 +10,6 @@ import time
 from pathlib import Path
 
 import chess
-import chess.pgn
 import chess.svg
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -19,6 +17,8 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
 from tnh.web.engine import EngineError, EngineManager, lc0_from_ratings
+from tnh.web.lines import LineError, LineStore
+from tnh.web.pgn import parse_pgn, tree_pgn
 from tnh.web.models import ModelHub, ModelsOff, Superseded, _LRU, query
 from tnh.web.models import _board as _models_board
 from tnh.web.stats import TEMPI, Filters, Shrink, Stats, TrendRule, model_table, report
@@ -57,72 +57,10 @@ def _moves(moves: str) -> list[str]:
 
 
 def _pgn_tree(text: str) -> dict:
-    """A PGN (first game) as {root_fen, comment, tree, headers}: nodes {uci, san, comment, pre,
-    children} with variations. `comment` is the text after the move, `pre` the comment that opens
-    a variation before its first move, the top-level `comment` the one before the first move.
-    Comments are kept as text: NAGs and [%...] commands inside them are not interpreted."""
-    game = chess.pgn.read_game(io.StringIO(text))
-    if game is None:
-        raise HTTPException(400, "no game in the PGN")
-    if game.errors:
-        raise HTTPException(400, "PGN errors: " + "; ".join(str(e) for e in game.errors[:5]))
-
-    def walk(node: chess.pgn.GameNode) -> list[dict]:
-        out = []
-        for child in node.variations:
-            out.append({"uci": child.move.uci(), "san": child.san(), "comment": child.comment,
-                        "pre": child.starting_comment, "children": walk(child)})
-        return out
-
-    root = game.board()
-    return {"root_fen": root.fen(), "comment": game.comment, "tree": walk(game), "headers": dict(game.headers)}
-
-
-def pgn_comment(text: str) -> str:
-    """A comment as PGN can carry it: a closing brace would end the comment early, so it
-    becomes a closing parenthesis."""
-    return text.replace("}", ")").strip()
-
-
-def tree_pgn(body: dict) -> str:
-    """The PGN of a move tree in the form `_pgn_tree` returns ({root_fen, comment, headers,
-    tree}; `san` is not needed), with its variations and comments. Raises ValueError on a bad
-    FEN, a bad node or an illegal move."""
-    if not isinstance(body, dict):
-        raise ValueError("expected a JSON object")
-    fen = body.get("root_fen") or chess.STARTING_FEN
     try:
-        board = chess.Board(fen)
+        return parse_pgn(text)
     except ValueError as e:
-        raise ValueError(f"bad FEN: {e}") from e
-    game = chess.pgn.Game()
-    for k, v in (body.get("headers") or {}).items():
-        if k not in ("FEN", "SetUp"):
-            game.headers[str(k)] = str(v)
-    if board.fen() != chess.STARTING_FEN:
-        game.setup(board)
-    game.comment = pgn_comment(str(body.get("comment") or ""))
-
-    def add(node: chess.pgn.GameNode, board: chess.Board, items) -> None:
-        if not isinstance(items, list):
-            raise ValueError("children must be a list")
-        for it in items:
-            if not isinstance(it, dict) or not isinstance(it.get("uci"), str):
-                raise ValueError(f"bad node: {it!r}"[:200])
-            try:
-                move = chess.Move.from_uci(it["uci"])
-            except ValueError as e:
-                raise ValueError(f"bad move {it['uci']!r}") from e
-            if not board.is_legal(move):
-                raise ValueError(f"illegal move {it['uci']} in {board.fen()}")
-            child = node.add_variation(move, comment=pgn_comment(str(it.get("comment") or "")),
-                                       starting_comment=pgn_comment(str(it.get("pre") or "")))
-            after = board.copy(stack=False)
-            after.push(move)
-            add(child, after, it.get("children") or [])
-
-    add(game, board, body.get("tree") or [])
-    return game.accept(chess.pgn.StringExporter(headers=True, variations=True, comments=True, columns=80))
+        raise HTTPException(400, str(e)) from e
 
 
 def piece_sprite(tile: int = 40) -> str:
@@ -150,7 +88,8 @@ def _board_with(fen: str, moves: list[str]) -> chess.Board:
 
 
 def create_app(stats: Stats, hub: ModelHub, *, trend_rule: TrendRule = TrendRule(),
-               shrink: Shrink = Shrink(), engines: EngineManager | None = None) -> FastAPI:
+               shrink: Shrink = Shrink(), engines: EngineManager | None = None,
+               lines: LineStore | None = None) -> FastAPI:
     @contextlib.asynccontextmanager
     async def lifespan(_app):
         yield
@@ -302,6 +241,52 @@ def create_app(stats: Stats, hub: ModelHub, *, trend_rule: TrendRule = TrendRule
             return {"pgn": tree_pgn(await request.json())}
         except ValueError as e:
             raise HTTPException(400, str(e)) from e
+
+    # Saved lines: the whole tree as one PGN file per name (tnh.web.lines). A refusal answers
+    # {"detail": {"code", "message"}}: 400 invalid, 404 missing, 409 exists or collision.
+    def line_store() -> LineStore:
+        if lines is None:
+            raise HTTPException(404, "no lines directory on this server")
+        return lines
+
+    def refused(e: LineError) -> HTTPException:
+        status = {"invalid": 400, "missing": 404, "exists": 409, "collision": 409}[e.code]
+        return HTTPException(status, {"code": e.code, "message": str(e)})
+
+    @app.get("/api/lines")
+    def lines_list():
+        st = line_store()
+        return {"dir": str(st.root), "lines": st.list()}
+
+    @app.get("/api/lines/load")
+    def lines_load(name: str):
+        try:
+            return line_store().load(name)
+        except LineError as e:
+            raise refused(e) from e
+        except ValueError as e:      # a file edited by hand into something that is not PGN
+            raise HTTPException(400, {"code": "invalid", "message": f"the saved line {name!r}: {e}"}) from e
+
+    @app.post("/api/lines/save")
+    async def lines_save(request: Request):
+        """{name, overwrite, root_fen, comment, headers, tree}: the tree saved under the name."""
+        st = line_store()
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise ValueError("expected a JSON object")
+            return st.save(body.get("name"), body, overwrite=bool(body.get("overwrite")))
+        except LineError as e:
+            raise refused(e) from e
+        except ValueError as e:
+            raise HTTPException(400, {"code": "invalid", "message": str(e)}) from e
+
+    @app.delete("/api/lines")
+    def lines_delete(name: str):
+        try:
+            return line_store().delete(name)
+        except LineError as e:
+            raise refused(e) from e
 
     @app.exception_handler(ModelsOff)
     async def models_off(_request, exc: ModelsOff):

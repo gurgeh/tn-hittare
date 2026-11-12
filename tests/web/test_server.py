@@ -52,7 +52,7 @@ def server(tmp_path_factory):
     env.pop("TNH_WEB_TABLE", None)
     proc = subprocess.Popen(
         [sys.executable, "-m", "tnh.web", "--port", str(port), "--move-model", "fake", "--value-model", "fake",
-         "--preppy-fake"],
+         "--preppy-fake", "--lines-dir", str(data / "lines")],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
     )
     base = f"http://127.0.0.1:{port}"

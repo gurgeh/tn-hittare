@@ -108,6 +108,11 @@ main {
 .var .cmt { opacity: 0.85; }
 #mvbar { display: flex; gap: 4px; }
 #comment { flex: 1; min-width: 0; padding: 1px 5px; }
+#linebar { display: flex; gap: 4px; }
+#linename { flex: 1 1 7em; min-width: 0; padding: 1px 5px; }
+#linelist { flex: 1 1 10em; min-width: 0; }
+#linestate { font-size: 11px; min-height: 1.3em; }
+#linestate.warn { color: var(--warn); }
 #board:focus { outline: none; }
 
 #paste { width: 100%; resize: vertical; padding: 3px 5px; font-family: ui-monospace, monospace; font-size: 11px; }

@@ -35,6 +35,14 @@
       <input id="comment" type="text" spellcheck="false" autocomplete="off" title="The comment on the move shown (c to edit, Enter saves, Escape cancels; empty removes it). It goes into the PGN as {...}">
       <button id="copypgn" title="Copy the whole tree as PGN: variations and comments">copy PGN</button>
     </div>
+    <div id="linebar">
+      <input id="linename" type="text" spellcheck="false" autocomplete="off" placeholder="line name" title="The name to save the whole tree under (Enter saves)">
+      <button id="linesave" title="Save the whole tree, variations and comments, under this name: a PGN file on the server">save</button>
+      <select id="linelist" title="Saved lines"></select>
+      <button id="lineload" title="Load the chosen saved line in place of the tree">load</button>
+      <button id="linedel" title="Delete the chosen saved line (asks first)">×</button>
+    </div>
+    <div id="linestate" class="dim"></div>
     <textarea id="paste" rows="2" spellcheck="false" placeholder="Paste FEN or PGN, Enter to load (/ to focus, Ctrl+V anywhere)"></textarea>
     <div id="fen" class="dim mono" title="FEN of the position shown (click to copy)"></div>
   </section>

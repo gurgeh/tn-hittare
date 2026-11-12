@@ -199,6 +199,130 @@ def check_comments(page) -> None:
     assert comments(page) == gone, comments(page)
 
 
+class Dialogs:
+    """Answers the page's confirm() dialogs from a queue and keeps what they asked."""
+
+    def __init__(self, page):
+        self.answers: list[bool] = []
+        self.asked: list[str] = []
+        page.on("dialog", self.on)
+
+    def on(self, d) -> None:
+        self.asked.append(d.message)
+        (d.accept if self.answers and self.answers.pop(0) else d.dismiss)()
+
+    def wait(self, page, n: int) -> None:
+        for _ in range(100):
+            if len(self.asked) >= n:
+                return
+            page.wait_for_timeout(50)
+        raise AssertionError(f"expected {n} dialogs, saw {self.asked}")
+
+
+def saved_lines(page) -> list[dict]:
+    return page.evaluate("fetch('/api/lines').then(r => r.json()).then(d => d.lines)")
+
+
+def check_lines(page, dialogs: Dialogs) -> None:
+    """Saved lines: save, reload, overwrite prompt, load with the unsaved-changes prompt, delete."""
+    state = page.locator("#linestate")
+    expect(state).to_have_text("not saved as a line")
+    expect(page.locator("#linelist option")).to_have_text(["no saved lines"])
+    before = comments(page)
+    page.locator("#linename").fill("Italian: main")
+    page.locator("#linesave").click()
+    expect(page.locator("#status")).to_contain_text('saved "Italian: main" as italian-main.pgn')
+    expect(state).to_have_text('line "Italian: main": saved')
+    [line] = saved_lines(page)
+    assert line["name"] == "Italian: main" and line["preview"].startswith("1. e4 e5 2. Nf3 Nc6"), line
+    expect(page.locator("#linelist")).to_have_value("Italian: main")
+
+    # a change makes it unsaved; undoing the change makes it saved again; a reload keeps both
+    page.keyboard.press("End")
+    page.wait_for_function("window.tnh.state.tree.current.uci === 'b8c6'")
+    page.evaluate("window.tnh.play('f1c4')")
+    expect(state).to_have_text('line "Italian: main": unsaved changes')
+    page.keyboard.press("Delete")
+    expect(state).to_have_text('line "Italian: main": saved')
+    page.evaluate("window.tnh.play('f1c4')")
+    page.reload()
+    settle(page)
+    expect(state).to_have_text('line "Italian: main": unsaved changes')
+    expect(page.locator("#linename")).to_have_value("Italian: main")
+    assert comments(page) == before, comments(page)
+
+    # saving over the name asks first: no, then yes
+    dialogs.answers[:] = [False]
+    page.locator("#linesave").click()
+    expect(page.locator("#status")).to_contain_text('not saved: "Italian: main" exists')
+    assert "Overwrite" in dialogs.asked[-1], dialogs.asked
+    expect(state).to_have_text('line "Italian: main": unsaved changes')
+    dialogs.answers[:] = [True]
+    page.locator("#linesave").click()
+    expect(state).to_have_text('line "Italian: main": saved')
+    assert len(dialogs.asked) == 2
+    [line] = saved_lines(page)
+    assert line["preview"].startswith("1. e4 e5 2. Nf3 Nc6 3. Bc4"), line
+
+    # a pasted PGN is a new, unsaved tree; save it under another name
+    page.locator("#paste").fill("1. d4 d5 2. c4 {the gambit} *")
+    page.locator("#paste").press("Enter")
+    expect(state).to_have_text("not saved as a line")
+    expect(page.locator("#linename")).to_have_value("")
+    page.locator("#linename").fill("QGD")
+    page.locator("#linename").press("Enter")
+    expect(state).to_have_text('line "QGD": saved')
+    assert [x["name"] for x in saved_lines(page)] == ["Italian: main", "QGD"]
+
+    # loading another line over unsaved changes asks first: no keeps the tree, yes replaces it
+    page.evaluate("window.tnh.play('e7e6')")
+    page.locator("#linelist").select_option("Italian: main")
+    dialogs.answers[:] = [False]
+    n = len(dialogs.asked)
+    page.locator("#lineload").click()
+    dialogs.wait(page, n + 1)
+    expect(state).to_have_text('line "QGD": unsaved changes')
+    assert "unsaved changes" in dialogs.asked[-1] and "Italian: main" in dialogs.asked[-1], dialogs.asked
+    assert page.evaluate("window.tnh.state.tree.current.uci") == "e7e6"
+    dialogs.answers[:] = [True]
+    page.locator("#lineload").click()
+    expect(state).to_have_text('line "Italian: main": saved')
+    expect(page.locator("#linename")).to_have_value("Italian: main")
+    assert comments(page) == before, comments(page)
+    assert page.evaluate("window.tnh.state.tree.current === window.tnh.state.tree.root")
+    # the board follows (its animations run one after another)
+    page.wait_for_function("document.querySelectorAll('#board g[data-square]').length === 32 && "
+                           "document.querySelector(\"#board g[data-square='e2']\") && "
+                           "!document.querySelector(\"#board g[data-square='d4']\")")
+    if SHOTS:
+        page.screenshot(path=f"{SHOTS}/e2e_lines.png")
+    # loading a line with no unsaved changes asks nothing
+    n = len(dialogs.asked)
+    page.locator("#lineload").click()
+    expect(page.locator("#status")).to_contain_text('loaded "Italian: main"')
+    assert len(dialogs.asked) == n
+
+    # delete asks first
+    page.locator("#linelist").select_option("QGD")
+    dialogs.answers[:] = [False]
+    n = len(dialogs.asked)
+    page.locator("#linedel").click()
+    dialogs.wait(page, n + 1)
+    assert "Delete" in dialogs.asked[-1]
+    assert len(saved_lines(page)) == 2
+    dialogs.answers[:] = [True]
+    page.locator("#linedel").click()
+    expect(page.locator("#status")).to_contain_text('deleted "QGD"')
+    assert [x["name"] for x in saved_lines(page)] == ["Italian: main"]
+    expect(page.locator("#linelist option")).to_have_count(2)
+
+    # a reload keeps the loaded line, saved
+    page.reload()
+    settle(page)
+    expect(state).to_have_text('line "Italian: main": saved')
+    expect(page.locator("#linelist")).to_have_value("Italian: main")
+
+
 def main() -> None:
     errors: list[str] = []
     with sync_playwright() as p:
@@ -206,6 +330,7 @@ def main() -> None:
         ctx = browser.new_context(viewport={"width": 1366, "height": 768},
                                   permissions=["clipboard-read", "clipboard-write"])
         page = ctx.new_page()
+        dialogs = Dialogs(page)
         page.on("pageerror", lambda e: errors.append(str(e)))
         page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
 
@@ -276,6 +401,7 @@ def main() -> None:
         assert counts(page) == {"e7e6": 3, "g7g6": 1}, counts(page)
 
         check_comments(page)
+        check_lines(page, dialogs)
 
         # the controls that are gone, and the engine section that replaces them
         for gone in ("#nodes", "#run", "#repline", "#replines", "#stubs"):

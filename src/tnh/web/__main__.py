@@ -1,6 +1,6 @@
 """Serve the interface on 127.0.0.1.
 
-    uv run python -m tnh.web [--port 8765] [--table full|dev] [--move-model policy-trees] [--value-model frontier]
+    uv run python -m tnh.web [--port 8765] [--table full|dev] [--move-model policy-trees] [--value-model frontier] [--lines-dir DIR]
 
 The position statistics come from `tnh.data.edges.EdgeDB` by table name: `--table`, else
 $TNH_WEB_TABLE, else `full` when `corpus/edges.parquet`, `pos_index.parquet` and
@@ -15,11 +15,13 @@ import argparse
 import socket
 import sys
 import time
+from pathlib import Path
 
 import uvicorn
 
 from tnh.web.app import create_app
 from tnh.web.engine import EngineManager, default_specs
+from tnh.web.lines import DEFAULT_DIR, LineStore
 from tnh.web.models import Hub, NoModels
 from tnh.web.stats import open_stats
 
@@ -44,6 +46,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--preppy-fake", action="store_true",
                     help="run preppy with its fake models (python -m tnh.engine.uci --fake): no GPU, for trying the page")
     ap.add_argument("--engine-idle", type=float, default=60.0, help="quit the engine after this many seconds unasked")
+    ap.add_argument("--lines-dir", type=Path, default=DEFAULT_DIR,
+                    help=f"where saved lines go, one PGN file per name (default {DEFAULT_DIR}, created on the first save)")
     args = ap.parse_args(argv)
 
     with socket.socket() as s:
@@ -67,7 +71,9 @@ def main(argv: list[str] | None = None) -> None:
         p.cmd, p.gpu_mb, p.label = p.cmd + ["--fake"], 0, "preppy (fake)"
         p.settings = tuple(k for k in p.settings if k != "Tempo")     # the fake has its own tempo
     engines = EngineManager(specs, idle_s=args.engine_idle)
-    app = create_app(stats, hub, engines=engines)
+    lines = LineStore(args.lines_dir)
+    print(f"saved lines: {lines.root}", file=sys.stderr)
+    app = create_app(stats, hub, engines=engines, lines=lines)
     print(f"tn-hittare: http://{HOST}:{args.port}/", file=sys.stderr)
     try:
         uvicorn.run(app, host=HOST, port=args.port, log_level="warning")
