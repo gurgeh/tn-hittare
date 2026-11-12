@@ -346,6 +346,7 @@ def cmd_fit(a) -> None:
                 b2, _, s2f, s2t = ref_cfg.linear()
                 e2, lpt2, _ = ref_cfg.finish(s2f, s2t)
                 ref = -lpt2[ref_cfg.T_.D.y]
+                del ref_cfg, s2f, s2t, lpt2   # holds a second copy of both samples
             else:
                 ref = losses["linear"]
         res = {}

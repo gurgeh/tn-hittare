@@ -1,0 +1,139 @@
+{
+ "config": "+t3pol+t3ch-p0.5",
+ "spec": {
+  "maia": "79m",
+  "pol": "t3",
+  "ch": "t3",
+  "rule": "p0.5"
+ },
+ "base_columns": [
+  "m0",
+  "mbest",
+  "lc0pol",
+  "lc0ch_eloss",
+  "lc0ch_cploss",
+  "lc0ch_unev"
+ ],
+ "linear": {
+  "beta": [
+   0.1846163128793521,
+   0.41061786913868437,
+   0.24868060493202032,
+   -5.612322354410838,
+   -0.2659867325723394,
+   -2.2725752005209268
+  ],
+  "eps": 0.0
+ },
+ "trees": {
+  "init_beta": [
+   0.18388374253601494,
+   0.41194417624370705,
+   0.2501450635615141,
+   -5.555643785766631,
+   -0.2653425237928003,
+   -2.2108068994702452
+  ],
+  "eps": 0.0,
+  "settings": {
+   "num_leaves": 15,
+   "learning_rate": 0.05,
+   "min_data_in_leaf": 2000,
+   "feature_fraction": 0.9,
+   "lambda_l2": 1.0
+  },
+  "n_trees": 381,
+  "design_names": [
+   "m0",
+   "mbest",
+   "lc0pol",
+   "lc0ch_eloss",
+   "lc0ch_cploss",
+   "lc0ch_unev",
+   "rank_m0",
+   "rank_mbest",
+   "rank_lc0pol",
+   "board_capture",
+   "board_check",
+   "board_promotion",
+   "board_castling",
+   "board_piece_N",
+   "board_piece_B",
+   "board_piece_R",
+   "board_piece_Q",
+   "board_piece_K",
+   "ctx_mover_elo",
+   "ctx_opp_elo",
+   "ctx_elo_diff",
+   "ctx_ply",
+   "ctx_n_legal",
+   "ctx_entropy_mbest",
+   "ctx_entropy_lc0pol",
+   "m0*ctx_mover_elo",
+   "m0*ctx_ply",
+   "mbest*ctx_mover_elo",
+   "mbest*ctx_ply",
+   "lc0pol*ctx_mover_elo",
+   "lc0pol*ctx_ply",
+   "lc0ch_eloss*ctx_mover_elo",
+   "lc0ch_eloss*ctx_ply",
+   "lc0ch_cploss*ctx_mover_elo",
+   "lc0ch_cploss*ctx_ply"
+  ],
+  "tried": [
+   {
+    "num_leaves": 15,
+    "learning_rate": 0.05,
+    "min_data_in_leaf": 2000,
+    "feature_fraction": 0.9,
+    "lambda_l2": 1.0,
+    "trees": 381,
+    "validation": 1.1638509113465618,
+    "seconds": 116
+   }
+  ]
+ },
+ "sources": {
+  "m0": "/home/gurgeh/out/tn-hittare/features/maia3-79m/offset+0",
+  "mbest": "/home/gurgeh/out/tn-hittare/features/maia3-79m/offset+600",
+  "lc0pol": "/home/gurgeh/out/tn-hittare/features/lc0-t3/policy",
+  "lc0ch": "/home/gurgeh/out/tn-hittare/features/lc0-t3/children-p0.5"
+ },
+ "fit": {
+  "sample": "/home/gurgeh/out/tn-hittare/corpus/samples/fit_sub100k.parquet",
+  "rows": 99980,
+  "train_rows": 79936,
+  "validation_rows": 20044,
+  "test_sample": "/home/gurgeh/out/tn-hittare/corpus/samples/test_sub100k.parquet",
+  "test_rows": 99972
+ },
+ "test": {
+  "linear": {
+   "test": {
+    "est": 1.162889775390621,
+    "lo": 1.1543084406933135,
+    "hi": 1.171656927418217
+   },
+   "minus_linear_combo_p0.5": {
+    "est": 0.015385260114779808,
+    "lo": 0.014046107563974182,
+    "hi": 0.016747541788253044
+   }
+  },
+  "trees": {
+   "test": {
+    "est": 1.1498506276051341,
+    "lo": 1.1415422112438096,
+    "hi": 1.158520102808754
+   },
+   "minus_linear_combo_p0.5": {
+    "est": 0.002346112329292841,
+    "lo": 0.0006977636721505578,
+    "hi": 0.0038564232651145205
+   }
+  }
+ },
+ "date": "2026-11-12T12:23:34",
+ "commit": "464a9e5e906ae7b6e1258b3dc71e7e9cbe3ca986",
+ "refit": "uv run python -m tnh.models.combotrees fit --configs '+t3pol+t3ch-p0.5'"
+}
