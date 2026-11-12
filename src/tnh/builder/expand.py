@@ -336,7 +336,7 @@ class Expander:
         p = self._factor_plain(node)
         keep = p >= self.tail_p
         if node.me_to_move and node.engine is not None and not np.all(np.isnan(node.engine)):
-            eps = self.params.eps(self.me_white)
+            eps = self.params.eps_at(self.me_white, node.id == self.graph.root)
             with np.errstate(invalid="ignore"):
                 keep |= node.engine >= np.nanmax(node.engine) - eps - 1e-12
         if not node.me_to_move and self.needs_best(node):
@@ -357,7 +357,7 @@ class Expander:
         if node.me_to_move:
             f = node.p_model.copy()
             if node.engine is not None and not np.all(np.isnan(node.engine)):
-                eps = self.params.eps(self.me_white)
+                eps = self.params.eps_at(self.me_white, node.id == self.graph.root)
                 with np.errstate(invalid="ignore"):
                     ok = node.engine >= np.nanmax(node.engine) - eps - 1e-12
                     f[ok] = np.maximum(f[ok], self.explore)

@@ -209,7 +209,7 @@ def run(a) -> None:
         return " ".join(o)
 
     params = Params(kappa=a.kappa, eps_white=a.eps, eps_black=a.eps, min_reach=a.min_reach,
-                    cost=ObviousCost(a.obvious))
+                    cost=ObviousCost(a.obvious), root_eps=a.root_eps)
     db = EdgeDB("full")
     band = None if a.no_band else (a.band_lo, a.band_hi)
     counts = EdgeDBCounts(db, tempi=a.tempo or None, elo_bands=band)
@@ -275,12 +275,26 @@ def run(a) -> None:
         else:
             deep_v, cheap_v = {}, {}
         sound = sound_root_moves(game)
-        say(f"sound fourth moves for the comparison: {[san([m]) for m in sound]}")
+        say(f"sound fourth moves for the comparison (root eps {a.root_eps or a.eps}): {[san([m]) for m in sound]}")
+        # grow each to the same number of expansions below it; moves grown before only top up
+        by_san = {san([m]): m for m in sound}
+        grow_list = [by_san[x] for x in a.grow_roots if x in by_san] if a.grow_roots else list(sound)
+        missing = [x for x in (a.grow_roots or []) if x not in by_san]
+        if missing:
+            say(f"asked to grow {missing}, which are not sound at the root")
+        grown = {}
         for m in sound:
             c = ex.graph.child(root, m)
+            inside = subtree_of(ex, c)
+            grown[m] = sum(1 for n_ in ex.graph.nodes if n_.children is not None and inside(n_))
+        for m in grow_list:
+            c = ex.graph.child(root, m)
+            want = max(0, a.per_move - grown[m])
             tg = time.perf_counter()
-            n = grow_under(ex, c, max_expansions=a.per_move)
-            say(f"grew {san([m])}: {n} expansions, graph {len(ex.graph)} nodes, {time.perf_counter() - tg:.0f} s")
+            n = grow_under(ex, c, max_expansions=want) if want else 0
+            grown[m] += n
+            say(f"grew {san([m])}: {n} expansions (now {grown[m]} below it), graph {len(ex.graph)} nodes, "
+                f"{time.perf_counter() - tg:.0f} s")
         with open(out / "graph.pkl", "wb") as f:
             pickle.dump({"graph": ex.graph, "root_moves": root_moves, "args": {k: v for k, v in vars(a).items() if k != "fn"}}, f)
         grow_stats = dict(ex.stats)
@@ -293,7 +307,8 @@ def run(a) -> None:
         def check(k, m):
             if (k, m) not in cache:
                 node = ex.graph.nodes[Game(ex.graph, params).by_key[k][0]]
-                cache[(k, m)] = checker.check(list(root_moves) + rel_path(node), m, params.eps(me_white))
+                cache[(k, m)] = checker.check(list(root_moves) + rel_path(node), m,
+                                              params.eps_at(me_white, node.id == ex.graph.root))
             return cache[(k, m)]
 
         ts = time.perf_counter()
@@ -425,17 +440,18 @@ def run(a) -> None:
     rep.append("## The fourth move: forced, best expected score per budget\n")
     q_root = game.dist[rd.id]
     cnt_root = counts.counts(rd.key, rd.moves)
-    hdr = "| 4th move | I play it unaided | engine | games (band) | " + " | ".join(f"N={N}" for N in [0] + sorted(budgets)) + " |"
+    hdr = ("| 4th move | expanded below it | I play it unaided | engine | games (band) | "
+           + " | ".join(f"N={N}" for N in [0] + sorted(budgets)) + " |")
     rep.append(hdr)
-    rep.append("|" + "---|" * (5 + len(budgets)))
+    rep.append("|" + "---|" * (6 + len(budgets)))
     best_free = {N: sols[N].value for N in budgets}
     for m in sound:
         j = rd.moves.index(m)
         vals = [forced[m][N].value for N in [0] + sorted(budgets)]
         fmt = lambda v: "infeasible" if v == -math.inf else f"{v:.4f}"   # noqa: E731
-        rep.append(f"| {san([m])} | {rd.p_model[j]:.0%} | {rd.engine[j]:.3f} | {int(cnt_root[j]) if cnt_root is not None else 0} | "
+        rep.append(f"| {san([m])} | {grown[m]} | {rd.p_model[j]:.0%} | {rd.engine[j]:.3f} | {int(cnt_root[j]) if cnt_root is not None else 0} | "
                    + " | ".join(fmt(v) for v in vals) + " |")
-    rep.append("| free choice | | | | " + " | ".join(f"{(sols[N].value):.4f}" for N in [0] + sorted(budgets)) + " |\n")
+    rep.append("| free choice | | | | | " + " | ".join(f"{(sols[N].value):.4f}" for N in [0] + sorted(budgets)) + " |\n")
     if deep_v:
         best_d = max(deep_v.values())
         rep.append(f"Which fourth moves are sound: the {len(deep_v)} best at {a.sf_nodes} nodes per move, searched "
@@ -505,6 +521,20 @@ def run(a) -> None:
         for name, d, v0 in side:
             rep.append(f"| {name} | {v0:.4f} | " + " | ".join(f"{d[N][0]:.4f} ({san([d[N][1]]) if d[N][1] != '-' else '-'})"
                                                             for N in sorted(budgets)) + " |")
+    rep.append("\n## How many of my moves each eps admits\n")
+    rep.append(f"Over my expanded positions with Stockfish values ({a.sf_nodes} nodes per move), the root left out: "
+               "the number of legal moves within eps of the best.\n")
+    rep.append("| eps | positions | mean | median | 90th percentile | max | reach-weighted mean (free choice, N=10) |")
+    rep.append("|---|---:|---:|---:|---:|---:|---:|")
+    R10 = game.reach(sols[min(10, K)].learned)
+    mine_nodes = [n for n in ex.graph.nodes if n.me_to_move and n.children is not None and n.engine is not None
+                  and n.id != ex.graph.root and not np.all(np.isnan(n.engine))]
+    for e in a.count_eps:
+        c_ = np.array([int(np.sum(n.engine >= np.nanmax(n.engine) - e - 1e-12)) for n in mine_nodes])
+        w_ = np.array([R10[n.id] for n in mine_nodes])
+        rw = float((c_ * w_).sum() / w_.sum()) if w_.sum() > 0 else math.nan
+        rep.append(f"| {e:g} | {len(c_)} | {c_.mean():.2f} | {np.median(c_):.0f} | {np.percentile(c_, 90):.0f} | "
+                   f"{c_.max()} | {rw:.2f} |")
     rep.append("\n## The frontier value: where its calls went\n")
     n_real = len(real_all)
     n_front = len(real_front)

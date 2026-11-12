@@ -165,6 +165,8 @@ class Params:
     - `cost(node, j)`: the budget units that learning move j at the node costs, an
       int >= 0 (`uniform_cost`: 1; `ObviousCost(t)`: 0 when my model gives the move at
       least t). Zero-cost moves are learned wherever they gain anything.
+    - `root_eps`: eps at the root position only (the user's choice of first moves can be
+      wider than what is allowed deeper in the tree).
     - `force`: (position key, move) pairs that are played regardless (to ask "what if
       the root move were this one"). The move's cost is taken out of the budget.
     """
@@ -176,6 +178,7 @@ class Params:
     min_reach: float = 0.0
     cost: Callable[[Node, int], int] = uniform_cost
     force: frozenset = frozenset()
+    root_eps: float | None = None
     lam_node: float = 0.0
     shrink: float = 0.0
     shrink_to: str = "parent"
@@ -189,6 +192,9 @@ class Params:
 
     def eps(self, me_white: bool) -> float:
         return self.eps_white if me_white else self.eps_black
+
+    def eps_at(self, me_white: bool, is_root: bool) -> float:
+        return self.root_eps if is_root and self.root_eps is not None else self.eps(me_white)
 
     def kappa_at(self, node: Node) -> float:
         return self.kappa(node) if callable(self.kappa) else self.kappa
@@ -281,7 +287,6 @@ class Game:
         self.graph = graph
         self.params = params
         self.order = graph.reachable()
-        eps = params.eps(graph.me_white)
         self.dist: dict[int, np.ndarray] = {}
         self.sound: dict[int, np.ndarray] = {}
         self.by_key: dict[Key, list[int]] = {}
@@ -307,7 +312,7 @@ class Game:
                 d[n.moves.index(self.forced[n.key])] = 1.0
                 self.sound[i] = np.zeros(0, dtype=np.int64)
             elif n.me_to_move:
-                self.sound[i] = sound(n, eps, params.banned)
+                self.sound[i] = sound(n, params.eps_at(graph.me_white, i == graph.root), params.banned)
             self.dist[i] = d
         self.leaf = {i: self._leaf_value(i) for i in self.order if not graph.nodes[i].expanded}
         missing = set(self.forced) - {graph.nodes[i].key for i in self.dist}
