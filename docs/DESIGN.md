@@ -454,6 +454,30 @@ is a bootstrap over tournaments.
   nodes (0.848 raw, 0.835 recalibrated, on its own 10,000 games). Maia-3's
   value head needs the five-parameter recalibration (1.221 raw, 0.888 after).
 
+**The live model** (`tnh.models.combo`, 2026-11-12):
+
+- `Combo()` is that combination as a `MoveModel`: Maia-3 79M at offset 0 and
+  at +600, Lc0's policy and two columns from Lc0's raw child values, in the
+  linear conditional logit with a uniform mixture. No rating terms and no
+  trees. Coefficients are in `src/tnh/models/combo_coef.json` with their
+  provenance; `python -m tnh.models.combo fit` refits them from the feature
+  files. Test figure on `test_sub100k`: 1.1475 [1.1389, 1.1562].
+- The second Maia setting is offset +600, not the mapped rating: step 1's
+  feature files hold +600, so that is what the coefficients were fitted on.
+  `Combo(maia_best="map1580+0.558x")` swaps the mapped rating in under the
+  same coefficients (1.1606 against 1.1617 on 500 rows, not distinguishable).
+  `Elo.parse("map<a>+<b>x")` is the mapped variant.
+- `FrontierValue()` gives win/draw/loss for the mover from both FIDE ratings:
+  Lc0 at 50 nodes, `WDLCalibrationElo` = mover + 400, `Contempt` = mover -
+  opponent, then the stored recalibration (`value_recal.json`).
+- `WithValue(Combo(), FrontierValue())` is a `MoveModel` whose `wdl` is the
+  frontier value. The builder reads frontier values from `Prediction.wdl`, so
+  this is passed as its `move_model` and nothing else changes.
+- Cost on the laptop GPU: `Combo` 32 positions per second whatever the batch
+  size, 88-91 % of it in Lc0's child values (one network call per legal
+  move); `FrontierValue` 13.6 positions per second with one Lc0 process.
+  Maia-3 23M in place of 79M does not change the total.
+
 ## Difficulty against results (step 2): `tnh.difficulty`
 
 Question: does a difficulty measure from the move model explain White's real
