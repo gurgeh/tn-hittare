@@ -124,25 +124,61 @@ def test_uci_analyse_gives_legal_lines_with_scores(uci):
     assert infos[0]["score"].relative.score() >= infos[-1]["score"].relative.score() - 2000
 
 
+def kv(s: str) -> dict:
+    return dict(t.split("=", 1) for t in s.split()[1:] if "=" in t)
+
+
 def test_uci_info_strings_and_bestmove(uci):
+    assert uci.id["name"] == "preppy"
     board = chess.Board(_fen(C4))
     strings = []
     with uci.analysis(board, chess.engine.Limit(nodes=80), multipv=2) as an:
         for info in an:
             if "string" in info:
                 strings.append(info["string"])
-    lines = [s for s in strings if s.startswith("tnh line")]
-    roots = [s for s in strings if s.startswith("tnh root")]
+    lines = [kv(s) for s in strings if s.startswith("preppy multipv=")]
+    roots = [kv(s) for s in strings if s.startswith("preppy root")]
     assert lines and roots
-    t = lines[-1].split()
-    assert t[2] in ("1", "2") and t[3] == "value" and 0 <= float(t[4]) <= 1
-    assert "moves" in t
-    flags = t[t.index("moves") + 1:]
-    assert all(f.split(":")[1] in ("L", "M") or 0 <= float(f.split(":")[1]) <= 1 for f in flags)
-    r = roots[-1].split()
-    assert r[r.index("cap") + 1] == "-"
+    x = lines[-1]
+    assert x["multipv"] in ("1", "2") and 0 <= float(x["value"]) <= 1 and float(x["reach"]) <= 1
+    assert int(x["nonobvious"]) >= 0
+    for f in x["moves"].split(","):
+        flag = f.split(":")[1]
+        assert flag in ("L", "M") or 0 <= float(flag) <= 1
+    assert roots[-1]["cap"] == "-" and int(roots[-1]["expanded"]) > 0
     res = uci.play(board, chess.engine.Limit(nodes=40))
     assert res.move in board.legal_moves
+
+
+def test_uci_infinite_and_stop_many_times_keeps_the_graph(uci):
+    board = chess.Board(_fen(C4))
+    expanded = []
+    for i in range(5):
+        with uci.analysis(board, multipv=3) as an:            # go infinite
+            n = 0
+            for info in an:
+                if "string" in info and info["string"].startswith("preppy root"):
+                    expanded.append(int(kv(info["string"])["expanded"]))
+                    n += 1
+                    if n >= 1:
+                        break
+            an.stop()
+            best = an.wait()
+            assert best.move in board.legal_moves
+        if i == 2:
+            board.push(best.move)                           # step into a child: the graph is kept
+    assert expanded == sorted(expanded)                     # never cleared
+
+
+def test_uci_errors_are_reported_and_the_engine_goes_on():
+    import subprocess
+    p = subprocess.Popen([sys.executable, "-m", "tnh.engine.uci", "--fake"], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, text=True)
+    out, _ = p.communicate("uci\nsetoption name Nonsense value 3\nsetoption name Price value x\nisready\n"
+                           "position startpos moves e2e4\ngo nodes 20\nisready\n", timeout=60)
+    assert p.returncode == 0                                # stdin closed: a clean exit
+    assert "error=unknown_option:Nonsense" in out and "error=ValueError" in out
+    assert "readyok" in out and "bestmove" in out
 
 
 def test_uci_cap_and_opponent_to_move(uci):

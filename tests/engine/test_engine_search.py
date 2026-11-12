@@ -266,3 +266,29 @@ def test_a_position_at_two_plies_one_unexpanded():
     assert game.cost_of("X", "win") == 1
     s = solve_price(game, 0.001)
     assert s.learned.get("X") == "win"
+
+
+def test_learnable_at_one_occurrence_is_learnable_for_the_position():
+    from tnh.builder.game import Graph
+    g = Graph(me_white=True)
+    r = g.add("root", 0, True, ["a", "b"], p_model=np.array([0.5, 0.5]))
+    oa = g.add("oa", 1, False, ["x"], p_model=np.array([1.0]))
+    ob = g.add("ob", 1, False, ["y"], p_model=np.array([1.0]))
+    x2 = g.add("X", 2, True, ["win", "usual"], p_model=np.array([0.02, 0.98]))
+    m2 = g.add("m2", 2, True, ["u"], p_model=np.array([1.0]))
+    o3 = g.add("o3", 3, False, ["v"], p_model=np.array([1.0]))
+    x4 = g.add("X", 4, True, ["win", "usual"], p_model=np.array([0.02, 0.98]))
+    leaves = [g.add(f"l{i}", ply, me_, [], value=v) for i, (ply, me_, v) in
+              enumerate([(3, False, 0.9), (3, False, 0.5), (5, False, 0.9), (5, False, 0.5)])]
+    g.link(r, [oa, ob]); g.link(oa, [x2]); g.link(ob, [m2]); g.link(m2, [o3]); g.link(o3, [x4])
+    g.link(x2, leaves[:2]); g.link(x4, leaves[2:])
+    for n in (r, m2):
+        n.engine = np.full(len(n.moves), np.nan)
+    x2.engine = np.array([0.5, 0.5])                   # both learnable here
+    x4.engine = np.array([np.nan, 0.5])                # 'win' not learnable at this occurrence
+    for n in (oa, ob, o3):
+        n.engine = np.array([0.5])
+    game = Game(g, Params(eps_white=1.0))
+    assert game.is_sound("X", "win")
+    v = game.evaluate({"X": "win"})                    # played at both occurrences
+    assert v == pytest.approx(0.9)

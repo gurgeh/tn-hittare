@@ -347,10 +347,13 @@ class Game:
         return i in self.sound and len(self.sound[i]) > 0
 
     def is_sound(self, key: Key, move: str) -> bool:
+        """Learnable at the position: at any of its occurrences (a position is learned once; at
+        an occurrence where the move's child is not expanded it stands in)."""
         for i in self.by_key.get(key, ()):
             if i in self.sound:
                 n = self.graph.nodes[i]
-                return move in n.moves and n.moves.index(move) in set(self.sound[i].tolist())
+                if move in n.moves and n.moves.index(move) in set(self.sound[i].tolist()):
+                    return True
         return False
 
     def move_cost(self, i: int, j: int) -> int:

@@ -609,10 +609,14 @@ class Engine:
                 self.solve(final=False)
             now = time.perf_counter()
             if on_info is not None and now - last_info >= info_every:
-                self.solve()
+                # an info line re-solves only when enough has been evaluated that the solve
+                # stays at most about half the time; otherwise it reports the last solve
+                if self.since_solve > 0 and self.eval_since_solve >= self.last_solve_seconds:
+                    self.solve()
                 on_info(self.result(t0, start_exp))
-                last_info = now
-        self.solve()
+                last_info = time.perf_counter()
+        if not (stop is not None and stop.is_set() and self.last is not None):
+            self.solve()              # a stop answers at once with the last solve
         return self.result(t0, start_exp)
 
     def _expand_root(self) -> None:
@@ -703,7 +707,8 @@ class Engine:
             i = n.children[j]
             seen.add(i)
             cn = g.nodes[i]
-            if cn.children is None or not cn.moves or cn.info.get("stand_in") or len(moves) > 40:
+            if cn.children is None or not cn.moves or cn.info.get("stand_in") or len(moves) > 40 \
+                    or i not in game.dist:            # expanded after the last solve: the line ends here
                 break
             if cn.me_to_move:
                 lm = res.learned.get(cn.key)

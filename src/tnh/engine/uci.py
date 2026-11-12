@@ -1,29 +1,78 @@
-"""The repertoire engine over UCI.
+"""preppy: the repertoire engine over UCI.
 
     uv run python -m tnh.engine.uci              # classical and blitz models, the full database
     uv run python -m tnh.engine.uci --fake       # deterministic fake models, no database (tests)
 
-Commands: `uci`, `isready`, `setoption` (while idle), `ucinewgame` (clears the graph;
-otherwise it is kept between positions and stepping into a child or back reuses it),
-`position startpos|fen ... [moves ...]`, `go [nodes N | movetime MS | infinite]`
-(anything else, such as clock times, searches until `stop`), `stop`, `quit`.
+This docstring is the contract for a GUI (the web page's engine section).
 
-**What the score means.** Every value is my expected score in the repertoire game (see
-`tnh.engine.search`), turned into the side to move's at the root. `score cp` is
-`400 * log10(E / (1 - E))` for that expected score E (clipped to +-2000): 0 is an even
-game, +200 is 0.76. With me to move the lines are my candidate moves by net value (value
-minus the price of the non-obvious moves the line's repertoire learns); with the
-opponent to move they are his most likely replies.
+## Behaviour
 
-**`info string tnh ...`** gives the exact numbers, one line per pv and one per search:
+- `uci` answers at once; the models load once, at the first `isready` or `go`.
+- `position startpos [moves ...]` or `position fen F [moves ...]` sets the root. The graph
+  and every cache are kept: stepping into a child or back reuses what was searched. Only
+  `ucinewgame` clears them (and a `position fen` with a new starting FEN).
+- `go infinite`, `go nodes N` (N more expanded positions), `go movetime MS`; any other
+  `go` (clock times) searches until `stop`. `stop` answers with `bestmove` at once, from
+  the last exact solve (it does not wait for a new one).
+- `setoption` between searches. A `position`, `setoption`, `go` or `ucinewgame` that
+  arrives while a search runs stops it first (its `bestmove` is sent).
+- `quit`, or the end of stdin, stops any search and exits.
+- An error in a command is reported as `info string preppy error=...` and the engine
+  goes on; nothing is swallowed silently.
 
-    info string tnh line K value V net N nonobvious C reach R moves m1:F1 m2:F2 ...
-    info string tnh root value V net N price P cost C cap X stand_in S frontier F finished G expanded E
+## Options
 
-where each move's flag F is `L` (my move, learned), `M` (my move, not learned: the move
-model's most likely) or the opponent's probability of the move (e.g. `0.412`).
-`cap` is `-` without a cap; with one, `cost` may be below it (the price only reaches the
-points of the concave hull of value against cost).
+| option | type | default | range / values | meaning |
+|---|---|---|---|---|
+| MyElo | spin | 2200 | 400-3200 | my rating (FIDE for classical, Lichess blitz for blitz) |
+| OppElo | spin | 2200 | 400-3200 | the opponent's |
+| Side | combo | tomove | white, black, tomove | which side I am; tomove = the side to move at the root |
+| Tempo | combo | classical | classical, blitz (+ fake with --fake) | the model bundle: classical = the default move model (Maia-3 79M +0/+600, Lc0 policy, trees) with the cheap result model, classical games in the database; blitz = plain Maia-3 79M at the given ratings with its own value head, blitz and rapid games |
+| Price | string (float) | 0.001 | >= 0 | price per non-obvious learned move, in expected score |
+| Cap | spin | 0 | 0-1000 | at most this many non-obvious learned moves (0 = off; then Price decides). A cap can return fewer: the price reaches only the concave hull of value against cost |
+| Obvious | string (float) | 0.85 | 0-1 | a move is obvious (costs 0) when my move model alone gives it at least this |
+| Prepared | string (float) | 0 | 0-1 | share of the opponent's probability on his best reply, at every position |
+| Mix | combo | fitted | fitted, kappa | the opponent's database mix: the fitted rule (tnh.movemix) or (count + kappa p) / (n + kappa) |
+| Kappa | string (float) | 100 | > 0 | with Mix = kappa |
+| DbFilter | combo | auto | auto, classical, blitz, all, off | the database games counted; auto = the tempo's own |
+| MultiPV | spin | 3 | 1-20 | lines shown |
+| CPuct | string (float) | 1.5 | > 0 | PUCT exploration at my moves |
+| PolicyWeight | string (float) | 0.5 | 0-1 | Lc0's raw policy in my prior (the rest is my move model) |
+| PriorMin | string (float) | 0.002 | 0-1 | safety net: a move with a smaller prior is not a candidate |
+| Blunder | string (float) | 0.15 | 0-1 | safety net: a learned move's position may be at most this much worse than the one before |
+| Batch | spin | 12 | 1-512 | positions evaluated per batch |
+| SolveRatio | string (float) | 4 | >= 0 | solve again when evaluation time since the last solve is this many times its duration |
+
+## Output
+
+Every value is my expected score in the repertoire game (`tnh.engine.search`), turned into
+the side to move's at the root. **Score mapping:** `score cp X` with
+`X = round(400 * log10(E / (1 - E)))` for that expected score E, clipped to +-2000
+(0 = even, +200 = 0.76, +400 = 0.91). No `wdl`: the search keeps expected scores only.
+
+At most about one round of info per second. Per line, in order of `multipv`:
+
+    info depth D multipv K score cp X nodes N nps S time MS pv m1 m2 ...
+    info string preppy multipv=K value=V net=NET nonobvious=C reach=R moves=m1:F1,m2:F2,...
+
+and once per round:
+
+    info string preppy root value=V net=NET price=P cost=C cap=X stand_in=S frontier=F finished=G expanded=E
+
+- `value`: the line's expected score for the side to move at the root (6 decimals).
+- `net` (me to move): value minus price times the non-obvious moves the line's repertoire
+  learns; `-` when the opponent is to move.
+- `nonobvious`: non-obvious learned moves on the line. `reach`: probability of reaching
+  the line's end under the repertoire.
+- Each move's flag `F`: `L` my move, learned; `M` my move, not learned (my model's most
+  likely); a number: the opponent's probability of the move.
+- With me to move the lines are my candidate moves by net value; with the opponent to
+  move, his most likely replies.
+- `root`: the repertoire's value and net value, the price in force (with a cap, the one
+  found), the non-obvious moves it learns, `cap=-` without a cap, the probability mass
+  that ends on stand-ins (positions not yet expanded, valued by their parent),
+  frontier positions and finished games, and the expanded positions so far.
+- `nodes` in the `info` line is the number of expanded positions in the graph.
 """
 
 from __future__ import annotations
@@ -42,14 +91,14 @@ import chess  # noqa: E402
 from tnh.engine.api import Handle  # noqa: E402
 from tnh.engine.search import Engine, Result, Settings  # noqa: E402
 
-NAME = "tnh-repertoire"
+NAME = "preppy"
 
 # UCI option -> (Settings field, type, UCI declaration)
 OPTIONS = {
     "MyElo": ("my_elo", int, "type spin default 2200 min 400 max 3200"),
     "OppElo": ("opp_elo", int, "type spin default 2200 min 400 max 3200"),
     "Side": ("my_side", str, "type combo default tomove var white var black var tomove"),
-    "Tempo": ("tempo", str, "type combo default classical var classical var blitz{fake}"),
+    "Tempo": ("tempo", str, "type combo default {tempo} var classical var blitz{fake}"),
     "Price": ("price", float, "type string default 0.001"),
     "Cap": ("cap", int, "type spin default 0 min 0 max 1000"),
     "Obvious": ("obvious", float, "type string default 0.85"),
@@ -73,15 +122,14 @@ def cp_of(e: float) -> int:
 
 
 class UCI:
-    def __init__(self, engine: Engine, out=sys.stdout, make_evaluator=None) -> None:
+    def __init__(self, engine: Engine, out=sys.stdout, make_evaluator=None, fake: bool = False) -> None:
         self.engine = engine
         self.handle = Handle(engine)
         self.out = out
         self.make_evaluator = make_evaluator
         self.lock = threading.Lock()
-        self.t0 = 0.0
-        self.exp0 = 0
-        self.fake = False
+        self.fake = fake
+        self.loaded = False
 
     def send(self, line: str) -> None:
         with self.lock:
@@ -90,52 +138,59 @@ class UCI:
 
     # -- reporting ---------------------------------------------------------------------------
 
-    def report(self, r: Result) -> None:
-        if r is None:
+    def report(self, r: Result | None) -> None:
+        if r is None or r.solve is None:
             return
         eng = self.engine
         nodes = eng.stats["expanded"]
         ms = max(int(r.seconds * 1000), 1)
         nps = int(r.expansions / max(r.seconds, 1e-9))
         for k, line in enumerate(r.lines, 1):
-            pv = " ".join(line.moves)
             self.send(f"info depth {len(line.moves)} multipv {k} score cp {cp_of(line.value)} nodes {nodes} "
-                      f"nps {nps} time {ms} pv {pv}")
-            flags = []
-            for m, p, l in zip(line.moves, line.probs, line.learned):
-                flags.append(f"{m}:{'L' if l else 'M'}" if p is None else f"{m}:{p:.4f}")
-            net = "-" if line.net is None else f"{line.net:.5f}"
-            self.send(f"info string tnh line {k} value {line.value:.5f} net {net} nonobvious {line.nonobvious} "
-                      f"reach {line.reach:.5f} moves {' '.join(flags)}")
-        s = r.solve
-        m = r.mass
+                      f"nps {nps} time {ms} pv {' '.join(line.moves)}")
+            flags = ",".join(f"{m}:{'L' if l else 'M'}" if p is None else f"{m}:{p:.4f}"
+                             for m, p, l in zip(line.moves, line.probs, line.learned))
+            net = "-" if line.net is None else f"{line.net:.6f}"
+            self.send(f"info string preppy multipv={k} value={line.value:.6f} net={net} "
+                      f"nonobvious={line.nonobvious} reach={line.reach:.6f} moves={flags}")
+        s, m = r.solve, r.mass
         root = eng.graph.nodes[eng.graph.root]
         v = s.value if root.me_to_move else 1 - s.value
         cap = "-" if eng.s.cap == 0 else str(eng.s.cap)
-        self.send(f"info string tnh root value {v:.5f} net {s.net:.5f} price {s.mu:.6g} cost {s.cost} cap {cap} "
-                  f"stand_in {m['stand_in']:.4f} frontier {m['frontier']:.4f} finished {m['finished']:.4f} "
-                  f"expanded {nodes}")
+        self.send(f"info string preppy root value={v:.6f} net={s.net:.6f} price={s.mu:.6g} cost={s.cost} cap={cap} "
+                  f"stand_in={m['stand_in']:.4f} frontier={m['frontier']:.4f} finished={m['finished']:.4f} "
+                  f"expanded={nodes}")
 
     def bestmove(self, r: Result | None) -> None:
         if r is not None and r.lines:
             self.send(f"bestmove {r.lines[0].moves[0]}")
             return
-        root = self.engine.graph.nodes[self.engine.graph.root]
-        b = self.engine.ev.board(self.engine.pos[root.id])
+        b = self.engine.ev.board(self.engine.pos[self.engine.graph.root])
         legal = list(b.legal_moves)
         self.send(f"bestmove {legal[0].uci() if legal else '0000'}")
 
     # -- commands ------------------------------------------------------------------------------
 
+    def idle(self) -> None:
+        """Stop a running search first (its bestmove is sent by the search thread)."""
+        if self.handle.busy:
+            self.handle.stop()
+
+    def load(self) -> None:
+        if not self.loaded:
+            self.engine.ev.bundle(self.engine.s.tempo)
+            self.loaded = True
+
     def cmd_uci(self) -> None:
         self.send(f"id name {NAME}")
         self.send("id author tn-hittare")
         for name, (_, _, decl) in OPTIONS.items():
-            self.send(f"option name {name} {decl.format(fake=' var fake' if self.fake else '')}")
+            self.send(f"option name {name} " + decl.format(fake=" var fake" if self.fake else "",
+                                                         tempo=self.engine.s.tempo))
         self.send("uciok")
 
     def cmd_setoption(self, args: list[str]) -> None:
-        self.handle.require_idle()
+        self.idle()
         if "name" not in args:
             return
         i = args.index("name")
@@ -143,36 +198,36 @@ class UCI:
         name = " ".join(args[i + 1 : j])
         value = " ".join(args[j + 1 :]) if j < len(args) else ""
         if name not in OPTIONS:
-            self.send(f"info string unknown option {name}")
+            self.send(f"info string preppy error=unknown_option:{name}")
             return
         field, typ, _ = OPTIONS[name]
         if field == "my_side" and value == "tomove":
             value = "to_move"
         self.engine.set_settings(**{field: typ(value)})
+        if field == "tempo":
+            self.loaded = False
 
     def cmd_position(self, args: list[str]) -> None:
-        self.handle.require_idle()
+        self.idle()
         moves = args[args.index("moves") + 1 :] if "moves" in args else []
+        fen = None
         if args and args[0] == "fen":
             end = args.index("moves") if "moves" in args else len(args)
             fen = chess.Board(" ".join(args[1:end])).fen()
-            if fen != chess.Board().fen():
-                if self.make_evaluator is None:
-                    raise ValueError("this engine starts from the standard position only")
-                cur = getattr(self.engine.ev, "start_fen", None)
-                if cur != fen:
-                    self.engine.ev = self.make_evaluator(fen)
-                    self.engine.clear()
-            elif getattr(self.engine.ev, "start_fen", None) is not None:
-                self.engine.ev = self.make_evaluator(None)
-                self.engine.clear()
-        elif getattr(self.engine.ev, "start_fen", None) is not None and self.make_evaluator is not None:
-            self.engine.ev = self.make_evaluator(None)
+            if fen == chess.Board().fen():
+                fen = None
+        cur = getattr(self.engine.ev, "start_fen", None)
+        if fen != cur:
+            if self.make_evaluator is None:
+                raise ValueError("this engine starts from the standard position only")
+            old = self.engine.ev
+            self.engine.ev = self.make_evaluator(fen, getattr(old, "bundles", None))
             self.engine.clear()
         self.engine.set_position(moves)
 
     def cmd_go(self, args: list[str]) -> None:
-        self.handle.require_idle()
+        self.idle()
+        self.load()
         nodes = seconds = None
         if "nodes" in args:
             nodes = int(args[args.index("nodes") + 1])
@@ -181,33 +236,43 @@ class UCI:
         self.handle.start(nodes=nodes, seconds=seconds, on_info=self.report,
                           on_done=lambda r: (self.report(r), self.bestmove(r)))
 
+    def dispatch(self, cmd: str, args: list[str]) -> bool:
+        if cmd == "uci":
+            self.cmd_uci()
+        elif cmd == "isready":
+            if not self.handle.busy:
+                self.load()
+            self.send("readyok")
+        elif cmd == "setoption":
+            self.cmd_setoption(args)
+        elif cmd == "ucinewgame":
+            self.idle()
+            self.engine.clear()
+        elif cmd == "position":
+            self.cmd_position(args)
+        elif cmd == "go":
+            self.cmd_go(args)
+        elif cmd == "stop":
+            self.idle()
+        elif cmd == "quit":
+            self.idle()
+            return False
+        else:
+            self.send(f"info string preppy error=unknown_command:{cmd}")
+        return True
+
     def run(self, inp=sys.stdin) -> None:
         for raw in inp:
             parts = raw.split()
             if not parts:
                 continue
-            cmd, args = parts[0], parts[1:]
-            if cmd == "uci":
-                self.cmd_uci()
-            elif cmd == "isready":
-                self.send("readyok")
-            elif cmd == "setoption":
-                self.cmd_setoption(args)
-            elif cmd == "ucinewgame":
-                self.handle.require_idle()
-                self.engine.clear()
-            elif cmd == "position":
-                self.cmd_position(args)
-            elif cmd == "go":
-                self.cmd_go(args)
-            elif cmd == "stop":
-                self.handle.stop()
-            elif cmd == "quit":
-                if self.handle.busy:
-                    self.handle.stop()
-                return
-            else:
-                self.send(f"info string unknown command {cmd}")
+            try:
+                if not self.dispatch(parts[0], parts[1:]):
+                    return
+            except Exception as e:                      # shown to the GUI, and the engine goes on
+                msg = f"{type(e).__name__}:{e}".replace("\n", " ")
+                self.send(f"info string preppy error={msg}")
+        self.idle()                                     # stdin closed
 
 
 def main(argv=None) -> None:
@@ -221,16 +286,14 @@ def main(argv=None) -> None:
     if not (a.fake or a.no_db):
         from tnh.data.edges import EdgeDB
         db = EdgeDB("full")
-    bundles = {"fake": FakeBundle()} if a.fake else {}
+    base = {"fake": FakeBundle()} if a.fake else {}
 
-    def make(fen):
-        return ChessEvaluator(bundles, db, start_fen=fen)
+    def make(fen, bundles=None):
+        return ChessEvaluator(bundles if bundles is not None else base, db, start_fen=fen)
 
     settings = Settings(tempo="fake") if a.fake else Settings()
     eng = Engine(make(None), settings)
-    u = UCI(eng, make_evaluator=make)
-    u.fake = a.fake
-    u.run()
+    UCI(eng, make_evaluator=make, fake=a.fake).run()
 
 
 if __name__ == "__main__":
