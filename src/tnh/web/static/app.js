@@ -780,8 +780,14 @@ main()
 // its lines a few times a second. The choice is kept per browser.
 
 const ENG_STORE = "tnh.engine"
-// Options the page feeds from its own controls rather than a settings box (preppy's).
-const FED = ["MyElo", "OppElo", "Side", "Tempo"]
+// Options the page feeds from its own controls rather than a settings box: preppy's sides,
+// ratings and tempo; Lc0's ContemptMode (the server derives it from Contempt and "me").
+const FED = ["MyElo", "OppElo", "Side", "Tempo", "ContemptMode"]
+const OPTION_TIPS = {
+    Contempt: "Lc0's contempt in Elo: positive when I (the side at the bottom) am the stronger side; empty or 0 = off. WDLEvalObjectivity is left at its default, but in this Lc0 (v0.32.1) the shown score moves too, not only the choice of moves: measured on the Najdorf, Contempt 200 for White took White's score from +0.36 to -0.04",
+    WDLCalibrationElo: "Lc0: the rating its WDL is calibrated to; 0 = off",
+    DrawScore: "preppy: what a draw is worth to me (0-1, 0.5 = half a point). The rating difference in the White and Black boxes is preppy's real contempt; DrawScore only changes what a draw is worth",
+}
 
 function storeGet() {
     try {
@@ -888,7 +894,8 @@ async function engineGo() {
     state.eng.err = null
     try {
         const r = await fetch("/api/uci/go", {method: "POST", headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({engine: state.eng.name, fen, moves: historyMoves(), multipv: state.eng.multipv, settings})})
+            body: JSON.stringify({engine: state.eng.name, fen, moves: historyMoves(), multipv: state.eng.multipv, settings,
+                                  me: state.orientation === COLOR.white ? "white" : "black"})})
         const d = await r.json()
         if (!r.ok) throw new Error(d.detail || r.status)
         if (seq === engineSeq) state.eng.want.gen = d.gen
@@ -977,12 +984,20 @@ function renderEngine() {
     if (on && s && s.options && e) {
         set = s.options.filter(o => !FED.includes(o.name)).map(o => {
             const v = state.eng.settings[o.name] ?? o.default ?? ""
-            if (o.type === "combo") return `<label>${esc(o.name)} <select data-opt="${esc(o.name)}">${o.vars.map(x => `<option ${x === v ? "selected" : ""}>${esc(x)}</option>`).join("")}</select></label>`
-            if (o.type === "spin") return `<label>${esc(o.name)} <input data-opt="${esc(o.name)}" type="number" min="${o.min ?? ""}" max="${o.max ?? ""}" value="${esc(v)}"></label>`
-            if (o.type === "check") return `<label>${esc(o.name)} <select data-opt="${esc(o.name)}"><option ${v === "true" ? "selected" : ""}>true</option><option ${v !== "true" ? "selected" : ""}>false</option></select></label>`
-            return `<label>${esc(o.name)} <input data-opt="${esc(o.name)}" class="short" value="${esc(v)}"></label>`
+            const tip = OPTION_TIPS[o.name] ? ` title="${esc(OPTION_TIPS[o.name])}"` : ""
+            if (o.type === "combo") return `<label${tip}>${esc(o.name)} <select data-opt="${esc(o.name)}">${o.vars.map(x => `<option ${x === v ? "selected" : ""}>${esc(x)}</option>`).join("")}</select></label>`
+            if (o.type === "spin") return `<label${tip}>${esc(o.name)} <input data-opt="${esc(o.name)}" type="number" min="${o.min ?? ""}" max="${o.max ?? ""}" value="${esc(v)}"></label>`
+            if (o.type === "check") return `<label${tip}>${esc(o.name)} <select data-opt="${esc(o.name)}"><option ${v === "true" ? "selected" : ""}>true</option><option ${v !== "true" ? "selected" : ""}>false</option></select></label>`
+            return `<label${tip}>${esc(o.name)} <input data-opt="${esc(o.name)}" class="short" value="${esc(v)}"></label>`
         }).join(" ")
-        if (feedsSides()) {
+        const ap = s.applied || {}
+        if ("ContemptMode" in ap) {
+            const mode = ap.ContemptMode
+            set += ` <span class="dim" title="What the server sent to Lc0: ContemptMode follows the side at the bottom (f flips it)">sent: ` +
+                (mode === "disable" ? "contempt off" : `Contempt ${esc(ap.Contempt)} for ${mode.split("_")[0]} (${esc(mode)})`) +
+                (ap.WDLCalibrationElo && ap.WDLCalibrationElo !== "0" ? ` · WDLCalibrationElo ${esc(ap.WDLCalibrationElo)}` : "") + `</span>`
+        }
+        if (feedsSides() && Object.keys(fedSettings()).length) {
             const f = fedSettings()
             set += ` <span class="dim" title="Fed from the page: me = the side at the bottom (f flips), the ratings from the White and Black boxes, Tempo blitz when only blitz games are shown">me ${f.Side} ${f.MyElo} v ${f.OppElo}${f.Tempo ? ", " + f.Tempo : ""}</span>`
         }

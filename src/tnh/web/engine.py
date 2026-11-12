@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -46,6 +47,8 @@ class EngineSpec:
     settings: tuple[str, ...] = ()                              # options the page may set (whitelist)
     gpu_mb: int = 0                                             # free GPU memory needed to start
     short: str = ""                                             # column header
+    # Turns the page's settings and its "me" side into the options to send (Lc0's contempt).
+    derive: Callable[[dict, str], dict] | None = None
 
     def available(self) -> str | None:
         """None when it can start, else why not."""
@@ -76,11 +79,38 @@ def default_specs(*, threads: int = 4, hash_mb: int = 256, lc0_minibatch: int = 
                           {"WeightsFile": str(lc0.network_path()), "Backend": "cuda-auto",
                            "BackendOptions": f"max_batch={lc0_minibatch}", "MinibatchSize": str(lc0_minibatch),
                            "MaxPrefetch": "0", "Threads": "2", "UCI_ShowWDL": "true"},
-                          gpu_mb=2500, short="Lc0"),
+                          ("Contempt", "WDLCalibrationElo", "ContemptMode"), gpu_mb=2500, short="Lc0",
+                          derive=lc0_contempt),
         "preppy": EngineSpec("preppy", "preppy", [sys.executable, "-m", "tnh.engine.uci"], {},
-                             ("MyElo", "OppElo", "Side", "Tempo", "Price", "Cap", "Obvious", "Prepared"),
+                             ("MyElo", "OppElo", "Side", "Tempo", "Price", "Cap", "Obvious", "Prepared", "DrawScore"),
                              gpu_mb=2500, short="preppy"),
     }
+
+
+def lc0_contempt(settings: dict, me: str) -> dict:
+    """Lc0's contempt from the page: `Contempt` in Elo (empty or 0 = off), positive when "me"
+    (the side at the bottom of the board) is the stronger side. On, `ContemptMode` is
+    `white_side_analysis` or `black_side_analysis` for that side, never `play`, which would
+    favour whichever side is to move; off, `ContemptMode disable` and an empty `Contempt`.
+    `WDLCalibrationElo` passes through (0 = off). `WDLEvalObjectivity` stays at its default.
+    Measured with Lc0 v0.32.1 and BT4 on the Najdorf (2026-11-12): the shown score is not
+    objective under contempt. Contempt 200 for White took White's score from +0.36 to -0.04
+    (and made 6.Bc4 the first move); the same for Black took it to +2.74."""
+    raw = str(settings.get("Contempt", "") or "").strip()
+    try:
+        c = float(raw) if raw else 0.0
+    except ValueError as e:
+        raise EngineError(f"Contempt must be a number of Elo, not {raw!r}") from e
+    if me not in ("white", "black"):
+        raise EngineError(f"me must be white or black, not {me!r}")
+    elo = str(settings.get("WDLCalibrationElo", "") or "").strip() or "0"
+    try:
+        float(elo)
+    except ValueError as e:
+        raise EngineError(f"WDLCalibrationElo must be a number, not {elo!r}") from e
+    if c == 0:
+        return {"Contempt": "", "ContemptMode": "disable", "WDLCalibrationElo": elo}
+    return {"Contempt": f"{c:g}", "ContemptMode": f"{me}_side_analysis", "WDLCalibrationElo": elo}
 
 
 def gpu_free_mb() -> int | None:
@@ -332,7 +362,8 @@ class EngineManager:
             self._gen += 1
             self._lines, self._strings, self._extra, self._root = {}, {}, {}, None
 
-    def go(self, name: str, fen: str, moves: list[str], multipv: int, settings: dict | None = None) -> int:
+    def go(self, name: str, fen: str, moves: list[str], multipv: int, settings: dict | None = None,
+           me: str = "white") -> int:
         """Analyse `fen` (reached by `moves` from the start, or from the FEN alone when `moves`
         is empty) with `name`, `multipv` lines and the page's `settings`. Returns the search's
         generation. `name` "off" quits the engine."""
@@ -360,6 +391,8 @@ class EngineManager:
                     return self._gen
                 self._stop_search()
                 spec = self.specs[name]
+                if spec.derive is not None:
+                    settings = spec.derive(settings, me)
                 want = {"MultiPV": str(multipv)} if "MultiPV" in self._options else {}
                 for k, v in settings.items():
                     if k in spec.settings and k in self._options:
@@ -395,7 +428,9 @@ class EngineManager:
                    "gen": self._gen, "error": self._error, "lines": [], "strings": [],
                    "fen": s.fen if s else None, "searching": self._searching,
                    "options": [self._options[k] for k in self.specs[self._name].settings if k in self._options]
-                   if self._name in self.specs else []}
+                   if self._name in self.specs else [],
+                   "applied": {k: v for k, v in self._applied.items()
+                               if self._name in self.specs and k in self.specs[self._name].settings}}
             if s is None or s.gen != self._gen:
                 return out
             lines = sorted((d for d in self._lines.values() if d["gen"] == s.gen and d["multipv"] <= s.multipv),

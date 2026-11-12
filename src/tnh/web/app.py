@@ -206,7 +206,8 @@ def create_app(stats: Stats, hub: ModelHub, *, trend_rule: TrendRule = TrendRule
 
     @app.post("/api/uci/go")
     async def uci_go(request: Request):
-        """Analyse a position: {engine, fen, moves, multipv, settings}; engine "off" quits it."""
+        """Analyse a position: {engine, fen, moves, multipv, settings, me}; engine "off" quits it.
+        `me` is the side at the bottom of the board (Lc0's contempt side)."""
         if engines is None:
             raise HTTPException(404, "no engines on this server")
         body = await request.json()
@@ -218,7 +219,8 @@ def create_app(stats: Stats, hub: ModelHub, *, trend_rule: TrendRule = TrendRule
         if not 1 <= multipv <= 20:
             raise HTTPException(400, "multipv must be 1-20")
         try:
-            gen = await run_in_threadpool(engines.go, name, fen, moves, multipv, body.get("settings") or {})
+            gen = await run_in_threadpool(engines.go, name, fen, moves, multipv, body.get("settings") or {},
+                                          body.get("me", "white"))
         except EngineError as e:
             raise HTTPException(503, str(e)) from e
         return {"gen": gen}

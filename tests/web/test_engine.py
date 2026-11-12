@@ -227,3 +227,35 @@ def test_start_up_strings_are_not_shown_errors_are(mgr):
     while time.monotonic() < end and not any("error" in x for x in mgr.snapshot()["strings"]):
         time.sleep(0.02)
     assert any("preppy error=" in x for x in mgr.snapshot()["strings"])
+
+
+def test_lc0_contempt_mapping():
+    """Lc0's contempt from the page, through the fake engine: off, on with me as White, then
+    flipped so that I am Black, then off again."""
+    from tnh.web.engine import lc0_contempt
+    spec = EngineSpec("lc0f", "Lc0 (fake)", [sys.executable, FAKE], {},
+                      ("Contempt", "WDLCalibrationElo", "ContemptMode"), short="Lc0", derive=lc0_contempt)
+    m = EngineManager({"lc0f": spec}, gpu_free=lambda: None)
+    try:
+        def sent(settings, me):
+            m.go("lc0f", *after(), multipv=1, settings=settings, me=me)
+            wait_lines(m, 1)
+            return m.snapshot()["applied"]
+
+        assert sent({}, "white") == {"Contempt": "", "ContemptMode": "disable", "WDLCalibrationElo": "0"}
+        assert sent({"Contempt": "0"}, "white")["ContemptMode"] == "disable"
+        on = sent({"Contempt": "200", "WDLCalibrationElo": "2200"}, "white")
+        assert on == {"Contempt": "200", "ContemptMode": "white_side_analysis", "WDLCalibrationElo": "2200"}
+        assert sent({"Contempt": "200", "WDLCalibrationElo": "2200"}, "black")["ContemptMode"] == "black_side_analysis"
+        assert sent({"Contempt": "-150"}, "black") == {"Contempt": "-150", "ContemptMode": "black_side_analysis",
+                                                       "WDLCalibrationElo": "0"}
+        off = sent({"Contempt": ""}, "black")
+        assert off == {"Contempt": "", "ContemptMode": "disable", "WDLCalibrationElo": "0"}
+        # the engine was told each time (the fake echoes every setoption)
+        assert m._applied["ContemptMode"] == "disable"
+        with pytest.raises(EngineError, match="Contempt"):
+            m.go("lc0f", *after(), multipv=1, settings={"Contempt": "lots"}, me="white")
+        assert "play" not in {lc0_contempt({"Contempt": c}, me)["ContemptMode"]
+                              for c in ("", "0", "100", "-100") for me in ("white", "black")}
+    finally:
+        m.close()

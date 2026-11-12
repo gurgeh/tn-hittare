@@ -25,6 +25,10 @@ OPTIONS = [
     "option name Obvious type string default 0.85",
     "option name Prepared type string default 0",
     "option name Hash type spin default 16 min 1 max 1024",
+    "option name Contempt type string default",
+    "option name ContemptMode type combo default play var play var white_side_analysis var black_side_analysis var disable",
+    "option name WDLCalibrationElo type string default 0",
+    "option name DrawScore type string default 0.5",
 ]
 
 
