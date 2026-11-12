@@ -104,21 +104,37 @@ class FastMover:
         pass
 
 
-class ComboMover(FastMover):
-    """``Combo(prune="p0.5")`` for the moves; the leaf from the fast evaluator's calls."""
+class ComboMover:
+    """``Combo(prune="p0.5")`` for the moves; the leaf from Combo's own Maia and Lc0 policy networks (one more
+    call of each: Combo does not hand out the value heads of its internal calls), so no network is loaded twice."""
 
     def __init__(self):
-        super().__init__()
+        from tnh.eval.result import ResultModel
         from tnh.models.combo import Combo
-        self.combo = Combo(prune="p0.5")
+        from tnh.models.maia3 import Elo
+
+        self.combo = Combo(prune="p0.5", maia_batch=64)
+        self.elos = [Elo.offset(0.0), Elo.offset(600.0)]
+        self.leaf = ResultModel("cheap")
         self.name = "combo"
 
     def evaluate(self, queries):
-        _, _, leaf = super().evaluate(queries)
+        m0, m6 = self.combo.maia.predict_many(queries, self.elos)
+        pol = self.combo.policy.predict(queries)
+        w = {"maia0": np.array([p.wdl for p in m0], float), "maia600": np.array([p.wdl for p in m6], float),
+             "lc0raw": np.array([p.wdl for p in pol], float)}
+        w = {k: v / v.sum(1, keepdims=True) for k, v in w.items()}
+        leaf = self.leaf.from_sources(w, queries)
         preds = self.combo.predict(queries)
         moves = [p.moves for p in preds]
-        probs = [np.exp(p.logp.astype(np.float64)) / np.exp(p.logp.astype(np.float64)).sum() for p in preds]
+        probs = []
+        for p in preds:
+            e = np.exp(p.logp.astype(np.float64))
+            probs.append(e / e.sum())
         return moves, probs, leaf
+
+    def close(self):
+        pass
 
 
 # --- nodes --------------------------------------------------------------------------------------
@@ -331,7 +347,7 @@ def cmd_analyse(a) -> None:
 
     test = read_sample(a.positions).with_columns(pl.col("ply").cast(pl.Int64))
     res = {}
-    for mover in ("fast", "combo"):
+    for mover in ("fast", "fast_exact", "combo"):
         f = OUT / f"{mover}.parquet"
         if not f.exists():
             continue

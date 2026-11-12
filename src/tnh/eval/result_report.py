@@ -96,7 +96,11 @@ def front_points(R: Path, rows_file: Path, mover: str = "fast", boot: int = 1000
                          mlogit_probs(th, design(w, ctx, res["all"]["sources"])), "engine"))
     # look-ahead on top of the best static model: (1 - lambda) best + lambda look-ahead, lambda out of fold
     best = np.array(j.get_column("all").to_list())
-    secs = {k: float(j.get_column(f"per_position_{k}").mean()) for k in
+    # seconds per position: from a timing run made in the same sitting as the benchmark, where one exists
+    # (the look-ahead runs themselves shared the GPU with other jobs part of the time)
+    tf = OUT / f"{mover}_timing.parquet"
+    src = pl.read_parquet(tf) if tf.exists() else j
+    secs = {k: float(src.get_column(f"per_position_{k}").mean()) for k in
             ("exact1_seconds", "exact2_seconds", "mc_seconds", "mc_evals")}
     per_eval = secs["mc_seconds"] / secs["mc_evals"]
     t_best = 1.0 / cost["all"]
