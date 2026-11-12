@@ -37,6 +37,8 @@ This docstring is the contract for a GUI (the web page's engine section).
 | Kappa | string (float) | 100 | > 0 | with Mix = kappa |
 | DbFilter | combo | auto | auto, classical, blitz, all, off | the database games counted; auto = the tempo's own |
 | MultiPV | spin | 3 | 1-20 | lines shown |
+| Mode | combo | repertoire | repertoire, bestmove | repertoire: the priced repertoire search (PUCT, learning costs); bestmove: plain expectimax to a reach horizon, deepened step by step, values a function of the models only (`tnh.engine.bestmove`). In bestmove Price, Cap and Obvious are ignored |
+| Alpha | string (float) | 1 | >= 0 | bestmove: my candidates' horizon weight (P / max P) ** Alpha below the root; 0 = every candidate as deep as my top one |
 | CPuct | string (float) | 1.5 | > 0 | PUCT exploration at my moves |
 | PolicyWeight | string (float) | 0.5 | 0-1 | Lc0's raw policy in my prior (the rest is my move model) |
 | PriorMin | string (float) | 0.002 | 0-1 | safety net: a move with a smaller prior is not a candidate |
@@ -80,6 +82,16 @@ and once per round:
   that ends on stand-ins (positions not yet expanded, valued by their parent),
   frontier positions and finished games, and the expanded positions so far.
 - `nodes` in the `info` line is the number of expanded positions in the graph.
+
+**Mode bestmove.** `depth` in the `info` line is the last completed depth k (horizon
+2^(-k/2) of reach weight). The info strings carry, beside the keys above (`net=-`,
+`nonobvious=0`): `mode=bestmove depth=K complete=0|1 inside=N value_in_progress=V|-`, where
+`value` is the move's value at the last completed depth (final; with `complete=0` no depth
+is complete yet and it is the depth in progress), `value_in_progress` its value at the
+depth being searched, and `inside` the positions inside its horizon. All root moves share
+one horizon, so their values compare. My moves in the pv are my best moves (flag `L`).
+The root line: `info string preppy root value=V mode=bestmove depth=K complete=0|1
+provisional=0|1 depth_in_progress=K expanded=E`.
 """
 
 from __future__ import annotations
@@ -116,6 +128,8 @@ OPTIONS = {
     "Kappa": ("kappa", float, "type string default 100"),
     "DbFilter": ("db_filter", str, "type combo default auto var auto var classical var blitz var all var off"),
     "MultiPV": ("lines", int, "type spin default 3 min 1 max 20"),
+    "Mode": ("mode", str, "type combo default repertoire var repertoire var bestmove"),
+    "Alpha": ("alpha", float, "type string default 1"),
     "CPuct": ("c_puct", float, "type string default 1.5"),
     "PolicyWeight": ("policy_weight", float, "type string default 0.5"),
     "PriorMin": ("prior_min", float, "type string default 0.002"),
@@ -151,6 +165,8 @@ class UCI:
     # -- reporting ---------------------------------------------------------------------------
 
     def report(self, r: Result | None) -> None:
+        if r is not None and getattr(r, "mode", None) == "bestmove":
+            return self.report_bestmove(r)
         if r is None or r.solve is None:
             return
         if self.trace and r.lines:
@@ -179,6 +195,28 @@ class UCI:
         self.send(f"info string preppy root value={v:.6f} net={s.net:.6f} price={s.mu:.6g} cost={s.cost} cap={cap} "
                   f"stand_in={m['stand_in']:.4f} frontier={m['frontier']:.4f} finished={m['finished']:.4f} "
                   f"expanded={nodes} provisional={int(r.provisional)}")
+
+    def report_bestmove(self, r: Result) -> None:
+        if self.trace and r.lines:
+            tr = self.trace[-1]
+            key = "first_provisional" if r.provisional else "first_info"
+            tr.setdefault(key, time.perf_counter() - tr["t_position"])
+        eng = self.engine
+        nodes = eng.stats["expanded"]
+        ms = max(int(r.seconds * 1000), 1)
+        nps = int(r.expansions / max(r.seconds, 1e-9))
+        depth = max(r.depth, 0)
+        tail = f"mode=bestmove depth={r.depth} complete={int(r.complete)} provisional={int(r.provisional)}"
+        for k, line in enumerate(r.lines, 1):
+            self.send(f"info depth {depth} multipv {k} score cp {cp_of(line.value)} nodes {nodes} "
+                      f"nps {nps} time {ms} pv {' '.join(line.moves)}")
+            flags = ",".join(f"{m}:{'L' if l else 'M'}" if p is None else f"{m}:{p:.4f}"
+                             for m, p, l in zip(line.moves, line.probs, line.learned))
+            vp = "-" if line.provisional_value is None else f"{line.provisional_value:.6f}"
+            self.send(f"info string preppy multipv={k} value={line.value:.6f} net=- nonobvious=0 "
+                      f"reach={line.reach:.6f} {tail} inside={line.inside} value_in_progress={vp} moves={flags}")
+        self.send(f"info string preppy root value={r.root_value:.6f} {tail} depth_in_progress={r.depth_in_progress} "
+                  f"expanded={nodes}")
 
     def bestmove(self, r: Result | None) -> None:
         if r is not None and r.lines:

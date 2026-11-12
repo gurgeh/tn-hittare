@@ -92,6 +92,8 @@ class Settings:
     kappa: float = 100.0              # with mix="kappa": the model's weight in games
     db_filter: Hashable = "auto"      # passed to the evaluator's counts; "auto" = the tempo's own
     lines: int = 3
+    mode: str = "repertoire"          # "repertoire" (priced, PUCT) or "bestmove" (expectimax to a reach horizon)
+    alpha: float = 1.0                # bestmove: my candidates' horizon weight (P_a / max P) ** alpha
     c_puct: float = 1.5
     fpu: float = 0.05
     policy_weight: float = 0.5        # Lc0's raw policy in my prior
@@ -590,8 +592,16 @@ class Engine:
 
     def search(self, *, nodes: int | None = None, seconds: float | None = None,
                stop: threading.Event | None = None, on_info: Callable[[Result], None] | None = None,
-               info_every: float = 1.0) -> Result:
+               info_every: float = 1.0, depth: int | None = None) -> Result:
         """Search until `nodes` more expansions, `seconds`, or `stop` is set."""
+        if self.s.mode == "bestmove":
+            if getattr(self, "bm", None) is None:
+                from tnh.engine.bestmove import BestMove
+                self.bm = BestMove(self)
+            return self.bm.search(nodes=nodes, seconds=seconds, stop=stop, on_info=on_info, info_every=info_every,
+                                  depth=depth)
+        if self.s.mode != "repertoire":
+            raise ValueError(f"mode must be repertoire or bestmove, got {self.s.mode!r}")
         t0 = time.perf_counter()
         start_exp = self.stats["expanded"]
         last_info = t0
