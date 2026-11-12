@@ -17,7 +17,8 @@
 #
 # - Output goes to $TNH_DATA/logs/NAME.log (default ~/out/tn-hittare/logs).
 # - Blocks until CMD ends. Exit code: CMD's own, 99 when stopped at the cap.
-# - Holds an idle/sleep inhibitor while CMD runs.
+# - Holds an idle/sleep inhibitor while CMD runs. TNH_INHIBIT=0 skips it: for a
+#   server that only waits for requests, which must not keep the laptop awake.
 # - The working directory is the repository root.
 # - Stop a job:  systemctl --user stop tnh-NAME
 # - List jobs:   systemctl --user list-units 'tnh-*'
@@ -32,6 +33,11 @@ mkdir -p "$DATA/logs"
 CAP_MB=$((MEM * 1024))
 HARD_MB=$((CAP_MB + CAP_MB / 4))
 CG=/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/app.slice/tnh-$NAME.service
+if [ "${TNH_INHIBIT:-1}" = 0 ]; then
+  INHIBIT=
+else
+  INHIBIT="systemd-inhibit --what=idle:sleep --why=tn-hittare:$NAME"
+fi
 echo "tnh-run: unit tnh-$NAME, cap ${MEM}G (kernel limit ${HARD_MB}M), log $LOG" >&2
 
 systemd-run --user --quiet --collect --wait \
@@ -40,7 +46,7 @@ systemd-run --user --quiet --collect --wait \
   -p MemoryMax="${HARD_MB}M" -p MemorySwapMax=0 -p TimeoutStopSec=5 \
   -p StandardOutput="append:$LOG" -p StandardError="append:$LOG" \
   -E PATH="$PATH" -E HOME="$HOME" -E TNH_DATA="$DATA" ${TNH_LC0:+-E TNH_LC0="$TNH_LC0"} \
-  systemd-inhibit --what=idle:sleep --why="tn-hittare: $NAME" "$@" &
+  $INHIBIT "$@" &
 RUN=$!
 
 OVER=0
