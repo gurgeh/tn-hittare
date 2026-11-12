@@ -11,10 +11,10 @@ const $ = id => document.getElementById(id)
 const LAST_MOVE = {class: "marker-last", slice: "markerSquare"}
 const CURSOR_ARROW = {class: "arrow-cursor"}
 // Choices of presentation; each is one switch here. `view` was decided by the owner on
-// 2026-11-12: always from White. The other two are still open.
+// 2026-11-12: always from White, and classical games as the default tempo. `ratings` is still open.
 const CHOICES = {
     view: "white",          // "white": scores, ratings, performance, engine and W/D/L from White; "mover": from the side to move
-    defaultTempi: null,     // tempi when the URL names none: null = all, ["classical"] = classical only
+    defaultTempi: ["classical"],   // tempi when the URL names none: null = all, ["classical"] = classical only
     ratings: "both",        // the Maia line: "both" (FIDE -> Maia), "fide" or "maia"
 }
 const MAIA_MIN = 0.01        // Maia moves below this are not listed unless "all legal"

@@ -50,6 +50,7 @@ import multiprocessing
 import os
 import shutil
 import tempfile
+import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -421,10 +422,14 @@ class _Sorted:
     """
 
     def __init__(self, path: Path, key: str):
-        self.pf = pq.ParquetFile(path)
+        self.path = path
         self.key = key
-        col = self.pf.schema_arrow.get_field_index(key)
-        md = self.pf.metadata
+        self._local = threading.local()
+        first = pq.ParquetFile(path)
+        self._local.pf = first
+        self.metadata, self.schema = first.metadata, first.schema_arrow
+        col = self.schema.get_field_index(key)
+        md = self.metadata
         self.groups, mins, maxs = [], [], []
         for i in range(md.num_row_groups):
             rg = md.row_group(i)
@@ -438,6 +443,17 @@ class _Sorted:
             maxs.append(st.max)
         self.groups = np.array(self.groups, np.int64)
         self.mins, self.maxs = np.array(mins, np.uint64), np.array(maxs, np.uint64)
+
+    @property
+    def pf(self) -> pq.ParquetFile:
+        """This thread's reader. A pyarrow ParquetFile cannot be read from two threads at once
+        (it fails with "ReadRangeCache did not find matching cache entry"), and the interface
+        looks positions up from a pool of threads, so each thread opens its own on the footer
+        that was read once."""
+        pf = getattr(self._local, "pf", None)
+        if pf is None:
+            pf = self._local.pf = pq.ParquetFile(self.path, metadata=self.metadata)
+        return pf
 
     def row_groups(self, keys) -> list[int]:
         """Every row group whose [min, max] holds one of the keys.
@@ -458,7 +474,7 @@ class _Sorted:
         k = np.unique(np.asarray(keys, np.uint64))
         groups = self.row_groups(k)
         if not groups:
-            t = self.pf.schema_arrow.empty_table()
+            t = self.schema.empty_table()
             return pl.from_arrow(t.select(columns) if columns else t)
         read = None if columns is None else list(dict.fromkeys([self.key, *columns]))
         df = pl.from_arrow(self.pf.read_row_groups(groups, columns=read))

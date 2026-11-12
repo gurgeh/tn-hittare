@@ -306,3 +306,31 @@ def test_summary_from_files(tmp_path):
     p.write_parquet(tmp_path / "pos_index_s.parquet")
     edges_mod.parents_from_edges(e).write_parquet(tmp_path / "parents_s.parquet")
     assert EdgeDB(name="s", directory=tmp_path).summary() == {"games": 3, "first_year": 2019, "last_year": 2024}
+
+
+def test_reader_is_safe_from_several_threads(tmp_path):
+    """The interface reads one table from a pool of threads; a shared pyarrow reader failed about
+    one page load in five with "ReadRangeCache did not find matching cache entry" (2026-11-12)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    import pyarrow.parquet as pq
+
+    from tnh.data.edges import _Sorted
+
+    n = 40_000
+    df = pl.DataFrame({"pos_hash": [i // 3 for i in range(n)], "v": list(range(n))},
+                      schema={"pos_hash": pl.UInt64, "v": pl.Int64})
+    path = tmp_path / "t.parquet"
+    with pq.ParquetWriter(path, df.to_arrow().schema) as w:
+        w.write_table(df.to_arrow(), row_group_size=64)
+    t = _Sorted(path, "pos_hash")
+    rng = random.Random(1)
+    jobs = [[rng.randrange(n // 3) for _ in range(rng.randint(1, 40))] for _ in range(1200)]
+
+    def look(keys):
+        return sorted(t.rows(keys)["v"].to_list())
+
+    want = [sorted(v for k in set(keys) for v in (3 * k, 3 * k + 1, 3 * k + 2) if v < n) for keys in jobs]
+    with ThreadPoolExecutor(8) as pool:
+        got = list(pool.map(look, jobs))
+    assert got == want
