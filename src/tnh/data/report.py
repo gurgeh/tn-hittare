@@ -120,7 +120,18 @@ def gid_int() -> pl.Expr:
 
 def main() -> None:
     # the first two clocks are all the report shows; the full lists would double the memory
-    games = pl.scan_parquet(CORPUS / "games.parquet").with_columns(pl.col("clocks_s").list.head(2)).collect()
+    # No move strings and only two clocks per game: the full columns would be several GB. Moves are
+    # compared through hashes and fetched as strings only for the few games a table shows.
+    games = (
+        pl.scan_parquet(CORPUS / "games.parquet")
+        .with_columns(
+            pl.col("clocks_s").list.head(2),
+            pl.col("moves_uci").hash(seed=SEED).alias("_mh"),
+            pl.col("moves_uci").str.split(" ").list.head(20).list.join(" ").hash(seed=SEED).alias("_mh20"),
+        )
+        .drop("moves_uci")
+        .collect(engine="streaming")
+    )
     extra = pl.read_parquet(CORPUS / "games_extra.parquet")
     stats = json.loads((CORPUS / "parse_stats.json").read_text())
     g = games.join(extra, on="game_id")
@@ -427,7 +438,9 @@ def king_signal(g: pl.DataFrame, stats: dict, w) -> None:
         w(md_table(d.select("source", *[c for c in labels if c in d.columns])) + "\n")
         early = s.filter(pl.col("ply") < 60)
         if early.height:
-            ex = early.sample(min(20, early.height), seed=SEED).select(
+            ex = early.sample(min(20, early.height), seed=SEED)
+            mv = fetch_moves(ex["game_id"].to_list())
+            ex = ex.with_columns(pl.Series("moves_uci", [mv[g] for g in ex["game_id"].to_list()])).select(
                 "source", pl.col("event").str.slice(0, 40), "date", "white", "black", "result", "ply",
                 pl.col("moves_uci").str.split(" ").list.tail(4).list.join(" ").alias("last moves kept"), "game_url")
             w(f"{early.height:,} of them before ply 60 ({early.height / s.height:.1%}); a sample of {ex.height}:\n")
@@ -435,10 +448,22 @@ def king_signal(g: pl.DataFrame, stats: dict, w) -> None:
             w(KING_STRIP_FINDINGS)
 
 
+def fetch_moves(game_ids: list[str]) -> dict[str, str]:
+    """{game_id: moves_uci} for a few games, read from games.parquet without loading the column whole."""
+    want = pl.DataFrame({"game_id": game_ids}, schema={"game_id": pl.String})
+    got = (pl.scan_parquet(CORPUS / "games.parquet").select("game_id", "moves_uci")
+           .join(want.lazy(), on="game_id", how="semi").collect(engine="streaming"))
+    return dict(zip(got["game_id"].to_list(), got["moves_uci"].to_list(), strict=True))
+
+
 def near_duplicates(g: pl.DataFrame) -> str:
-    """TWIC games from 2020 on that did not match a broadcast game but plausibly are one."""
+    """TWIC games from 2020 on that did not match a broadcast game but plausibly are one.
+
+    Moves are compared by hash (``_mh`` whole game, ``_mh20`` first 20 plies);
+    the prefix test fetches the move strings of the pairs only.
+    """
     lines = []
-    cols = ["game_id", "white", "black", "date", "year", "moves_uci", "n_plies", "tournament_id", "split", "event", "round"]
+    cols = ["game_id", "white", "black", "date", "year", "_mh", "_mh20", "n_plies", "tournament_id", "split", "event", "round"]
     tw = g.filter((pl.col("copy_sources") == [TWIC]) & (pl.col("year") >= 2020)).select(*cols, "source")
     lb = g.filter(pl.col("copy_sources") == [LB]).select(*cols, "broadcast_name")
     lb = lb.filter(pl.col("year") >= 2020)
@@ -451,15 +476,20 @@ def near_duplicates(g: pl.DataFrame) -> str:
 
     tw, lb = add_names(tw), add_names(lb)
     # 1. same date and surnames, different moves
-    pair = tw.join(lb, on=["date", "ws", "bs"], suffix="_lb").filter(pl.col("date").is_not_null())
-    a, b = pl.col("moves_uci"), pl.col("moves_uci_lb")
+    pair = tw.join(lb, on=["date", "ws", "bs"], suffix="_lb").filter(pl.col("date").is_not_null() & (pl.col("_mh") != pl.col("_mh_lb")))
+    mv = fetch_moves(pl.concat([pair["game_id"], pair["game_id_lb"]]).unique().to_list()) if pair.height else {}
     pair = pair.with_columns(
-        kind=pl.when(a.str.starts_with(b) | b.str.starts_with(a)).then(pl.lit("one is a truncated copy of the other"))
-        .when(a.str.split(" ").list.head(20).list.join(" ") == b.str.split(" ").list.head(20).list.join(" "))
+        pl.Series("_a", [mv.get(x, "") for x in pair["game_id"].to_list()], dtype=pl.String),
+        pl.Series("_b", [mv.get(x, "") for x in pair["game_id_lb"].to_list()], dtype=pl.String),
+    )
+    a, b = pl.col("_a"), pl.col("_b")
+    pair = pair.with_columns(
+        kind=pl.when((a + " ").str.starts_with(b + " ") | (b + " ").str.starts_with(a + " ")).then(pl.lit("one is a truncated copy of the other"))
+        .when(pl.col("_mh20") == pl.col("_mh20_lb"))
         .then(pl.lit("same first 20 plies, different later"))
         .otherwise(pl.lit("different before ply 20 (another game the same day)")),
         same_split=pl.col("split") == pl.col("split_lb"),
-    )
+    ).drop("_a", "_b")
     t = pair.group_by("kind").agg(pairs=pl.len(), twic_games=pl.col("game_id").n_unique(),
                                   in_different_splits=(~pl.col("same_split")).sum()).sort("pairs", descending=True)
     lines.append(f"Unmatched TWIC games from 2020 on: {tw.height:,}. Of these, {pair['game_id'].n_unique():,} have a "
@@ -467,25 +497,25 @@ def near_duplicates(g: pl.DataFrame) -> str:
                  "order) but with different moves:\n")
     lines.append(md_table(t) + "\n")
     # 2. same date and moves, surnames differ
-    pm = tw.join(lb, on=["date", "moves_uci"], suffix="_lb").filter(pl.col("date").is_not_null())
+    pm = tw.join(lb, on=["date", "_mh"], suffix="_lb").filter(pl.col("date").is_not_null())
     pm = pm.filter(pl.col("n_plies") >= 20)
     lines.append(f"Same date and the same moves (at least 20 plies) but surnames that the key reads differently: "
                  f"**{pm['game_id'].n_unique():,}** TWIC games, "
                  f"{(pm['split'] != pm['split_lb']).sum():,} of the pairs in different splits.\n")
     if pm.height:
-        s = pm.sample(min(10, pm.height), seed=SEED).select("white", "black", "white_lb", "black_lb", "date")
-        lines.append(md_table(s) + "\n")
+        smp = pm.sample(min(10, pm.height), seed=SEED).select("white", "black", "white_lb", "black_lb", "date")
+        lines.append(md_table(smp) + "\n")
     # 3. same surnames and moves, different year (the key's year)
-    py = tw.join(add_names(g.filter(pl.col("copy_sources") == [LB]).select(*cols)), on=["ws", "bs", "moves_uci"], suffix="_lb")
+    py = tw.join(add_names(g.filter(pl.col("copy_sources") == [LB]).select(*cols)), on=["ws", "bs", "_mh"], suffix="_lb")
     py = py.filter((pl.col("year") != pl.col("year_lb")) & (pl.col("n_plies") >= 20))
     lines.append(f"Same surnames and moves (at least 20 plies), different year: **{py['game_id'].n_unique():,}** TWIC games.\n")
     near = pair.filter(pl.col("kind") != "different before ply 20 (another game the same day)")
     if near.height:
-        s = near.sample(min(10, near.height), seed=SEED).select(
+        smp = near.sample(min(10, near.height), seed=SEED).select(
             "white", "black", "date", "n_plies", "n_plies_lb", "kind", pl.col("event").str.slice(0, 30),
             pl.col("broadcast_name").str.slice(0, 40))
         lines.append("A sample of truncated or late-diverging pairs:\n")
-        lines.append(md_table(s) + "\n")
+        lines.append(md_table(smp) + "\n")
     return "\n".join(lines)
 
 

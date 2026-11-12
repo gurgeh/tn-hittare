@@ -38,6 +38,7 @@ from pathlib import Path
 
 import chess
 import polars as pl
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from tnh.data.pgn import (
@@ -775,36 +776,60 @@ def build(sources: list[str], workers: int, limit_files: int | None, merge_near_
     outs = {"games": out_dir / "games.parquet", "extra": out_dir / "games_extra.parquet"}
     planned = planned.with_columns((pl.col("_id") // (1 << 32)).alias("_part"))
     counts = {"source": Counter(), "tempo": Counter(), "split": Counter(), "cut": Counter(), "strip": Counter()}
-    # games.parquet is sorted by game_id (readers rely on it to skip row groups): the kept rows of
-    # each part go to 256 buckets on the first two hex digits of game_id, and each bucket is sorted
-    # and appended in turn, so one bucket at a time is in memory
+    # games.parquet is sorted by game_id (readers rely on it to skip row groups). The kept rows of
+    # each part are appended to 16 Arrow streams on the first hex digit of game_id; each stream is
+    # then read, sorted and written in turn, so one sixteenth of the games is in memory at a time.
+    # Streams rather than a file per part and bucket: that was 512 small files per part.
     bdir = work.parent / "buckets"
     if bdir.exists():
         shutil.rmtree(bdir)
-    for part_path in parts:
+    bdir.mkdir()
+    streams: dict[tuple[str, str], tuple] = {}
+
+    def flush_streams() -> None:
+        for fh, _ in streams.values():
+            fh.flush()
+            os.fsync(fh.fileno())
+            os.posix_fadvise(fh.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+
+    for k, part_path in enumerate(parts, 1):
         part = int(part_path.stem.split("-")[1])
         g, e = apply_plan(pl.read_parquet(part_path), planned.filter(pl.col("_part") == part).drop("_part"))
         _drop_cache(part_path)
-        b = g["game_id"].str.slice(0, 2)
+        b = g["game_id"].str.slice(0, 1)
         for key, df in (("games", g), ("extra", e)):
             df = df.with_columns(_b=b)
             for (bk,), sub in df.partition_by("_b", as_dict=True).items():
-                d = bdir / key / bk
-                d.mkdir(parents=True, exist_ok=True)
-                sub.drop("_b").write_parquet(d / f"p{part:05d}.parquet", compression="lz4")
-                _drop_cache(d / f"p{part:05d}.parquet")
+                t = sub.drop("_b").to_arrow()
+                if (key, bk) not in streams:
+                    fh = open(bdir / f"{key}_{bk}.arrows", "wb")  # noqa: SIM115 (closed below)
+                    streams[(key, bk)] = (fh, pa.ipc.new_stream(fh, t.schema))
+                streams[(key, bk)][1].write_table(t)
         counts["source"].update(g["source"].to_list())
         counts["tempo"].update(g["tempo"].to_list())
         counts["split"].update(g["split"].to_list())
         counts["cut"].update(g.filter(e["cut_illegal_central_king"])["source"].to_list())
         counts["strip"].update(g.filter(e["stripped_central_king_moves"] > 0)["source"].to_list())
+        if k % 50 == 0:
+            flush_streams()  # their page cache counts against the job's memory under tnh-run
+    flush_streams()
+    for fh, w in streams.values():
+        w.close()
+        fh.close()
     for key in ("games", "extra"):
-        for d in sorted((bdir / key).iterdir()) if (bdir / key).exists() else []:
-            df = pl.read_parquet(d / "*.parquet").sort("game_id")
+        for bk in "0123456789abcdef":
+            path = bdir / f"{key}_{bk}.arrows"
+            if not path.exists():
+                continue
+            with pa.memory_map(str(path)) as src:
+                df = pl.from_arrow(pa.ipc.open_stream(src).read_all()).sort("game_id")
+            _drop_cache(path)
             t = df.to_arrow()
+            del df
             if key not in writers:
                 writers[key] = pq.ParquetWriter(str(outs[key]) + ".tmp", t.schema, compression="zstd")
             writers[key].write_table(t, row_group_size=100_000)
+            path.unlink()
     for key, w in writers.items():
         w.close()
         Path(str(outs[key]) + ".tmp").replace(outs[key])
