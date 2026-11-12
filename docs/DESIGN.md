@@ -306,16 +306,21 @@ learn, and which move in each, to maximise my expected score.
   move model at my rating and Lc0's policy, descent by probability at the
   opponent's moves, leaves valued by the result model in batches. It runs as
   long as it is given and its answer only gets finer.
-- **Two tiers of the move model in the search.** A node is first expanded
-  with the default model (no child values). Without them that model gives
-  large mistakes 1.43 times their real frequency (1.62 at 2200-2399) and 1.26
-  times the real expected loss per move, against 1.18 and 1.12 with child
-  values. A leaf's value says how good the position is but does not change
-  how often the opponent is thought to play into it, so once a node's likely
-  children have been valued, its move probabilities are recomputed with those
-  values as the child columns (the `+ch` trees). The child values then cost
-  nothing extra, and the accurate model applies where the search spends its
-  time.
+- **A fitted update of the move probabilities from the search below** (the
+  user, 2026-11-12; after the first engine exists). The default move model
+  cannot see which of the plausible moves are bad: it gives large mistakes
+  1.43 times their real frequency (1.62 at 2200-2399) and 1.26 times the real
+  expected loss per move, and a leaf's value does not change how often the
+  opponent is thought to play into it. The repair is a model, fitted on real
+  games, that takes a node's first probabilities and what the search has
+  found under each move (the searched value against the best, how much search
+  it rests on, the ratings) and returns the probabilities to use. Step 1's
+  child-value columns are the special case of a search of depth zero (1.158
+  to 1.134 nats; the ratios above fall to 1.18 and 1.12). The data is the
+  engine run at a small budget on sampled game positions with the move played
+  as the label; the engine logs what that needs. Until it exists the search
+  uses the first probabilities as they are, and the root value is logged
+  against the number of expanded nodes so that the drift is visible.
 - **A price per non-obvious learned move** in place of a fixed N as the
   default: a move is learned where reach times gain exceeds the price, so the
   depth sets itself.
@@ -540,6 +545,18 @@ is a bootstrap over tournaments.
   sees, overweighted by 1.18 overall and 1.34 at 2400 and above for large
   ones (Maia +600: 2.17 and 3.20). A T3 network in place of BT4 is worse at
   every step.
+- **The default result model** (2026-11-12, `tnh.eval.result.ResultModel`): a
+  multinomial logit on value heads with both ratings, ply and side to move.
+  `"cheap"`: Maia-3's value head at +0 and +600 and Lc0's raw value head,
+  0.8346 nats on 28,613 test games at about 350 positions per second.
+  `"full"` adds Lc0 at 50 nodes with `WDLCalibrationElo` +400: 0.8276 at 16
+  per second. Ratings alone 0.9675, Lc0's raw value alone 0.8410. Trees lose
+  to the logit. The cheap one is the default: it needs exactly the network
+  calls the default move model makes, so a node's value comes with its move
+  probabilities. Looking ahead with the move model does not improve it: one
+  ply of exact expectation blended in gives +0.0001 [-0.0012, +0.0016], and
+  Monte Carlo lines are worse the deeper they go (+0.04 at 16 plies).
+  Report: `reports/result_model.md`.
 - **The default move model** (the user, 2026-11-12): Maia-3 79M at +0 and
   +600 and Lc0's policy under the trees, without child values (1.158). It is
   about four times as fast as with children at p0.5, and in the search the
