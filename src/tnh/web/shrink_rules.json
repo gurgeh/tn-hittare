@@ -1,0 +1,277 @@
+{
+  "rules": {
+    "w_elo": {
+      "form": "share_logistic",
+      "params": [
+        -22.344938367352775,
+        15.488894017011383,
+        9.76427227769727,
+        -2.0908829028821274,
+        0.5454901392076605,
+        0.18136301785037065,
+        -0.06409993079190911
+      ],
+      "spread_scale": 54.58706025035975,
+      "describe": "prior = base -22.3 +15.5 ln share +9.76 ln N; w = logistic(-2.09 +0.55 ln n +0.18 ln N -0.06 ln(1+spread/54.6))",
+      "provenance": {
+        "fitted": "2026-11-12",
+        "commit": "464a9e5",
+        "sample": {
+          "table": "full",
+          "walks": 3000,
+          "seed": 7,
+          "tempi": [
+            "classical"
+          ],
+          "split_year": 2024,
+          "positions": 38439,
+          "rows": 264633,
+          "date": "2026-11-12",
+          "commit": "41a62b9"
+        },
+        "pairs": 86316,
+        "prior": "0: the move's mean against the position's mean in the same period",
+        "collect": "python -m tnh.web.shrinkfit collect --table full --walks 3000 --seed 7 --tempi classical --split-year 2024 --out <file>",
+        "command": "python -m tnh.web.shrinkfit fit --data <collect output> --write-rules",
+        "oof_mse": {
+          "mse": 1411.966047501051,
+          "lo": 1189.8211741270634,
+          "hi": 1672.3087788324833
+        },
+        "runner_up": "share_hill",
+        "lead": {
+          "mse": 4.311177402085377,
+          "lo": 1.4580565000348997,
+          "hi": 7.326430356436559
+        }
+      }
+    },
+    "b_elo": {
+      "form": "share_logistic",
+      "params": [
+        -24.266391269797136,
+        16.888590960768717,
+        10.73352207397587,
+        -1.3493724216171776,
+        0.561459579575863,
+        0.12202046487863819,
+        -0.5655069234911548
+      ],
+      "spread_scale": 55.32952105155654,
+      "describe": "prior = base -24.3 +16.9 ln share +10.7 ln N; w = logistic(-1.35 +0.56 ln n +0.12 ln N -0.57 ln(1+spread/55.3))",
+      "provenance": {
+        "fitted": "2026-11-12",
+        "commit": "464a9e5",
+        "sample": {
+          "table": "full",
+          "walks": 3000,
+          "seed": 7,
+          "tempi": [
+            "classical"
+          ],
+          "split_year": 2024,
+          "positions": 38439,
+          "rows": 264633,
+          "date": "2026-11-12",
+          "commit": "41a62b9"
+        },
+        "pairs": 86316,
+        "prior": "0: the move's mean against the position's mean in the same period",
+        "collect": "python -m tnh.web.shrinkfit collect --table full --walks 3000 --seed 7 --tempi classical --split-year 2024 --out <file>",
+        "command": "python -m tnh.web.shrinkfit fit --data <collect output> --write-rules",
+        "oof_mse": {
+          "mse": 1403.2928692252808,
+          "lo": 1162.6518021195836,
+          "hi": 1669.7442282109876
+        },
+        "runner_up": "share_hill",
+        "lead": {
+          "mse": 5.472496765530877,
+          "lo": 2.5462365148534616,
+          "hi": 9.046581776714923
+        }
+      }
+    },
+    "chooser": {
+      "form": "share_logistic",
+      "params": [
+        -2.1364489209611266,
+        15.486785280460785,
+        7.038109082003717,
+        -0.6471484129852942,
+        0.4964033793700993,
+        0.0790799970390707,
+        -0.7197461504435176
+      ],
+      "spread_scale": 63.912086308926696,
+      "describe": "prior = base -2.14 +15.5 ln share +7.04 ln N; w = logistic(-0.65 +0.50 ln n +0.08 ln N -0.72 ln(1+spread/63.9))",
+      "provenance": {
+        "fitted": "2026-11-12",
+        "commit": "464a9e5",
+        "sample": {
+          "table": "full",
+          "walks": 3000,
+          "seed": 7,
+          "tempi": [
+            "classical"
+          ],
+          "split_year": 2024,
+          "positions": 38439,
+          "rows": 264633,
+          "date": "2026-11-12",
+          "commit": "41a62b9"
+        },
+        "pairs": 86316,
+        "prior": "0: the move's mean against the position's mean in the same period",
+        "collect": "python -m tnh.web.shrinkfit collect --table full --walks 3000 --seed 7 --tempi classical --split-year 2024 --out <file>",
+        "command": "python -m tnh.web.shrinkfit fit --data <collect output> --write-rules",
+        "oof_mse": {
+          "mse": 1549.9159616864526,
+          "lo": 1298.314074840884,
+          "hi": 1837.7105097265253
+        },
+        "runner_up": "share_hill",
+        "lead": {
+          "mse": 5.937719794094846,
+          "lo": 2.830797927004363,
+          "hi": 9.686952622199417
+        }
+      }
+    },
+    "gap": {
+      "form": "share_logistic",
+      "params": [
+        -3.8589586225331196,
+        3.7584994848836866,
+        1.2301243939985385,
+        -1.6089371898721976,
+        0.373571822416941,
+        0.033011178344582864,
+        -0.5665190770994835
+      ],
+      "spread_scale": 38.418866129321934,
+      "describe": "prior = base -3.86 +3.76 ln share +1.23 ln N; w = logistic(-1.61 +0.37 ln n +0.03 ln N -0.57 ln(1+spread/38.4))",
+      "provenance": {
+        "fitted": "2026-11-12",
+        "commit": "464a9e5",
+        "sample": {
+          "table": "full",
+          "walks": 3000,
+          "seed": 7,
+          "tempi": [
+            "classical"
+          ],
+          "split_year": 2024,
+          "positions": 38439,
+          "rows": 264633,
+          "date": "2026-11-12",
+          "commit": "41a62b9"
+        },
+        "pairs": 86316,
+        "prior": "0: the move's mean against the position's mean in the same period",
+        "collect": "python -m tnh.web.shrinkfit collect --table full --walks 3000 --seed 7 --tempi classical --split-year 2024 --out <file>",
+        "command": "python -m tnh.web.shrinkfit fit --data <collect output> --write-rules",
+        "oof_mse": {
+          "mse": 519.0537633993305,
+          "lo": 426.68766291470297,
+          "hi": 622.3765435725255
+        },
+        "runner_up": "share_hill",
+        "lead": {
+          "mse": 0.9907158649853045,
+          "lo": 0.45272392414117063,
+          "hi": 1.6018555173003846
+        }
+      }
+    },
+    "score": {
+      "form": "logistic",
+      "params": [
+        -3.8454405306779305,
+        0.3183236770256043,
+        0.3032440251679833,
+        0.42139338181004743
+      ],
+      "spread_scale": 0.06377193354163133,
+      "describe": "w = logistic(-3.85 +0.32 ln n +0.30 ln N +0.42 ln(1+spread/0.0638))",
+      "provenance": {
+        "fitted": "2026-11-12",
+        "commit": "464a9e5",
+        "sample": {
+          "table": "full",
+          "walks": 3000,
+          "seed": 7,
+          "tempi": [
+            "classical"
+          ],
+          "split_year": 2024,
+          "positions": 38439,
+          "rows": 264633,
+          "date": "2026-11-12",
+          "commit": "41a62b9"
+        },
+        "pairs": 91686,
+        "prior": "0: the move's mean against the position's mean in the same period",
+        "collect": "python -m tnh.web.shrinkfit collect --table full --walks 3000 --seed 7 --tempi classical --split-year 2024 --out <file>",
+        "command": "python -m tnh.web.shrinkfit fit --data <collect output> --write-rules",
+        "oof_mse": {
+          "mse": 0.0017196661994654165,
+          "lo": 0.001393699925941317,
+          "hi": 0.0021008759328790647
+        },
+        "runner_up": "logistic",
+        "lead": {
+          "mse": 6.684131267009272e-08,
+          "lo": -2.2060376426984053e-07,
+          "hi": 3.3780074844861817e-07
+        }
+      }
+    },
+    "draw": {
+      "form": "share_logistic",
+      "params": [
+        0.003424432519268257,
+        0.009628527652614745,
+        0.0009653442221468079,
+        -5.635067993596973,
+        0.4649443190294393,
+        0.34522951165641064,
+        1.1067073157020486
+      ],
+      "spread_scale": 0.0620250805684785,
+      "describe": "prior = base +0.00342 +0.00963 ln share +0.000965 ln N; w = logistic(-5.64 +0.46 ln n +0.35 ln N +1.11 ln(1+spread/0.062))",
+      "provenance": {
+        "fitted": "2026-11-12",
+        "commit": "464a9e5",
+        "sample": {
+          "table": "full",
+          "walks": 3000,
+          "seed": 7,
+          "tempi": [
+            "classical"
+          ],
+          "split_year": 2024,
+          "positions": 38439,
+          "rows": 264633,
+          "date": "2026-11-12",
+          "commit": "41a62b9"
+        },
+        "pairs": 91686,
+        "prior": "0: the move's mean against the position's mean in the same period",
+        "collect": "python -m tnh.web.shrinkfit collect --table full --walks 3000 --seed 7 --tempi classical --split-year 2024 --out <file>",
+        "command": "python -m tnh.web.shrinkfit fit --data <collect output> --write-rules",
+        "oof_mse": {
+          "mse": 0.001879603748904977,
+          "lo": 0.0015210168812623574,
+          "hi": 0.002304234314930321
+        },
+        "runner_up": "share_hill",
+        "lead": {
+          "mse": 5.772182781527786e-06,
+          "lo": 2.8448823057805868e-06,
+          "hi": 9.85811687622149e-06
+        }
+      }
+    }
+  }
+}

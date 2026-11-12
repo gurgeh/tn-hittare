@@ -337,14 +337,22 @@ function fetchEngine(force) {
 
 // The columns. A column whose figure comes from the models shows the database figure,
 // dimmed, until the models answer (or for good when they are off).
+// The rule each shrunk column uses, as the server states it (a fitted rule from
+// shrink_rules.json, or the fallback n/(n+k)).
+function ruleText(q) {
+    const r = state.info && state.info.shrink && state.info.shrink[q]
+    if (!r || typeof r !== "object") return ""
+    return ` Rule (${r.fallback ? "fallback, not fitted" : "fitted " + r.fitted + " on held-out games"}): ${r.text}; n = the move's games, share = n / the position's games.`
+}
+
 function eloCols() {
     if (CHOICES.elo === "chooser") return [
-        {k: "elo1", h: "Δ Elo", t: "The chooser's rating against the position: the mean rating of the side to move in the games with this move minus its mean over all moves from here, shrunk n/(n+k) toward zero (n = games with both ratings)"},
-        {k: "elo2", h: "Δ gap", t: "The rating gap (chooser minus opponent) in the games with this move minus the same gap over all moves from here, shrunk n/(n+k): above zero, the move is chosen against relatively weaker opponents"},
+        {k: "elo1", h: "Δ Elo", t: () => "The chooser's rating against the position, predicted for the next game with this move: the mean rating of the side to move in its games minus the mean over all moves from here, shrunk toward the rule's prior (n = games with both ratings)." + ruleText("chooser")},
+        {k: "elo2", h: "Δ gap", t: () => "The rating gap (chooser minus opponent) in the games with this move minus the same gap over all moves from here, shrunk the same way: above zero, the move is chosen against relatively weaker opponents." + ruleText("gap")},
     ]
     return [
-        {k: "elo1", h: "W-Elo", t: "White's rating in the games with this move against White's mean over all moves from here, shrunk n/(n+k) toward zero (n = games with both ratings): the expected difference for the next White to reach the position after it"},
-        {k: "elo2", h: "B-Elo", t: "The same for Black"},
+        {k: "elo1", h: "W-Elo", t: () => "White's rating, predicted for the next game with this move, against White's mean over all moves from here: the move's own difference shrunk toward the rule's prior (n = games with both ratings)." + ruleText("w_elo")},
+        {k: "elo2", h: "B-Elo", t: () => "The same for Black." + ruleText("b_elo")},
     ]
 }
 
@@ -353,11 +361,11 @@ function cols() {
     return [
         {k: "san", h: "Move", num: false, w: 62, t: "Move. Italic: not played in the database under these filters"},
         {k: "n", h: "Games", w: 62, t: "Games that played the move from this position, under the filters"},
-        {k: "p_mix", h: "Prob", w: 46, t: `Probability of the move: (games + κ·model) / (all games + κ), κ = ${sh.kappa}. The database share alone in the cell's tooltip`},
+        {k: "p_mix", h: "Prob", w: 46, t: `Probability of the move: (games + κ·model 1) / (all games + κ), κ = ${sh.kappa} (not fitted yet: it needs model 1 on the sample). The database share alone in the cell's tooltip`},
         {k: "p_model", h: "Model", w: 50, t: "Model 1's probability for the side to move at the header's ratings"},
-        {k: "score", h: "Score", w: 50, t: `White's expected score, %: (games·database + κv·model 2) / (games + κv), κv = ${sh.kappa_v}, model 2 for the position after the move at the header's ratings`},
-        {k: "draw", h: "Draw", w: 46, t: `Draw probability, %, mixed the same way (κv = ${sh.kappa_v})`},
-        ...eloCols().map(c => ({...c, w: 58, t: c.t + ` (k = ${sh.k_elo})`})),
+        {k: "score", h: "Score", w: 50, t: () => "White's expected score, %: the move's games shrunk toward model 2 for the position after it (header ratings); until model 2 answers, toward the position's own mean." + ruleText("score")},
+        {k: "draw", h: "Draw", w: 46, t: () => "Draw probability, %, shrunk the same way." + ruleText("draw")},
+        ...eloCols().map(c => ({...c, w: 58})),
         {k: "last_year", h: "Last", w: 44, t: "Last year the move was played"},
         {k: "reach", h: "Reach", w: 62, t: "Games reaching the position after the move by any move order; unfiltered, all tempi"},
         ...(CHOICES.trend ? [{k: "trend", h: "Trend", num: false, w: 82, t: "Share per year. ▲/▼: recent share differs from the earlier share beyond chance"}] : []),
@@ -402,8 +410,11 @@ function rows() {
         }
         r.p_mix = m ? m.p_mix : null
         r.p_model = m ? m.p_model : null
-        r.score = m ? m.score_mix : r.dbScore
-        r.draw = m ? m.draw_mix : r.dbDraw
+        // Before model 2: the database shrunk toward the position (servers from api 3 on).
+        r.preScore = d.score_shrunk ?? r.dbScore
+        r.preDraw = d.draw_shrunk ?? r.dbDraw
+        r.score = m ? m.score_mix : r.preScore
+        r.draw = m ? m.draw_mix : r.preDraw
         if (flip && r.score != null) r.score = 1 - r.score
         r.elo1 = CHOICES.elo === "chooser" ? d.mover_elo_delta ?? null : d.w_elo_delta ?? null
         r.elo2 = CHOICES.elo === "chooser" ? d.gap_delta ?? null : d.b_elo_delta ?? null
@@ -457,7 +468,7 @@ function trendCell(r, s) {
 }
 
 function pending() {
-    return modelsOff() ? "models off: the database alone" : oldServer() ? "the server is older than this page: restart it"
+    return modelsOff() ? "models off" : oldServer() ? "the server is older than this page: restart it"
         : state.modelBusy ? "models computing: the database alone for now" : "the database alone"
 }
 
@@ -471,12 +482,16 @@ function mixCell(r, kind) {
     const m = r.m
     const v = kind === "score" ? r.score : r.draw
     const dbv = kind === "score" ? r.dbScore : r.dbDraw
+    const pre = kind === "score" ? r.preScore : r.preDraw
     const db = dbv == null ? "no games" : `database ${pct(dbv, 1)}% of ${r.n}`
     if (m && v != null) {
         const mv = kind === "score" ? m.score_model : m.draw_model
         return `<td class="num" title="${esc(`${db}; model 2 ${pct(mv, 1)}%`)}">${pct(v)}</td>`
     }
-    return `<td class="num pending" title="${esc(db + "; " + pending())}">${pct(dbv)}</td>`
+    const shrunk = pre != null && pre !== dbv ? `; shrunk toward the position ${pct(pre, 1)}%` : ""
+    // With the models off this is the final figure; otherwise it waits for model 2.
+    const cls = modelsOff() && shrunk ? "num" : "num pending"
+    return `<td class="${cls}" title="${esc(db + shrunk + "; " + pending())}">${pct(pre)}</td>`
 }
 
 function eloCell(r, which) {
@@ -493,6 +508,8 @@ function eloCell(r, which) {
     } else {
         tip = which === 1 ? `White here ${int(d.white_elo)}, position ${int(t.white_elo)}` : `Black here ${int(d.black_elo)}, position ${int(t.black_elo)}`
     }
+    const raw = CHOICES.elo === "chooser" ? (which === 1 ? d.mover_elo_raw : d.gap_raw) : (which === 1 ? d.w_elo_raw : d.b_elo_raw)
+    if (raw != null) tip += `; unshrunk ${signed(raw)}`
     return `<td class="num" title="${esc(`${tip}; ${d.n_rated} games with both ratings`)}">${signed(v)}</td>`
 }
 
@@ -564,7 +581,7 @@ function renderModels() {
     if (oldServer()) {
         h = '<span class="warn">The server is older than this page: restart it (the database columns still work).</span>'
     } else if (modelsOff()) {
-        h = '<span class="dim">models off (server started with --no-models): every column is the database alone</span>'
+        h = '<span class="dim">models off (--no-models): Prob is the database share; Score, Draw and the rating columns are the database shrunk by the fitted rules</span>'
     } else if (m) {
         const c = m.cost
         h = `<span title="Model 1: moves for the side to move. Model 2: win, draw, loss of each position. Both at White ${m.white}, Black ${m.black} (FIDE)">` +
