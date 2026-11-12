@@ -175,8 +175,9 @@ def test_counts_from_the_position_statistics():
     ex = Expander(FakeMoves(), FakeEngine(), Params(kappa=10, eps_white=0.1), me_white=True,
                   me_elo=2000, opp_elo=2000, root_moves=["e2e4"], counts=at_level)
     root = ex.graph.nodes[ex.graph.root]
-    assert not root.me_to_move and root.counts[root.moves.index("e7e5")] == 25
+    assert root.counts is None                     # looked up when the position is expanded
     ex.expand(root)
+    assert not root.me_to_move and root.counts[root.moves.index("e7e5")] == 25
     q = Game(ex.graph, ex.params).dist[root.id]
     assert q[root.moves.index("e7e5")] > 0.6
 
@@ -201,3 +202,41 @@ def test_resume_from_a_saved_graph_makes_no_model_calls():
     assert Game(ex2.graph, params).evaluate({}) == pytest.approx(v)
     ex2.grow(expand_reach=0.01, max_expansions=5)
     assert mm2.queries > 0 and ex2.stats["expanded"] == 5
+
+
+class FakeValue:
+    """A value function: win/draw/loss for the mover from material."""
+
+    def __init__(self) -> None:
+        self.queries = 0
+
+    def wdl(self, queries):
+        self.queries += len(queries)
+        return np.array([FakeMoves().predict([q])[0].wdl for q in queries])
+
+
+def test_separate_value_function_and_stand_ins():
+    from tnh.builder.output import frontier_mass
+    mm, val, eng = FakeMoves(QUEENS_PAWN), FakeValue(), FakeEngine()
+    params = Params(eps_white=0.0, min_reach=0.05)
+    ex = Expander(mm, eng, params, me_white=True, me_elo=2000, opp_elo=2000, value_fn=val, tail_p=0.05)
+    ex.grow(expand_reach=0.01, max_expansions=15)
+    g = ex.graph
+    expanded = [n for n in g.nodes if n.children is not None]
+    # the move model only where a position was expanded, the value function for the rest
+    assert mm.queries == len({n.key for n in expanded}) == ex.stats["move model calls"]
+    real = [n for n in g.nodes if not n.info.get("stand_in")]
+    assert val.queries == ex.stats["value calls"] <= len({n.key for n in real})
+    stand = [n for n in g.nodes if n.info.get("stand_in")]
+    assert stand and ex.stats["stand-ins"] == len(stand)
+    for n in stand:
+        parent = next(p for p in g.nodes if p.children and n.id in p.children)
+        assert n.value == parent.value
+        j = parent.children.index(n.id)
+        assert Game(g, params).dist[parent.id][j] < 0.05
+    fm = frontier_mass(Game(g, params), {})
+    assert 0 < fm["stand_in"] < 0.6      # the tail adds up over plies: about 5 % per ply here
+    # expanding a stand-in gives it a real value first
+    n = stand[0]
+    ex.expand(n)
+    assert "stand_in" not in n.info and ex.stats["stand-ins upgraded"] >= 1

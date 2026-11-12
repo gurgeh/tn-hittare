@@ -29,14 +29,20 @@ def random_counts(g, rng):
 
 
 def random_cost(salt):
-    return lambda n: 2 if zlib.crc32(f"{salt}{n.key}".encode()) % 3 == 0 else 1
+    """0, 1 or 2 per (position, move): zero-cost moves included."""
+    return lambda n, j: zlib.crc32(f"{salt}{n.key}{j}".encode()) % 3
+
+
+def enumeration(game):
+    """How many learned sets brute force tries."""
+    return int(np.prod([1 + len(v) for v in candidates(game).values()]))
 
 
 @pytest.mark.parametrize("seed", range(60))
 def test_dp_is_exact_on_trees(seed):
     rng = np.random.default_rng(seed)
     g = random_game(rng, depth=int(rng.integers(3, 6)), branching=(2, 3), me_first=bool(seed % 2))
-    while len([n for n in g.nodes if n.me_to_move and n.moves]) > 14:   # keep the enumeration small
+    while len([n for n in g.nodes if n.me_to_move and n.moves]) > 10:   # keep the enumeration small
         g = random_game(rng, depth=int(rng.integers(3, 6)), branching=(2, 3), me_first=bool(seed % 2))
     random_counts(g, rng)
     params = Params(kappa=float(rng.choice([1.0, 20.0, np.inf])), lam=float(rng.choice([0.0, 0.2])),
@@ -44,6 +50,10 @@ def test_dp_is_exact_on_trees(seed):
                     eps_white=float(rng.choice([0.03, 0.1, 1.0])),
                     cost=random_cost(seed) if seed % 2 == 0 else Params().cost)
     game = Game(g, params)
+    while enumeration(game) > 20000:         # zero-cost moves make every subset feasible
+        g = random_game(rng, depth=3, branching=(2, 3), me_first=bool(seed % 2))
+        random_counts(g, rng)
+        game = Game(g, params)
     assert is_tree(game)
     n_cand = len(candidates(game))
     K = min(3, n_cand)

@@ -136,7 +136,7 @@ def test_cost_hook():
     A = me(("good", 0.5, 0.6, leaf(0.6)), ("bad", 0.5, 0.55, leaf(0.5)), key="A")
     B = me(("good", 0.1, 0.9, leaf(0.9)), ("bad", 0.9, 0.85, leaf(0.5)), key="B")
     g = build(opp(("a", 0.5, 0.5, A), ("b", 0.5, 0.5, B), key="root"))
-    cost = lambda n: 2 if n.key == "B" else 1
+    cost = lambda n, j: 2 if n.key == "B" else 1
     game = Game(g, Params(eps_white=0.1, cost=cost))
     _, sols = solve(game, 3)
     assert sols[1].learned == {"A": "good"}
@@ -207,3 +207,43 @@ def test_the_two_pessimisms_choose_differently_between_a_long_line_and_a_trap():
     for learned in ({}, {"root": "long"}, {"root": "trap"}):
         assert game.evaluate(learned) == pytest.approx(mixture_value(g, game.params, learned))
         assert game.values(learned)[g.root] == pytest.approx(game.evaluate(learned))
+
+
+def test_zero_cost_chain_of_obvious_moves_leads_to_the_one_that_costs():
+    # Three of my positions in a row where the right move is obvious (my model plays it
+    # 90 %, so it costs 0 at threshold 0.85), then D, where the winning move is one my
+    # model plays 2 % of the time (costs 1). Learning the chain is free and takes me to D
+    # every time; learning D is the one unit to spend.
+    from tnh.builder.game import ObviousCost
+    D = me(("win", 0.02, 0.9, leaf(0.9)), ("usual", 0.98, 0.5, leaf(0.5)), key="D")
+    node = D
+    for i in reversed(range(3)):
+        node = opp(("only", 1.0, 0.5, node), key=f"o{i}")
+        node = me(("good", 0.9, 0.5, node), ("bad", 0.1, 0.45, leaf(0.4)), key=f"C{i}")
+    g = build(node)
+    game = Game(g, Params(eps_white=0.1, cost=ObviousCost(0.85)))
+    _, sols = solve(game, 2)
+    chain = {"C0": "good", "C1": "good", "C2": "good"}
+    assert sols[0].learned == chain and sols[0].cost == 0
+    assert sols[1].learned == {**chain, "D": "win"} and sols[1].cost == 1
+    assert sols[1].value == pytest.approx(0.9)
+    for N in range(3):
+        assert sols[N].value == pytest.approx(brute_force(game, N)[0])
+    # with every move costing 1 the same budget buys far less
+    uniform = Game(g, Params(eps_white=0.1))
+    assert solve(uniform, 1)[1][1].value < sols[1].value - 0.1
+    # a threshold above 0.9 makes the chain cost, and N=1 then buys only D
+    strict = Game(g, Params(eps_white=0.1, cost=ObviousCost(0.95)))
+    assert solve(strict, 1)[1][1].learned == {"D": "win"}
+
+
+def test_forced_root_move_costs_its_budget_and_is_kept():
+    g = model_error_world()
+    base = Game(g, Params(eps_white=0.1))
+    forced = Game(g, Params(eps_white=0.1, force=frozenset({("root", "Q")})))
+    _, sols = solve(forced, 2)
+    assert sols[0].value == -np.inf                     # Q is not obvious: it costs 1
+    assert sols[1].learned == {"root": "Q"} and sols[1].cost == 1
+    assert sols[1].value == pytest.approx(base.evaluate({"root": "Q"}))
+    assert solve(base, 1)[1][1].learned == {"root": "P"}
+    assert brute_force(forced, 1)[0] == pytest.approx(sols[1].value)

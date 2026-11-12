@@ -111,6 +111,7 @@ class Row:
     entered_at: int          # that step's N
     shared_with: int         # how many other positions entered at the same step
     p_find: float            # how often my model plays the move unaided
+    cost: int                # budget units this move costs
     engine: float            # engine's expected score for me after the move, at the search budget
     engine_best: float       # same, after the engine's best move
     line: list[str] = field(default_factory=list)    # played out: learned moves, his best replies
@@ -191,7 +192,7 @@ def rows(game: Game, sols: list[Solution], N: int, ensure: Callable[[Node], None
         line, lv, why = engine_line(game, sol.learned, i, ensure)
         out.append(Row(k, i, paths.get(i, rel_path(n)), m, float(sum(R[x] for x in ids)), losses[k],
                        st.marginal if st else 0.0, st.N if st else 0, (len(st.entered) - 1) if st else 0,
-                       float(game.dist[i][j]), _mine(n, j), float(np.nanmax(n.engine)),
+                       float(n.p_model[j]), game.move_cost(i, j), _mine(n, j), float(np.nanmax(n.engine)),
                        line, lv, why, (deep or {}).get(k)))
     return sorted(out, key=lambda r: (r.entered_at, len(r.path)))
 
@@ -212,6 +213,7 @@ LEGEND = """\
 - reach: probability of reaching the position when I play the repertoire.
 - loss if forgotten: drop in expected score if only this position were forgotten; complementary positions each show their joint value, so this column does not add up.
 - curve gain: rise of the curve at the budget N where the position entered and stayed (`@N`); adds up to the total when the sets along the curve are nested (see the steps). `shared xK` means K positions entered at that step together.
+- cost: budget units (with the obviousness rule, 0 when my model plays the move at least the threshold).
 - I find it: how often my model plays the move unaided.
 - engine: engine's expected score for me after the move, at the search budget (best: after its own best move).
 - line: played out from the position, my learned moves and his engine-best replies until a position I have not learned; line value: the engine's value for me at its end."""
@@ -219,8 +221,8 @@ LEGEND = """\
 
 def table(rs: list[Row], root_board: chess.Board | None = None, path_board: Callable[[Row], chess.Board] | None = None) -> str:
     deep = any(r.deep for r in rs)
-    head = "| # | line to it | learn | reach | loss if forgotten | curve gain | I find it | engine (best) | played out | line value |"
-    sep = "|---|---|---|---:|---:|---:|---:|---:|---|---:|"
+    head = "| # | line to it | learn | cost | reach | loss if forgotten | curve gain | I find it | engine (best) | played out | line value |"
+    sep = "|---|---|---|---:|---:|---:|---:|---:|---:|---|---:|"
     if deep:
         head += " deep: move / best other / passes |"
         sep += "---|"
@@ -234,7 +236,7 @@ def table(rs: list[Row], root_board: chess.Board | None = None, path_board: Call
                 b.push_uci(m)
         played = _san_line(b, r.line)
         shared = f" shared x{r.shared_with + 1}" if r.shared_with else ""
-        row = (f"| {x} | {' '.join(to[:-1]) or '(root)'} | **{to[-1]}** | {r.reach:.3f} | {r.loss_if_forgotten:+.4f} | "
+        row = (f"| {x} | {' '.join(to[:-1]) or '(root)'} | **{to[-1]}** | {r.cost} | {r.reach:.3f} | {r.loss_if_forgotten:+.4f} | "
                f"{r.curve_gain:+.4f} @{r.entered_at}{shared} | {r.p_find:.0%} | {r.engine:.3f} ({r.engine_best:.3f}) | "
                f"{' '.join(played)} ({r.line_end}) | {r.line_value:.3f} |")
         if deep:
@@ -284,6 +286,8 @@ def frontier_mass(game: Game, learned: Learned) -> dict[str, float]:
     - `within_2_plies_of_a_learned_move`: the probability that the game reaches a
       frontier value-head read one or two plies after a learned move. The learned
       move's worth rests directly on those reads.
+    - `stand_in`: the probability of reaching a position whose value is its parent's
+      stand-in (a rare move that got no value call, see `Expander(tail_p=...)`).
     - `total`: all frontier mass (1 minus the mass of finished games).
     """
     g = game.graph
@@ -306,4 +310,5 @@ def frontier_mass(game: Game, learned: Learned) -> dict[str, float]:
     front = [i for i in game.order if not g.nodes[i].expanded and g.nodes[i].moves]
     return {"total": float(R[front].sum()),
             "in_budget_zone": float(sum(R[i] for i in front if bound[i] >= zone)),
-            "within_2_plies_of_a_learned_move": float(M[front, :2].sum())}
+            "within_2_plies_of_a_learned_move": float(M[front, :2].sum()),
+            "stand_in": float(sum(R[i] for i in front if g.nodes[i].info.get("stand_in")))}

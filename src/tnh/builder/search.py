@@ -65,11 +65,17 @@ class _NodeDP:
     prefixes: list[np.ndarray] | None = None    # convolution after each child (not learned)
     kids: list[int] | None = None               # child positions in the convolution order
     learn: np.ndarray | None = None             # per k: the learned move index, -1 = not learned
-    learn_best: np.ndarray | None = None        # f if learned (for backtracking ties)
+    free: bool = False                          # f(0) beats E0: something below is learned at no cost
 
 
 class DP:
-    """The knapsack DP over a `Game`, up to budget K."""
+    """The knapsack DP over a `Game`, up to budget K.
+
+    Costs are per move and may be 0 (an obvious move). Then a subtree can gain with no
+    budget at all, so a child that holds no budget enters with its own f(0), not with
+    E0, and backtracking descends wherever f(0) beats E0. Nothing else changes: the
+    recursion is exact on a tree for any non-negative integer costs.
+    """
 
     def __init__(self, game: Game, K: int) -> None:
         self.game = game
@@ -88,34 +94,36 @@ class DP:
                 cap[i] = 0
                 continue
             d = game.dist[i]
-            kids = [j for j in range(len(n.moves)) if d[j] > 0 and cap[n.children[j]] > 0]
-            c_learn = game.cost(i) if game.learnable(i) else 0
-            cap[i] = min(K, sum(cap[n.children[j]] for j in range(len(n.moves))) + c_learn)
-            # the not-learned value: E0 from children that hold no budget, convolution over the rest
-            base = float(sum(d[j] * self.E0[n.children[j]] for j in range(len(n.moves)) if j not in set(kids)))
+            fs = [self.nodes[c].f for c in n.children]
+            kids = [j for j in range(len(n.moves)) if d[j] > 0 and len(fs[j]) > 1]
+            ks = set(kids)
+            sound = game.sound.get(i, np.zeros(0, dtype=np.int64)) if game.learnable(i) else []
+            costs = {int(j): game.move_cost(i, int(j)) for j in sound}
+            cap[i] = min(K, sum(cap[c] for c in n.children) + max(costs.values(), default=0))
+            # children that hold no budget enter at their own f(0)
+            base = float(sum(d[j] * fs[j][0] for j in range(len(n.moves)) if j not in ks))
             h = np.array([base])
             prefixes = [h]
             for j in kids:
-                fc = self.nodes[n.children[j]].f
-                self.convolution_entries += len(h) * len(fc)
-                h = maxplus(h, d[j] * fc, K)
+                self.convolution_entries += len(h) * len(fs[j])
+                h = maxplus(h, d[j] * fs[j], K)
                 prefixes.append(h)
             f = np.full(cap[i] + 1, h[-1])
             f[: len(h)] = h[: cap[i] + 1]
             nd = _NodeDP(f, prefixes, kids)
-            if c_learn:
+            if costs:
                 learn = np.full(cap[i] + 1, -1, dtype=np.int64)
                 lb = np.full(cap[i] + 1, -np.inf)
-                for j in game.sound[i]:
-                    fc = self.nodes[n.children[j]].f
-                    for k in range(c_learn, cap[i] + 1):
-                        v = at(fc, k - c_learn)
+                for j, c in costs.items():
+                    for k in range(c, cap[i] + 1):
+                        v = at(fs[j], k - c)
                         if v > lb[k] + TOL:
                             lb[k], learn[k] = v, j
                 better = lb > f + TOL
                 f = np.where(better, lb, f)
                 learn[~better] = -1
-                nd.f, nd.learn, nd.learn_best = f, learn, lb
+                nd.f, nd.learn = f, learn
+            nd.free = bool(nd.f[0] > self.E0[i] + TOL)
             self.nodes[i] = nd
 
     def curve(self) -> np.ndarray:
@@ -132,18 +140,17 @@ class DP:
         nd = self.nodes[i]
         f = nd.f
         k = min(k, len(f) - 1)
-        # spend as little as gives the same value
-        target = f[k] - TOL
-        k = int(np.argmax(f >= target))
-        if k == 0 or nd.prefixes is None:
+        k = int(np.argmax(f >= f[k] - TOL))      # spend as little as gives the same value
+        if nd.prefixes is None or (k == 0 and not nd.free):
             return
         n = self.game.graph.nodes[i]
         if nd.learn is not None and nd.learn[k] >= 0:
             j = int(nd.learn[k])
             out.append((i, j))
-            self._back(n.children[j], k - self.game.cost(i), out)
+            self._back(n.children[j], k - self.game.move_cost(i, j), out)
             return
         d = self.game.dist[i]
+        alloc = {}
         for pos in range(len(nd.kids) - 1, -1, -1):
             j = nd.kids[pos]
             prev, fc = nd.prefixes[pos], self.nodes[n.children[j]].f
@@ -152,9 +159,12 @@ class DP:
                 v = at(prev, k - b) + d[j] * fc[b]
                 if v > best + TOL:
                     best, best_b = v, b
-            if best_b:
-                self._back(n.children[j], best_b, out)
+            alloc[j] = best_b
             k -= best_b
+        for j, c in enumerate(n.children):
+            b = alloc.get(j, 0)
+            if d[j] > 0 and (b > 0 or self.nodes[c].free):
+                self._back(c, b, out)
 
 
 @dataclass
@@ -182,38 +192,40 @@ def repair(game: Game, copies: list[tuple[int, int]]) -> dict[Key, str]:
     return learned
 
 
-def improve(game: Game, learned: dict[Key, str], N: int, max_steps: int = 1000) -> tuple[dict[Key, str], list[str]]:
+def improve(game: Game, learned: dict[Key, str], N: int, max_steps: int = 1000,
+            swap_limit: int = 12) -> tuple[dict[Key, str], list[str]]:
     """Local search with exact verification: the best single add or switch that fits,
-    else the best drop-then-add, until nothing improves."""
+    else (for sets of at most `swap_limit` positions, since each try re-values the
+    graph) the best drop-then-add, until nothing improves. Forced positions stay."""
     steps: list[str] = []
-    cur = dict(learned)
+    cur = {k: m for k, m in learned.items() if k not in game.forced}
     val = game.evaluate(cur)
     for _ in range(max_steps):
         used = game.total_cost(cur)
         best = (val + TOL, None)
         marg = game.marginals(cur)
-        cands = sorted(((gain, k, m) for (k, m), gain in marg.items() if m is not None and gain > TOL),
-                       key=lambda t: -t[0])
+        cands = sorted(((gain, k, m) for (k, m), gain in marg.items()
+                        if m is not None and gain > TOL and k not in game.forced), key=lambda t: -t[0])
         for gain, k, m in cands[:20]:
             if k in cur and cur[k] == m:
                 continue
-            extra = 0 if k in cur else game.key_cost(k)
+            extra = game.cost_of(k, m) - (game.cost_of(k, cur[k]) if k in cur else 0)
             if used + extra > N:
                 continue
             trial = {**cur, k: m}
             v = game.evaluate(trial)
             if v > best[0]:
                 best = (v, (f"add {k}:{m}" if k not in cur else f"switch {k}:{m}", trial))
-        if best[1] is None:
+        if best[1] is None and len(cur) <= swap_limit:
             for d in list(cur):
                 base = {k: m for k, m in cur.items() if k != d}
                 bused = game.total_cost(base)
                 marg = game.marginals(base)
                 cands = sorted(((gain, k, m) for (k, m), gain in marg.items()
-                                if m is not None and gain > TOL and k != d and k not in base),
-                               key=lambda t: -t[0])
+                                if m is not None and gain > TOL and k != d and k not in base
+                                and k not in game.forced), key=lambda t: -t[0])
                 for gain, k, m in cands[:5]:
-                    if bused + game.key_cost(k) > N:
+                    if bused + game.cost_of(k, m) > N:
                         continue
                     trial = {**base, k: m}
                     v = game.evaluate(trial)
@@ -227,16 +239,24 @@ def improve(game: Game, learned: dict[Key, str], N: int, max_steps: int = 1000) 
     return cur, steps
 
 
-def solve(game: Game, K: int, local_search: bool = True, overshoot: int = 2) -> tuple[DP, list[Solution]]:
+def solve(game: Game, K: int, local_search: bool = True, overshoot: int = 2,
+          improve_at: set[int] | None = None, greedy_max: int = 12) -> tuple[DP, list[Solution]]:
     """The DP and a solution for every N in 0..K.
 
     On a DAG the DP pays for a shared position once per path, so the repaired set of
     a larger budget N' often fits in N. The DP is run to `overshoot * K`, and for each
     N the best repaired set that fits is the start of the local search. On a tree
     every repaired set costs exactly its budget, and this changes nothing.
+
+    `improve_at`: the budgets that get the local search (default all); the others keep
+    the best repaired set. On a DAG a second local search from nothing runs for budgets up
+    to `greedy_max` (it takes a step per position, each re-valuing the graph). Forced moves (`Params.force`) take their cost out of every
+    budget; a budget below it has no solution (value -inf). Every solution's `learned`
+    includes the forced moves.
     """
     tree = is_tree(game)
-    dp = DP(game, K if tree else overshoot * K)
+    fc = game.forced_cost
+    dp = DP(game, max(K - fc, 0) if tree else overshoot * max(K - fc, 0))
     curve = dp.curve()
     starts: list[tuple[float, int, dict[Key, str]]] = []
     for M in range(dp.K + 1):
@@ -244,14 +264,17 @@ def solve(game: Game, K: int, local_search: bool = True, overshoot: int = 2) -> 
         starts.append((game.evaluate(learned), game.total_cost(learned), learned))
     sols = []
     for N in range(K + 1):
+        if N < fc:
+            sols.append(Solution(N, dict(game.forced), -np.inf, -np.inf, fc, ["infeasible: forced moves cost more"]))
+            continue
         fits = [(v, M) for M, (v, c, _) in enumerate(starts) if c <= N]
-        _, M = max(fits, key=lambda t: (t[0] + (TOL if t[1] == N else 0.0), -t[1]))
+        _, M = max(fits, key=lambda t: (t[0] + (TOL if t[1] == N - fc else 0.0), -t[1]))
         learned = dict(starts[M][2])
-        steps: list[str] = [f"start from N'={M}"] if M != N else []
-        if local_search:
+        steps: list[str] = [f"start from N'={M + fc}"] if M != N - fc else []
+        if local_search and (improve_at is None or N in improve_at):
             learned, more = improve(game, learned, N)
             steps += more
-            if not tree:
+            if not tree and N <= greedy_max:
                 # on a DAG, also a plain greedy from nothing; keep the better
                 alt, alt_steps = improve(game, {}, N)
                 if game.evaluate(alt) > game.evaluate(learned) + TOL:
@@ -259,7 +282,8 @@ def solve(game: Game, K: int, local_search: bool = True, overshoot: int = 2) -> 
         cost = game.total_cost(learned)
         if cost > N:
             raise AssertionError(f"solution for N={N} costs {cost}")
-        sols.append(Solution(N, learned, game.evaluate(learned), float(curve[N]), cost, steps))
+        learned = {**learned, **game.forced}
+        sols.append(Solution(N, learned, game.evaluate(learned), float(curve[min(N - fc, dp.K)]), cost, steps))
     # the exact values must not fall with N: carry a better smaller solution forward
     for N in range(1, K + 1):
         if sols[N].value < sols[N - 1].value - TOL:
@@ -280,22 +304,33 @@ def candidates(game: Game) -> dict[Key, list[str]]:
 
 
 def brute_force(game: Game, N: int, keys: list[Key] | None = None) -> tuple[float, dict[Key, str]]:
-    """The optimum by enumeration: every set of positions within budget N, every sound move."""
+    """The optimum by enumeration: every feasible choice of nothing or a sound move per
+    position, depth first with the budget that remains. With zero-cost moves any number
+    of positions may be learned, so small games only."""
     cand = candidates(game)
     if keys is not None:
         cand = {k: v for k, v in cand.items() if k in set(keys)}
-    ks = list(cand)
-    best = (game.evaluate({}), {})
-    for r in range(1, N + 1):
-        for subset in itertools.combinations(ks, r):
-            if sum(game.key_cost(k) for k in subset) > N:
-                continue
-            for mvs in itertools.product(*(cand[k] for k in subset)):
-                learned = dict(zip(subset, mvs))
-                v = game.evaluate(learned)
-                if v > best[0] + TOL:
-                    best = (v, learned)
-    return best
+    ks = [k for k in cand if k not in game.forced]
+    costs = {k: {m: game.cost_of(k, m) for m in cand[k]} for k in ks}
+    best = [-np.inf, {}]
+    chosen: dict[Key, str] = {}
+
+    def rec(x: int, left: int) -> None:
+        if x == len(ks):
+            v = game.evaluate(chosen)
+            if v > best[0] + TOL:
+                best[0], best[1] = v, dict(chosen)
+            return
+        rec(x + 1, left)
+        k = ks[x]
+        for m, c in costs[k].items():
+            if c <= left:
+                chosen[k] = m
+                rec(x + 1, left - c)
+                del chosen[k]
+
+    rec(0, N - game.forced_cost)
+    return best[0], {**best[1], **game.forced}
 
 
 def drop_one_gains(game: Game, learned: Learned) -> dict[Key, float]:

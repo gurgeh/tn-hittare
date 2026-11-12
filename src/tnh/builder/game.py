@@ -116,8 +116,21 @@ class Graph:
 
 # -- the pieces, each a parameter --------------------------------------------------
 
-def uniform_cost(node: Node) -> int:
+def uniform_cost(node: Node, j: int) -> int:
+    """Every learned move costs one unit."""
     return 1
+
+
+@dataclass(frozen=True)
+class ObviousCost:
+    """The user's rule (2026-11-12): a learned move costs 0 when it is obvious and 1 when it
+    is not. Obvious: my move model, at my rating and without database counts, gives the
+    move at least `threshold`. My nodes carry exactly that distribution in `p_model`."""
+
+    threshold: float = 0.85
+
+    def __call__(self, node: Node, j: int) -> int:
+        return 0 if node.p_model[j] >= self.threshold else 1
 
 
 @dataclass(frozen=True)
@@ -149,7 +162,11 @@ class Params:
     - `eps_white`, `eps_black`: how far below the engine's best (expected score) a
       move may be and still be learned, for the colour I play.
     - `min_reach`: no budget is spent in nodes whose reach bound is below it.
-    - `cost`: the budget units one learned position costs, an int >= 1.
+    - `cost(node, j)`: the budget units that learning move j at the node costs, an
+      int >= 0 (`uniform_cost`: 1; `ObviousCost(t)`: 0 when my model gives the move at
+      least t). Zero-cost moves are learned wherever they gain anything.
+    - `force`: (position key, move) pairs that are played regardless (to ask "what if
+      the root move were this one"). The move's cost is taken out of the budget.
     """
 
     kappa: float | Callable[[Node], float] = math.inf
@@ -157,7 +174,8 @@ class Params:
     eps_white: float = 0.03
     eps_black: float = 0.03
     min_reach: float = 0.0
-    cost: Callable[[Node], int] = uniform_cost
+    cost: Callable[[Node, int], int] = uniform_cost
+    force: frozenset = frozenset()
     lam_node: float = 0.0
     shrink: float = 0.0
     shrink_to: str = "parent"
@@ -268,6 +286,7 @@ class Game:
         self.sound: dict[int, np.ndarray] = {}
         self.by_key: dict[Key, list[int]] = {}
         self.parent: dict[int, tuple[int, int]] = {}      # first parent and the move index from it
+        self.forced: dict[Key, str] = dict(params.force)
         self.beta = engine_posterior(graph, params, self.order)
         self.stats: dict[str, int] = {}
         for i in self.order:
@@ -283,10 +302,18 @@ class Game:
             d = np.asarray(d, dtype=np.float64)
             if d.shape != (len(n.moves),) or abs(d.sum() - 1) > 1e-6 or (d < 0).any():
                 raise ValueError(f"bad distribution at {n.key} (ply {n.ply}): {d}")
-            self.dist[i] = d
-            if n.me_to_move:
+            if n.me_to_move and n.key in self.forced:
+                d = np.zeros(len(n.moves))
+                d[n.moves.index(self.forced[n.key])] = 1.0
+                self.sound[i] = np.zeros(0, dtype=np.int64)
+            elif n.me_to_move:
                 self.sound[i] = sound(n, eps, params.banned)
+            self.dist[i] = d
         self.leaf = {i: self._leaf_value(i) for i in self.order if not graph.nodes[i].expanded}
+        missing = set(self.forced) - {graph.nodes[i].key for i in self.dist}
+        if missing:
+            raise ValueError(f"forced positions not expanded in the graph: {missing}")
+        self.forced_cost = sum(self.cost_of(k, m) for k, m in self.forced.items())
 
     def _leaf_value(self, i: int) -> float:
         n = self.graph.nodes[i]
@@ -317,14 +344,15 @@ class Game:
                 return move in n.moves and n.moves.index(move) in set(self.sound[i].tolist())
         return False
 
-    def cost(self, i: int) -> int:
-        c = self.params.cost(self.graph.nodes[i])
-        if not (isinstance(c, (int, np.integer)) and c >= 1):
-            raise ValueError(f"cost must be an int >= 1, got {c!r}")
+    def move_cost(self, i: int, j: int) -> int:
+        c = self.params.cost(self.graph.nodes[i], j)
+        if not (isinstance(c, (int, np.integer)) and c >= 0):
+            raise ValueError(f"cost must be an int >= 0, got {c!r}")
         return int(c)
 
-    def key_cost(self, key: Key) -> int:
-        return self.cost(self.by_key[key][0])
+    def cost_of(self, key: Key, move: str) -> int:
+        i = self.by_key[key][0]
+        return self.move_cost(i, self.graph.nodes[i].moves.index(move))
 
     def policy(self, i: int, learned: Learned) -> np.ndarray:
         n = self.graph.nodes[i]
@@ -411,13 +439,18 @@ class Game:
 
     def check(self, learned: Learned) -> None:
         for k, mv in learned.items():
+            if k in self.forced:
+                if mv != self.forced[k]:
+                    raise ValueError(f"position {k} is forced to {self.forced[k]}, not {mv}")
+                continue
             if k not in self.by_key:
                 raise ValueError(f"learned position {k} is not in the graph")
             if not self.is_sound(k, mv):
                 raise ValueError(f"learned move {mv} at {k} is not sound (or the position is not expanded)")
 
     def total_cost(self, learned: Learned) -> int:
-        return sum(self.key_cost(k) for k in learned)
+        """Budget used by the learned set, the forced moves included."""
+        return sum(self.cost_of(k, m) for k, m in learned.items() if k not in self.forced) + self.forced_cost
 
     # -- marginal changes -------------------------------------------------------------
 

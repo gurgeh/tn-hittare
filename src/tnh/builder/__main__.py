@@ -15,7 +15,7 @@ import os
 # One thread for BLAS and OpenMP, set before numpy loads: the machine's cores are
 # budgeted per process, and a multi-threaded BLAS on long vectors here used four
 # cores to run slower than one (2026-11-12).
-for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "POLARS_MAX_THREADS"):
     os.environ.setdefault(_v, "1")
 
 import argparse
@@ -343,6 +343,37 @@ def main(argv=None) -> None:
     p.add_argument("--sigmas", type=float, nargs="*", default=[0.0, 0.04, 0.08])
     p.add_argument("--shrinks", type=float, nargs="*", default=[0.3, 0.5, 0.7, 0.9])
     p.set_defaults(fn=cmd_curse)
+
+    p = sub.add_parser("study", help="round 3: one root, real models and database, the root moves compared")
+    p.add_argument("--moves", default="c2c4 g8f6 g2g3 e7e6 f1g2 d7d5")
+    p.add_argument("--me", choices=["white", "black"], default="white")
+    p.add_argument("--elo", type=int, default=2200)
+    p.add_argument("--opp-elo", type=int, default=2200)
+    p.add_argument("--kappa", type=float, default=100.0)
+    p.add_argument("--kappas", type=float, nargs="*", default=[10.0, 100.0, 1000.0])
+    p.add_argument("--obvious", type=float, default=0.85)
+    p.add_argument("--thresholds", type=float, nargs="*", default=[0.8, 0.85, 0.9])
+    p.add_argument("--eps", type=float, default=0.03)
+    p.add_argument("--min-reach", type=float, default=0.003)
+    p.add_argument("--tempo", default="classical")
+    p.add_argument("--band-lo", type=int, default=2000)
+    p.add_argument("--band-hi", type=int, default=2200)
+    p.add_argument("--no-band", action="store_true")
+    p.add_argument("--prune", default="p0.5")
+    p.add_argument("--maia-size", default="79m")
+    p.add_argument("--sf-nodes", type=int, default=2000)
+    p.add_argument("--deep-nodes", type=int, default=1_000_000)
+    p.add_argument("--explore", type=float, default=0.25)
+    p.add_argument("--tail-p", type=float, default=0.005)
+    p.add_argument("--per-move", type=int, default=25, help="expansions under each sound root move")
+    p.add_argument("--budgets", type=int, nargs="*", default=[5, 10, 20, 40])
+    p.add_argument("--profile-budgets", type=int, nargs="*", default=[10, 20])
+    p.add_argument("--profile-min-reach", type=float, default=1e-3)
+    p.add_argument("--lam-side", type=float, default=0.1)
+    p.add_argument("--resume")
+    p.add_argument("--out", required=True)
+    p.add_argument("--report", required=True)
+    p.set_defaults(fn=lambda a: __import__("tnh.builder.study", fromlist=["run"]).run(a))
 
     p = sub.add_parser("chess")
     common(p)

@@ -73,15 +73,30 @@ def pos_key(board: chess.Board) -> int:
 class Expander:
     def __init__(self, move_model: MoveModel, value_model: ValueModel | None, params: Params, *,
                  me_white: bool, me_elo: int, opp_elo: int, root_moves: list[str] = (),
-                 counts: CountSource | None = None, batch: int = 64, explore: float = 1.0) -> None:
+                 counts: CountSource | None = None, batch: int = 64, explore: float = 1.0,
+                 value_fn=None, tail_p: float = 0.0) -> None:
         """`explore`: the reach factor growth gives a sound move at my nodes. 1 is the true
         upper bound (I could learn it). Then every sound move is reachable with
         probability 1, and with five sound moves per position growth fans out fivefold at
         each of my plies; a lower value grows mostly where my model goes and leaves the
         rest to `refine`. Positions whose growth bound is below `min_reach` get no engine
-        call and cannot be learned."""
+        call and cannot be learned.
+
+        `value_fn`: an object with `wdl(queries) -> (n, 3)` win/draw/loss for the mover,
+        e.g. `tnh.models.combo.FrontierValue`. Given, it values every created position
+        and the move model is called only when a position is expanded (most positions
+        never are). Not given, the move model's `Prediction.wdl` is the value and it is
+        called for every created position.
+
+        `tail_p`: children that the mover plays with probability below `tail_p` (and that
+        are not sound moves of mine, nor the opponent's engine-best reply where
+        pessimism needs it) get no value call: they stand in with their parent's value
+        and carry `info["stand_in"]`. `frontier_mass` reports the mass that rests on them.
+        """
         self.move_model = move_model
         self.value_model = value_model
+        self.value_fn = value_fn
+        self.tail_p = tail_p
         self.params = params
         self.me_white = me_white
         self.me_elo, self.opp_elo = me_elo, opp_elo
@@ -90,7 +105,8 @@ class Expander:
         self.explore = explore
         self.graph = Graph(me_white)
         self.boards: dict[int, chess.Board] = {}
-        self._pred: dict[Hashable, tuple[list[str], np.ndarray, float]] = {}   # key -> moves, p, mover's score
+        self._dist: dict[Hashable, tuple[list[str], np.ndarray]] = {}   # key -> moves, model probabilities
+        self._val: dict[Hashable, float] = {}                           # key -> mover's expected score
         self._engine: dict[Hashable, np.ndarray] = {}
         self.bound: dict[int, float] = {}
         self.stats: Counter = Counter()
@@ -99,7 +115,7 @@ class Expander:
         for m in root_moves:
             board.push_uci(m)
         self.root_moves = tuple(root_moves)
-        root = self._make([(board, self.root_moves)])[0]
+        root = self._make([(board, self.root_moves)], [False], math.nan)[0]
         self.graph.root = root.id
         self.beta: dict[int, float] = {}
         if params.lam > 0:
@@ -109,19 +125,21 @@ class Expander:
     @classmethod
     def resume(cls, graph: Graph, move_model: MoveModel, value_model: ValueModel | None, params: Params, *,
                me_white: bool, me_elo: int, opp_elo: int, root_moves: list[str],
-               counts: CountSource | None = None, batch: int = 64, explore: float = 1.0) -> "Expander":
+               counts: CountSource | None = None, batch: int = 64, explore: float = 1.0,
+               value_fn=None, tail_p: float = 0.0) -> "Expander":
         """An expander over a saved graph: boards replayed from the paths, the caches
         refilled from the nodes, reach bounds and posteriors recomputed. No model calls
         unless `params` need engine values the saved graph lacks."""
         ex = cls.__new__(cls)
         ex.move_model, ex.value_model, ex.params = move_model, value_model, params
+        ex.value_fn, ex.tail_p = value_fn, tail_p
         ex.me_white, ex.me_elo, ex.opp_elo = me_white, me_elo, opp_elo
         ex.counts_source = counts or NoCounts()
         ex.batch, ex.explore = batch, explore
         ex.graph = graph
         ex.root_moves = tuple(root_moves)
         ex.stats, ex.seconds = Counter(), Counter()
-        ex.boards, ex._pred, ex._engine = {}, {}, {}
+        ex.boards, ex._dist, ex._val, ex._engine = {}, {}, {}, {}
         for n in graph.nodes:
             b = chess.Board()
             for m in n.path:
@@ -129,8 +147,10 @@ class Expander:
             if pos_key(b) != n.key:
                 raise ValueError(f"node {n.id}: its path does not lead to its key")
             ex.boards[n.id] = b
-            s = n.value if n.me_to_move else 1.0 - n.value
-            ex._pred.setdefault(n.key, (list(n.moves), n.p_model if n.moves else np.zeros(0), s))
+            if n.p_model is not None:
+                ex._dist.setdefault(n.key, (list(n.moves), n.p_model))
+            if not n.info.get("stand_in"):
+                ex._val.setdefault(n.key, n.value if n.me_to_move else 1.0 - n.value)
             if n.engine is not None:
                 ex._engine.setdefault(n.key, n.engine)
         ex.bound = {graph.root: 1.0}
@@ -148,18 +168,18 @@ class Expander:
         me, op = (self.me_elo, self.opp_elo) if mine else (self.opp_elo, self.me_elo)
         return Query(board.fen(), list(path), me, op)
 
-    def _predict(self, items: list[tuple[chess.Board, tuple[str, ...]]]) -> None:
+    def _mine(self, board: chess.Board) -> bool:
+        return board.turn == (chess.WHITE if self.me_white else chess.BLACK)
+
+    def _predict(self, items: list[tuple[Hashable, chess.Board, tuple[str, ...]]]) -> None:
+        """Move-model calls for positions not in the cache; with no `value_fn` they also
+        give the values."""
         todo, seen = [], set()
-        for b, path in items:
-            k = pos_key(b)
-            if k in self._pred or k in seen:
+        for k, b, path in items:
+            if k in self._dist or k in seen:
                 self.stats["move model cache hits"] += 1
                 continue
             seen.add(k)
-            if b.is_game_over(claim_draw=False):
-                self._pred[k] = ([], np.zeros(0), _result_for_mover(b))
-                self.stats["game over"] += 1
-                continue
             todo.append((k, b, path))
         for s in range(0, len(todo), self.batch):
             chunk = todo[s : s + self.batch]
@@ -168,11 +188,49 @@ class Expander:
             self.seconds["move model"] += time.perf_counter() - t
             self.stats["move model calls"] += len(chunk)
             for (k, b, _), pr in zip(chunk, preds):
-                if pr.wdl is None:
-                    raise ValueError(f"{self.move_model.name} gave no value at {b.fen()}")
-                w, d, _l = pr.wdl
                 p = np.exp(pr.logp.astype(np.float64))
-                self._pred[k] = (list(pr.moves), p / p.sum(), w + 0.5 * d)
+                self._dist[k] = (list(pr.moves), p / p.sum())
+                if self.value_fn is None:
+                    if pr.wdl is None:
+                        raise ValueError(f"{self.move_model.name} gave no value at {b.fen()}")
+                    w, d, _l = pr.wdl
+                    self._val.setdefault(k, w + 0.5 * d)
+
+    def _values(self, items: list[tuple[Hashable, chess.Board, tuple[str, ...]]]) -> None:
+        """The mover's expected score for positions not in the cache."""
+        todo, seen = [], set()
+        for k, b, path in items:
+            if k in self._val or k in seen:
+                self.stats["value cache hits"] += 1
+                continue
+            seen.add(k)
+            if b.is_game_over(claim_draw=False):
+                self._val[k] = _result_for_mover(b)
+                self.stats["game over"] += 1
+                continue
+            todo.append((k, b, path))
+        if self.value_fn is None:
+            self._predict(todo)
+            return
+        for s in range(0, len(todo), self.batch):
+            chunk = todo[s : s + self.batch]
+            t = time.perf_counter()
+            w = np.asarray(self.value_fn.wdl([self._query(b, p) for _, b, p in chunk]), dtype=np.float64)
+            self.seconds["value"] += time.perf_counter() - t
+            self.stats["value calls"] += len(chunk)
+            for (k, _, _), row in zip(chunk, w):
+                self._val[k] = float(row[0] + 0.5 * row[1])
+
+    def _set_dist(self, node: Node) -> None:
+        """The node's move distribution, aligned with its legal moves."""
+        if node.p_model is not None or not node.moves:
+            return
+        self._predict([(node.key, self.boards[node.id], node.path)])
+        moves, p = self._dist[node.key]
+        idx = {m: i for i, m in enumerate(moves)}
+        if set(idx) != set(node.moves):
+            raise ValueError(f"move model and board disagree on the legal moves at {self.boards[node.id].fen()}")
+        node.p_model = p[[idx[m] for m in node.moves]]
 
     def _engine_values(self, node: Node) -> np.ndarray:
         if node.key in self._engine:
@@ -187,7 +245,7 @@ class Expander:
         self.stats["engine calls"] += 1
         idx = {m: i for i, m in enumerate(mv.moves)}
         if set(idx) != set(node.moves):
-            raise ValueError(f"engine and move model disagree on the legal moves at {b.fen()}")
+            raise ValueError(f"engine and board disagree on the legal moves at {b.fen()}")
         v = np.array([mv.value[idx[m]] for m in node.moves], dtype=np.float64)
         self.stats["engine moves without a value"] += int(np.isnan(v).sum())
         self._engine[node.key] = v
@@ -195,23 +253,39 @@ class Expander:
 
     # -- nodes -------------------------------------------------------------------------
 
-    def _make(self, items: list[tuple[chess.Board, tuple[str, ...]]]) -> list[Node]:
-        self._predict(items)
+    def _make(self, items: list[tuple[chess.Board, tuple[str, ...]]], stand_in: list[bool],
+              parent_value: float) -> list[Node]:
+        """Nodes for the boards; `stand_in[i]` children get `parent_value` (mine) and no call.
+        A stand-in that is needed for real later is upgraded in place."""
+        keyed = [(pos_key(b), b, path) for b, path in items]
+        need = [x for x, si in zip(keyed, stand_in) if not si]
+        self._values(need)
+        if self.value_fn is None:
+            self._predict(need)
         out = []
-        for b, path in items:
-            k, ply = pos_key(b), len(path) - len(self.root_moves)
-            hit = self.graph.get(k, ply)
-            if hit is not None:
+        for (k, b, path), si in zip(keyed, stand_in):
+            ply = len(path) - len(self.root_moves)
+            mine = self._mine(b)
+            node = self.graph.get(k, ply)
+            if node is not None:
                 self.stats["transpositions merged"] += 1
-                out.append(hit)
+                if not si and node.info.get("stand_in"):
+                    s = self._val[k]
+                    node.value = s if mine else 1.0 - s
+                    del node.info["stand_in"]
+                    self.stats["stand-ins upgraded"] += 1
+                out.append(node)
                 continue
-            moves, p, s = self._pred[k]
-            mine = b.turn == (chess.WHITE if self.me_white else chess.BLACK)
-            node = self.graph.add(k, ply, mine, moves, p_model=p if moves else None,
-                                  value=s if mine else 1.0 - s, path=path)
-            if moves:
-                node.counts = None if mine else self.counts_source.counts(k, moves)
+            moves = [m.uci() for m in b.legal_moves]
+            if si:
+                node = self.graph.add(k, ply, mine, moves, value=parent_value, path=path, info={"stand_in": True})
+                self.stats["stand-ins"] += 1
+            else:
+                s = self._val[k]
+                node = self.graph.add(k, ply, mine, moves, value=s if mine else 1.0 - s, path=path)
             self.boards[node.id] = b
+            if k in self._dist and moves:
+                self._set_dist(node)
             out.append(node)
         return out
 
@@ -228,19 +302,52 @@ class Expander:
     def expand(self, node: Node) -> list[Node]:
         if node.children is not None or not node.moves:
             return []
+        self._set_dist(node)
+        if not node.me_to_move and node.counts is None:
+            t = time.perf_counter()
+            node.counts = self.counts_source.counts(node.key, node.moves)
+            self.seconds["counts"] += time.perf_counter() - t
+            self.stats["count lookups"] += 1
         if (node.me_to_move and self.in_budget_zone(node)) or self.needs_best(node):
             self.ensure_engine(node)
+        if node.info.get("stand_in"):
+            self._values([(node.key, self.boards[node.id], node.path)])
+            s = self._val[node.key]
+            node.value = s if node.me_to_move else 1.0 - s
+            del node.info["stand_in"]
+            self.stats["stand-ins upgraded"] += 1
         b = self.boards[node.id]
         items = []
         for m in node.moves:
             c = b.copy(stack=False)
             c.push_uci(m)
             items.append((c, node.path + (m,)))
-        kids = self._make(items)
+        kids = self._make(items, self._stand_ins(node), node.value)
         self.graph.link(node, kids)
         self.stats["expanded"] += 1
         self._propagate(node)
         return kids
+
+    def _stand_ins(self, node: Node) -> list[bool]:
+        """Which children get no value call: rarely played, not a sound move of mine, not
+        his engine-best reply where pessimism needs it."""
+        if self.tail_p <= 0:
+            return [False] * len(node.moves)
+        p = self._factor_plain(node)
+        keep = p >= self.tail_p
+        if node.me_to_move and node.engine is not None and not np.all(np.isnan(node.engine)):
+            eps = self.params.eps(self.me_white)
+            with np.errstate(invalid="ignore"):
+                keep |= node.engine >= np.nanmax(node.engine) - eps - 1e-12
+        if not node.me_to_move and self.needs_best(node):
+            keep[best_index(node.engine, node)] = True
+        return [not k for k in keep]
+
+    def _factor_plain(self, node: Node) -> np.ndarray:
+        """The mover's probability of each move, with nothing learned."""
+        if node.me_to_move:
+            return node.p_model
+        return opponent_dist(node, self.params, self.beta.get(node.id, 0.0))
 
     def ensure_engine(self, node: Node) -> None:
         if node.engine is None and node.moves:
