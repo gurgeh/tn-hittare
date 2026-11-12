@@ -359,8 +359,9 @@ def main(argv=None) -> None:
     p.add_argument("--band-lo", type=int, default=2000)
     p.add_argument("--band-hi", type=int, default=2200)
     p.add_argument("--no-band", action="store_true")
-    p.add_argument("--prune", default="p0.5")
-    p.add_argument("--maia-size", default="79m")
+    p.add_argument("--prune", default=None,
+                   help="use Combo with this child-pruning rule (e.g. p0.5) instead of the default move model")
+    p.add_argument("--maia-size", default="79m", help="Maia size for --prune (the default model is 79M)")
     p.add_argument("--sf-nodes", type=int, default=2000)
     p.add_argument("--deep-nodes", type=int, default=1_000_000)
     p.add_argument("--explore", type=float, default=0.25)

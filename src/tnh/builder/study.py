@@ -186,6 +186,7 @@ def run(a) -> None:
     from tnh.builder.game import ObviousCost
     from tnh.builder.output import budget_for_price, curve_text, frontier_mass, rel_path, rows, steps_text, table
     from tnh.data.edges import EdgeDB
+    from tnh.models import default_move_model
     from tnh.models.combo import Combo, FrontierValue
     from tnh.models.stockfish import Stockfish
 
@@ -226,7 +227,7 @@ def run(a) -> None:
     say = lambda s: (log.append(s), print(s, flush=True))   # noqa: E731
 
     tl = time.perf_counter()
-    move_model = Combo(prune=a.prune, maia_size=a.maia_size)
+    move_model = Combo(prune=a.prune, maia_size=a.maia_size) if a.prune else default_move_model()
     frontier = FrontierValue()
     say(f"models loaded in {time.perf_counter() - tl:.0f} s")
     with Stockfish(a.sf_nodes, processes=1, per_move=True) as sf:
