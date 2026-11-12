@@ -293,6 +293,49 @@ def exact(ev, roots: list[Node], root_eval, p_min: float, stats: dict):
     return np.array(v1), np.array(v2)
 
 
+def exact_full(ev, roots: list[Node], root_eval, p_min: float, stats: dict) -> list[dict]:
+    """Per root: every legal move's probability and leaf wdl (root's side), and for the moves with p >= p_min
+    every legal reply's probability and leaf wdl (root's side), so that any backup over two plies (truncated
+    or not, expectation or a share on the best reply) can be computed offline. A child that ends the game has
+    its exact result and no replies."""
+    flat1, owner = [], []
+    for i, (n, e) in enumerate(zip(roots, root_eval)):
+        for m in e[0]:
+            flat1.append(n.child(m))
+            owner.append(i)
+    t = time.perf_counter()
+    e1 = evaluate_nodes(ev, flat1)
+    stats["exact1_seconds"] += time.perf_counter() - t
+    stats["exact1_evals"] += len(flat1)
+    out = [{"c_p": [], "c_wdl": [], "c_kept": [], "r_p": [], "r_wdl": []} for _ in roots]
+    flat2, owner2 = [], []
+    k = 0
+    for i, e in enumerate(root_eval):
+        for m, p in zip(e[0], e[1]):
+            c, ce = flat1[k], e1[k]
+            o = out[i]
+            o["c_p"].append(float(p))
+            o["c_wdl"].append(to_root(np.asarray(ce[2], float), 1).tolist())
+            kept = bool(p >= p_min)
+            o["c_kept"].append(kept)
+            if kept:
+                o["r_p"].append([float(q) for q in ce[1]])
+                j = len(o["r_p"]) - 1
+                for r in ce[0]:
+                    flat2.append(c.child(r))
+                    owner2.append((i, j))
+            k += 1
+    t = time.perf_counter()
+    e2 = evaluate_nodes(ev, flat2)
+    stats["exact2_seconds"] += time.perf_counter() - t
+    stats["exact2_evals"] += len(flat2)
+    for o in out:
+        o["r_wdl"] = [[] for _ in o["r_p"]]
+    for (i, j), ge in zip(owner2, e2):
+        out[i]["r_wdl"][j].append(to_root(np.asarray(ge[2], float), 2).tolist())
+    return out
+
+
 def monte_carlo(ev, roots: list[Node], root_eval, n_lines: int, depth: int, rng, stats: dict) -> dict:
     """Values at each depth in DEPTHS, per line: array roots x lines x len(DEPTHS) x 3 (root's side)."""
     R = len(roots)
@@ -372,10 +415,14 @@ def cmd_run(a) -> None:
         re = evaluate_nodes(ev, roots)
         stats["root_seconds"] += time.perf_counter() - t
         stats["root_evals"] += len(roots)
-        v1, v2 = exact(ev, roots, re, a.p_min, stats) if not a.no_exact else (None, None)
+        full = exact_full(ev, roots, re, a.p_min, stats) if a.full_exact else None
+        v1, v2 = exact(ev, roots, re, a.p_min, stats) if not (a.no_exact or a.full_exact) else (None, None)
         mc = monte_carlo(ev, roots, re, a.n_lines, a.depth, rng, stats)
         rows = {"game_id": c.get_column("game_id").to_list(), "ply": c.get_column("ply").to_list(),
                 "static": [list(map(float, e[2])) for e in re]}
+        if full is not None:
+            for key in ("c_p", "c_wdl", "c_kept", "r_p", "r_wdl"):
+                rows[key] = [f[key] for f in full]
         if v1 is not None:
             rows["exact1"] = v1.tolist()
             rows["exact2"] = v2.tolist()
@@ -675,6 +722,7 @@ def main(argv=None) -> None:
     sp.add_argument("--depth", type=int, default=16)
     sp.add_argument("--p-min", type=float, default=0.02)
     sp.add_argument("--no-exact", action="store_true")
+    sp.add_argument("--full-exact", action="store_true", help="per child and reply values (exact_full) instead of the averages")
     sp.add_argument("--limit", type=int)
     sp.add_argument("--chunk", type=int, default=50)
     sp.add_argument("--seed", type=int, default=5)

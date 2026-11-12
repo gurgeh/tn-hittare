@@ -110,3 +110,20 @@ def test_policy_trees_valued_takes_the_moves_and_puts_the_cheap_result_model_on_
                                                          "lc0raw": [pol[0].wdl]}), qs[:1])
     assert np.allclose(got[0].wdl, want[0]) and got[0].moves == pol[0].moves
     assert got[1].moves == [] and got[1].wdl == (0.1, 0.2, 0.7)
+
+
+def test_exact_full_reproduces_the_exact_averages():
+    from tnh.eval.lookahead import exact_full
+
+    ev = FakeEv()
+    b = chess.Board("4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1")
+    root = Node(b, [], 2200, 2100, 0)
+    re = evaluate_nodes(ev, [root])
+    stats = {k: 0.0 for k in ("exact1_seconds", "exact2_seconds", "exact1_evals", "exact2_evals")}
+    v1, v2 = exact(ev, [root], re, 0.0, stats)
+    f = exact_full(ev, [root], re, 0.0, stats)[0]
+    p = np.array(f["c_p"])
+    w = np.array(f["c_wdl"])
+    assert all(f["c_kept"]) and np.allclose(p @ w, v1[0])
+    e2 = sum(pc * (np.array(rp) @ np.array(rw) if rp else wc) for pc, wc, rp, rw in zip(p, w, f["r_p"], f["r_wdl"]))
+    assert np.allclose(e2, v2[0])
