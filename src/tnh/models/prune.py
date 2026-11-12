@@ -31,8 +31,6 @@ from pathlib import Path
 
 import numpy as np
 
-from tnh.models.combo import ENGINE_SOURCES, FIT_SAMPLE, LOGP_SOURCES, TEST_SAMPLE
-
 MATE_CP = 10_000
 
 
@@ -96,6 +94,7 @@ def _load(sample: Path):
     """Data with m0, mbest, lc0pol and the raw child value and effective centipawns per move."""
     from tnh.eval.common import attach, ragged, read_sample, window_rows
     from tnh.eval.logit import build
+    from tnh.models.combo import ENGINE_SOURCES, LOGP_SOURCES
 
     s = window_rows(read_sample(sample))
     D, _ = build(s, LOGP_SOURCES, {})
@@ -174,6 +173,8 @@ def cmd_analyse(a) -> None:
 
 
 def main(argv=None) -> None:
+    from tnh.models.combo import FIT_SAMPLE, TEST_SAMPLE
+
     p = argparse.ArgumentParser(prog="python -m tnh.models.prune", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)

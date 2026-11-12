@@ -498,6 +498,9 @@ def _terminal_value(board: chess.Board) -> tuple[float, int] | None:
     return None
 
 
+_SKIPPED = object()
+
+
 class Lc0Children:
     """The raw network's value of the position after every legal move, as a `ValueModel`.
 
@@ -510,13 +513,17 @@ class Lc0Children:
     """
 
     def __init__(self, network: str | Path = DEFAULT_NETWORK, *, backend: str = "cuda-auto",
-                 batch_size: int = MAX_BATCH, pool_across_positions: bool = True, home: Path = LC0_HOME) -> None:
-        if batch_size > MAX_BATCH:
+                 batch_size: int = MAX_BATCH, pool_across_positions: bool = True, home: Path = LC0_HOME,
+                 allow_nondeterministic_batch: bool = False) -> None:
+        """`allow_nondeterministic_batch`: permit batches above `MAX_BATCH`, where v0.32.1's CUDA
+        backend is not repeatable (an experiment for measuring what that costs, not for use)."""
+        if batch_size > MAX_BATCH and not allow_nondeterministic_batch:
             raise ValueError(f"batch_size above the backend's max_batch {MAX_BATCH}")
         self.network = network_path(str(network), home)
         self._lc = backends(home)
         self._weights = self._lc.Weights(str(self.network))
-        self._backend = self._lc.Backend(weights=self._weights, backend=backend, options=f"max_batch={MAX_BATCH}")
+        self._backend = self._lc.Backend(weights=self._weights, backend=backend,
+                                         options=f"max_batch={max(MAX_BATCH, batch_size)}")
         self.backend_name = backend
         self.batch_size = batch_size
         self.pool = pool_across_positions
@@ -536,11 +543,13 @@ class Lc0Children:
             out += [(float(r.q()), float(r.d())) for r in self._backend.evaluate(*inputs[s : s + self.batch_size])]
         return out
 
-    def evaluate(self, queries: list[Query]) -> list[MoveValues]:
+    def evaluate(self, queries: list[Query], only: list[set[str]] | None = None) -> list[MoveValues]:
+        """With `only`, per query the moves whose child is evaluated; the others get NaN value
+        and cp (mate 0) and cost nothing."""
         plans = []   # per query: legal moves, terminal values, and the slots of its network inputs
         inputs: list = []
         results: list[MoveValues] = []
-        for q in queries:
+        for qi, q in enumerate(queries):
             game = chess.Board()
             if q.moves_uci:
                 for m in q.moves_uci:
@@ -552,7 +561,12 @@ class Lc0Children:
             root_slot = len(inputs)
             inputs.append(self._state(q, []).as_input(self._backend))
             slots, terminal = [], []
+            wanted = None if only is None else only[qi]
             for m in legal:
+                if wanted is not None and m.uci() not in wanted:
+                    terminal.append(_SKIPPED)
+                    slots.append(None)
+                    continue
                 game.push(m)
                 t = _terminal_value(game)
                 game.pop()
@@ -578,6 +592,9 @@ class Lc0Children:
             cp = np.full(n, np.nan, dtype=np.float32)
             mate = np.zeros(n, dtype=np.int16)
             for i, (t, slot) in enumerate(zip(terminal, slots)):
+                if t is _SKIPPED:
+                    self.stats["children skipped"] += 1
+                    continue
                 if t is not None:
                     value[i], mate[i] = t
                     self.stats["terminal children"] += 1

@@ -44,6 +44,9 @@ import numpy as np
 import polars as pl
 
 from tnh.models.base import Prediction, Query
+from tnh.models.prune import keep_mask
+
+MAX_BATCH_DEFAULT = 12   # tnh.models.lc0.MAX_BATCH (not imported here: lc0 loads the bindings lazily)
 from tnh.paths import CORPUS, FEATURES, REPORTS
 
 HERE = Path(__file__).parent
@@ -91,6 +94,30 @@ def child_columns(values: list) -> tuple[list[np.ndarray], list[np.ndarray]]:
     return [e[a:b] for a, b in zip(cuts[:-1], cuts[1:])], [c[a:b] for a, b in zip(cuts[:-1], cuts[1:])]
 
 
+def pruned_child_columns(values: list, only: list[set[str]], fill: str):
+    """`lc0ch_eloss`, `lc0ch_cploss`, `lc0ch_unev` per position with only the kept children
+    evaluated, by `tnh.models.prune.pruned_columns`, the code that made them for the fit."""
+    from tnh.models.prune import MATE_CP, pruned_columns
+
+    lens = [len(v.moves) for v in values]
+    offsets = np.concatenate([[0], np.cumsum(lens)]).astype(np.int64)
+    value = np.concatenate([v.value for v in values]).astype(np.float64) if values else np.zeros(0)
+    cp = np.concatenate([v.cp for v in values]).astype(np.float64) if values else np.zeros(0)
+    mate = np.concatenate([v.mate for v in values]).astype(np.float64) if values else np.zeros(0)
+    keep = np.concatenate([[m in o for m in v.moves] for v, o in zip(values, only)]).astype(bool) \
+        if values else np.zeros(0, dtype=bool)
+    if np.isnan(value[keep]).any():
+        raise ValueError("a kept child without a value")
+    eff = np.where(mate != 0, np.sign(mate) * (MATE_CP - 100 * np.abs(mate)), cp)
+    cols = pruned_columns(value, eff, offsets, keep, fill)
+    cut = lambda x: [x[a:b] for a, b in zip(offsets[:-1], offsets[1:])]   # noqa: E731
+    return cut(cols["lc0ch_eloss"]), cut(cols["lc0ch_cploss"]), cut(cols["lc0ch_unev"])
+
+
+def coef_file(prune: str | None) -> Path:
+    return COEF_FILE if prune is None else HERE / f"combo_coef_{prune.replace('|', '_')}.json"
+
+
 class Combo:
     """Maia-3 (two rating settings) + Lc0 policy + Lc0 child values, combined by the stored logit.
 
@@ -98,14 +125,21 @@ class Combo:
     for the calibrated frontier value.
     """
 
-    def __init__(self, coef: Path = COEF_FILE, *, maia_size: str = "79m", maia_best: str | None = None,
-                 maia_batch: int = 512) -> None:
+    def __init__(self, coef: Path = COEF_FILE, *, prune: str | None = None, maia_size: str = "79m",
+                 maia_best: str | None = None, maia_batch: int = 512) -> None:
+        """`prune`: a rule of `tnh.models.prune` (e.g. "p0.5"); its coefficients come from
+        `combo_coef_<rule>.json` (refit: `python -m tnh.models.combo fit --prune <rule>`)."""
         from tnh.models.lc0 import Lc0Children, Lc0Policy
         from tnh.models.maia3 import Elo, Maia3
 
+        if prune is not None and coef == COEF_FILE:
+            coef = coef_file(prune)
         c = json.loads(Path(coef).read_text())
-        if c["columns"] != COLUMNS:
-            raise ValueError(f"{coef} has columns {c['columns']}, this model computes {COLUMNS}")
+        self.prune = c.get("prune")
+        self.fill = c.get("fill")
+        want = COLUMNS if self.prune is None else COLUMNS + ["lc0ch_unev"]
+        if c["columns"] != want:
+            raise ValueError(f"{coef} has columns {c['columns']}, this model computes {want}")
         self.coef = c
         self.beta = np.array(c["beta"], dtype=np.float64)
         self.eps = float(c["eps"])
@@ -113,7 +147,7 @@ class Combo:
         self.maia = Maia3(maia_size, batch_size=maia_batch)
         self.policy = Lc0Policy()
         self.children = Lc0Children()
-        self.name = f"combo-maia3-{maia_size}-lc0"
+        self.name = f"combo-maia3-{maia_size}-lc0" + ("" if self.prune is None else f"-{self.prune}")
         self.seconds: Counter = Counter()
 
     def features(self, queries: list[Query]) -> tuple[list[list[str]], list[np.ndarray], list[tuple]]:
@@ -124,11 +158,26 @@ class Combo:
         t = time.perf_counter()
         pol = self.policy.predict(queries)
         self.seconds["lc0 policy"] += time.perf_counter() - t
+        only = None
+        if self.prune is not None:
+            only = []
+            for i in range(len(queries)):
+                prob = {}
+                for p in (m0[i], mb[i], pol[i]):
+                    for m, lp in zip(p.moves, np.exp(p.logp.astype(np.float64))):
+                        prob[m] = max(prob.get(m, 0.0), lp)
+                ms = list(prob)
+                pr = np.array([prob[m] for m in ms])
+                keep = keep_mask(pr, np.array([0, len(ms)]), self.prune) if ms else np.zeros(0, dtype=bool)
+                only.append({m for m, k in zip(ms, keep) if k})
         t = time.perf_counter()
-        ch = self.children.evaluate(queries)
+        ch = self.children.evaluate(queries, only)
         self.seconds["lc0 children"] += time.perf_counter() - t
         t = time.perf_counter()
-        eloss, cploss = child_columns(ch)
+        if self.prune is None:
+            eloss, cploss = child_columns(ch)
+        else:
+            eloss, cploss, unev = pruned_child_columns(ch, only, self.fill)
         moves, X, wdl = [], [], []
         for i, q in enumerate(queries):
             ms = ch[i].moves
@@ -138,9 +187,9 @@ class Combo:
                 if set(idx) != set(ms):
                     raise ValueError(f"models disagree on the legal moves at {q.fen}")
                 cols.append(p.logp[[idx[m] for m in ms]].astype(np.float64))
-            cols += [eloss[i], cploss[i]]
+            cols += [eloss[i], cploss[i]] + ([] if self.prune is None else [unev[i]])
             moves.append(ms)
-            X.append(np.column_stack(cols) if ms else np.zeros((0, len(COLUMNS))))
+            X.append(np.column_stack(cols) if ms else np.zeros((0, len(self.beta))))
             wdl.append(ch[i].wdl)
         self.seconds["combine"] += time.perf_counter() - t
         return moves, X, wdl
@@ -241,10 +290,51 @@ def _test_loss(D, cols, beta, eps, boot: int, seed: int = 7) -> dict:   # seed 7
     return est(wmean(loss, D.w), bm[:, 0])
 
 
+def cmd_fit_pruned(a) -> None:
+    from tnh.eval.common import fit_eps, read_meta
+    from tnh.eval.logit import fit, scores
+    from tnh.models.prune import _load, pruned_columns
+
+    base = ["m0", "mbest", "lc0pol"]
+    cols = COLUMNS + ["lc0ch_unev"]
+    parts = {}
+    for side, path in (("fit", a.fit), ("test", a.test)):
+        D, v, c, pr = _load(path)
+        k = keep_mask(pr, D.offsets, a.prune)
+        parts[side] = (D.subset(base).with_columns(pruned_columns(v, c, D.offsets, k, a.fill)).subset(cols), k, D)
+    Xf, kf, Df = parts["fit"]
+    Xt, kt, Dt = parts["test"]
+    beta, it = fit(Xf)
+    lp, _ = scores(Xf, beta)
+    eps = fit_eps(lp, Df.n, Df.w)
+    test = _test_loss(Xt, cols, beta, eps, a.boot)
+    per_pos = np.add.reduceat(kt.astype(np.int64), Dt.offsets[:-1])
+    print(f"prune {a.prune} (fill {a.fill}): beta {np.round(beta, 4).tolist()}, eps {eps:.6f}; children per position "
+          f"{per_pos.mean():.2f}; test {test['est']:.4f} [{test['lo']:.4f}, {test['hi']:.4f}]", flush=True)
+    out = {
+        "what": "conditional logit over the legal moves, Lc0 children evaluated only for the moves kept by the "
+                "rule (tnh.models.prune), window rows of the fitting subsample",
+        "columns": cols, "beta": beta.tolist(), "eps": eps, "newton_iterations": it, "prune": a.prune, "fill": a.fill,
+        "maia_best": "offset+600",
+        "sources": {k: {"dir": str(v), "meta": read_meta(v)} for k, v in {**LOGP_SOURCES, **ENGINE_SOURCES}.items()},
+        "fit": {"sample": str(a.fit), "window_rows": int(len(Df.w)), "moves": int(Df.X.shape[0]),
+                "children_kept": float(kf.mean())},
+        "test": {"sample": str(a.test), "window_rows": int(len(Dt.w)), "mixed": test, "boot": a.boot,
+                 "children_per_position": float(per_pos.mean())},
+        "date": dt.datetime.now().isoformat(timespec="seconds"), "commit": _git_commit(),
+        "refit": f"uv run python -m tnh.models.combo fit --prune '{a.prune}' --fill {a.fill}",
+    }
+    path = a.out if a.out != COEF_FILE else coef_file(a.prune)
+    path.write_text(json.dumps(out, indent=1) + "\n")
+    print(f"wrote {path}")
+
+
 def cmd_fit(a) -> None:
     from tnh.eval.common import fit_eps, read_meta
     from tnh.eval.logit import fit, scores
 
+    if a.prune is not None:
+        return cmd_fit_pruned(a)
     t0 = time.perf_counter()
     _, Df, info_f = _data(a.fit)
     _, Dt, info_t = _data(a.test)
@@ -315,7 +405,13 @@ def _queries(sample: Path, n: int, seed: int) -> tuple[pl.DataFrame, list[Query]
     s = s.sample(n=min(n, s.height), seed=seed).sort("game_id", "ply")
     g = (pl.scan_parquet(CORPUS / "games.parquet").select("game_id", "moves_uci")
          .join(pl.LazyFrame({"game_id": s.get_column("game_id").unique()}), on="game_id", how="semi").collect())
-    s = s.join(g, on="game_id", how="left", maintain_order="left")
+    n0 = s.height
+    s = s.join(g, on="game_id", how="inner", maintain_order="left")
+    if s.height < n0:
+        # games.parquet was rebuilt after the samples were drawn (2026-11-12 07:04): a few
+        # sample games are no longer in it. Their rows are dropped and counted; for the rest
+        # the replay checks that the moves still reach the sample's FEN.
+        print(f"dropped {n0 - s.height} of {n0} sampled rows: their game is not in {CORPUS / 'games.parquet'}")
     return s, queries(s)
 
 
@@ -324,7 +420,8 @@ def cmd_check_live(a) -> None:
     from tnh.eval.logit import engine_columns
 
     s, qs = _queries(a.test, a.n, a.seed)
-    model = Combo(maia_best=a.maia_best)
+    rule = a.prune[0] if a.prune and a.prune[0] not in (None, "none") else None
+    model = Combo(maia_best=a.maia_best, prune=rule)
     t = time.perf_counter()
     moves, X, _ = model.features(qs)
     print(f"{len(qs)} test window positions, live features in {time.perf_counter() - t:.1f} s "
@@ -337,6 +434,7 @@ def cmd_check_live(a) -> None:
     j = attach(s, ENGINE_SOURCES["lc0ch"], ["value", "cp", "mate"])
     ec, _, _ = engine_columns(j, "lc0ch")
     rch = ragged(j, "value")
+    rcp, rmate = ragged(j, "cp"), ragged(j, "mate")
     played = s.get_column("played_uci").to_list()
     worst = Counter()
     ll_live, ll_file, n_pos = [], [], 0
@@ -350,10 +448,23 @@ def cmd_check_live(a) -> None:
             r = file_cols[k][1]
             F.append(r.values[r.offsets[i] : r.offsets[i + 1]][order])
         lo, hi = rch.offsets[i], rch.offsets[i + 1]
-        F += [ec["lc0ch_eloss"][lo:hi][order], ec["lc0ch_cploss"][lo:hi][order]]
+        if rule is None:
+            F += [ec["lc0ch_eloss"][lo:hi][order], ec["lc0ch_cploss"][lo:hi][order]]
+        else:
+            from tnh.models.prune import MATE_CP, pruned_columns
+            v = rch.values[lo:hi][order].astype(np.float64)
+            cpv = rcp.values[lo:hi][order].astype(np.float64)
+            mt = rmate.values[lo:hi][order].astype(np.float64)
+            eff = np.where(mt != 0, np.sign(mt) * (MATE_CP - 100 * np.abs(mt)), cpv)
+            kf = keep_mask(np.exp(np.column_stack(F)).max(1), np.array([0, len(ms)]), rule)
+            kl = x[:, 5] == 0
+            worst["kept set differs (positions)"] += int(not np.array_equal(kf, kl))
+            pc = pruned_columns(v, eff, np.array([0, len(ms)]), kf, model.fill)
+            F += [pc["lc0ch_eloss"], pc["lc0ch_cploss"], pc["lc0ch_unev"]]
         F = np.column_stack(F)
-        for c, name in enumerate(COLUMNS):
-            worst[name] = max(worst[name], float(np.max(np.abs(F[:, c] - x[:, c]))))
+        for c, name in enumerate(COLUMNS + ([] if rule is None else ["lc0ch_unev"])):
+            if name != "lc0ch_unev":
+                worst[name] = max(worst[name], float(np.max(np.abs(F[:, c] - x[:, c]))))
         lp_live, lp_file = model.combine(x), model.combine(F)
         worst["combined logp"] = max(worst["combined logp"], float(np.max(np.abs(lp_live - lp_file))))
         p = ms.index(played[i])
@@ -383,6 +494,125 @@ def cmd_throughput(a) -> None:
             parts = ", ".join(f"{k} {v / dt_:.0%}" for k, v in model.seconds.items())
             print(f"maia {size}, batch {bs:>4}: {len(qs) / dt_:6.1f} positions/s end to end ({parts})", flush=True)
         del model
+
+
+class _GpuSampler:
+    """GPU utilisation every 200 ms while a block runs (nvidia-smi), for 'where the time goes'."""
+
+    def __enter__(self):
+        self.proc = subprocess.Popen(["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits",
+                                      "-lms", "200"], stdout=subprocess.PIPE, text=True)
+        return self
+
+    def __exit__(self, *exc):
+        self.proc.terminate()
+        out, _ = self.proc.communicate(timeout=10)
+        self.samples = [int(x) for x in out.split() if x.strip().isdigit()]
+
+    @property
+    def mean(self) -> float:
+        return float(np.mean(self.samples)) if self.samples else float("nan")
+
+
+def cmd_front(a) -> None:
+    """Log loss against positions per second for the live model's variants, on the same rows."""
+    import os
+
+    from tnh.eval.common import boot_counts, boot_means, cluster_codes, est, wmean
+    from tnh.models.lc0 import Lc0Children, Lc0Policy
+    from tnh.models.maia3 import Elo, Maia3
+
+    s, qs = _queries(a.test, a.n, a.seed)
+    played = s.get_column("played_uci").to_list()
+    w = s.get_column("weight").to_numpy()
+    cl = cluster_codes(s)
+    counts = boot_counts(cl.max() + 1, a.boot, 7)
+    print(f"{len(qs)} test window positions; load {os.getloadavg()}", flush=True)
+    step1 = json.loads((REPORTS / "step1" / "logit_sub.json").read_text())["sets"]
+    seconds: dict[str, float] = {}
+
+    def timed(name, f):
+        with _GpuSampler() as g:
+            t = time.perf_counter()
+            r = f()
+            seconds[name] = time.perf_counter() - t
+        print(f"  {name}: {seconds[name]:.1f} s, {len(qs) / seconds[name]:.1f} positions/s, GPU busy {g.mean:.0f} %",
+              flush=True)
+        return r
+
+    maia = Maia3("79m", batch_size=512)
+    maia.predict_many(qs[:64], [Elo.offset(0.0), Elo.offset(600.0)])
+    m0, mb = timed("maia (two settings)", lambda: maia.predict_many(qs, [Elo.offset(0.0), Elo.offset(600.0)]))
+    del maia
+    pol_model = Lc0Policy()
+    pol_model.predict(qs[:24])
+    pol = timed("lc0 policy", lambda: pol_model.predict(qs))
+    del pol_model
+
+    def aligned(i, ms):
+        return [p.logp[[{m: k for k, m in enumerate(p.moves)}[x] for x in ms]].astype(np.float64)
+                for p in (m0[i], mb[i], pol[i])]
+
+    def loss_of(lp_rows, eps):
+        return np.array([-float(mix(lp, eps)[k]) for lp, k in lp_rows])
+
+    rows = {}
+    moves_of = [p.moves for p in m0]
+    # Maia only and Maia + policy: step 1's coefficients (logit_sub.json, sets M and M+pol)
+    for name, cols in (("maia only (M)", ["m0", "mbest"]), ("maia + lc0 policy (M+pol)", ["m0", "mbest", "lc0pol"])):
+        beta, eps = np.array(step1[name.split("(")[1][:-1]]["beta"]), step1[name.split("(")[1][:-1]]["eps"]
+        lps = []
+        for i in range(len(qs)):
+            X = np.column_stack(aligned(i, moves_of[i])[: len(cols)])
+            sc = X @ beta
+            lps.append((sc - np.logaddexp.reduce(sc), moves_of[i].index(played[i])))
+        rows[name] = (loss_of(lps, eps), ["maia (two settings)"] + (["lc0 policy"] if "lc0pol" in cols else []))
+    configs = [(r, MAX_BATCH_DEFAULT, False) for r in a.prune] + [(r, b, True) for r in a.prune_big for b in a.big_batches]
+    for rule, bs, big in configs:
+        rule = None if rule in (None, "none") else rule
+        model = Combo.__new__(Combo)
+        c = json.loads(coef_file(rule).read_text())
+        model.beta, model.eps, model.prune, model.fill = np.array(c["beta"]), float(c["eps"]), c.get("prune"), c.get("fill")
+        ch_model = Lc0Children(batch_size=bs, allow_nondeterministic_batch=big)
+        only = None
+        if rule is not None:
+            only = []
+            for i in range(len(qs)):
+                pr = np.exp(np.column_stack(aligned(i, moves_of[i]))).max(1)
+                keep = keep_mask(pr, np.array([0, len(pr)]), rule)
+                only.append({m for m, k in zip(moves_of[i], keep) if k})
+        ch_model.evaluate(qs[:8], None if only is None else only[:8])
+        label = f"+ children {'all' if rule is None else rule}, batch {bs}"
+        ch = timed(label, lambda: ch_model.evaluate(qs, only))
+        del ch_model
+        if rule is None:
+            el, cp = child_columns(ch)
+            un = None
+        else:
+            el, cp, un = pruned_child_columns(ch, only, model.fill)
+        lps = []
+        for i in range(len(qs)):
+            ms = ch[i].moves
+            base = [p.logp[[{m: k for k, m in enumerate(p.moves)}[x] for x in ms]].astype(np.float64)
+                    for p in (m0[i], mb[i], pol[i])]
+            X = np.column_stack(base + [el[i], cp[i]] + ([] if un is None else [un[i]]))
+            sc = X @ model.beta
+            lps.append((sc - np.logaddexp.reduce(sc), ms.index(played[i])))
+        rows[f"M+pol {label}"] = (loss_of(lps, model.eps), ["maia (two settings)", "lc0 policy", label])
+    ref = rows[next(k for k in rows if "children all, batch" in k and f"batch {MAX_BATCH_DEFAULT}" in k)][0] \
+        if any("children all" in k for k in rows) else None
+    print(f"\n| model | log loss | minus all children (batch {MAX_BATCH_DEFAULT}) | positions/s |")
+    print("|---|---|---|---|")
+    for name, (loss, parts) in rows.items():
+        bm = boot_means(loss[:, None], w, cl, counts)
+        e = est(wmean(loss, w), bm[:, 0])
+        d = ""
+        if ref is not None:
+            bd = boot_means((loss - ref)[:, None], w, cl, counts)
+            de = est(wmean(loss - ref, w), bd[:, 0])
+            d = f"{de['est']:+.4f} [{de['lo']:+.4f}, {de['hi']:+.4f}]"
+        pps = len(qs) / sum(seconds[p] for p in parts)
+        print(f"| {name} | {e['est']:.4f} [{e['lo']:.4f}, {e['hi']:.4f}] | {d} | {pps:.1f} |", flush=True)
 
 
 def cmd_check_value(a) -> None:
@@ -441,6 +671,8 @@ def main(argv=None) -> None:
     sp.add_argument("--test", type=Path, default=TEST_SAMPLE)
     sp.add_argument("--boot", type=int, default=1000)
     sp.add_argument("--out", type=Path, default=COEF_FILE)
+    sp.add_argument("--prune", help="a rule of tnh.models.prune, e.g. p0.5; writes combo_coef_<rule>.json")
+    sp.add_argument("--fill", default="zero", choices=["zero", "worst"])
     sp.set_defaults(fn=cmd_fit)
     sp = sub.add_parser("value-params")
     sp.add_argument("--label", default="lc0-bt4/nodes50-wdl-offset+400")
@@ -456,9 +688,19 @@ def main(argv=None) -> None:
         sp.add_argument("--n", type=int, default=500)
         sp.add_argument("--seed", type=int, default=1)
         sp.add_argument("--maia-best")
+        sp.add_argument("--prune", nargs="*", default=[None], help="rules; 'none' for all children")
         sp.add_argument("--batch-sizes", type=int, nargs="+", default=[16, 64, 256])
         sp.add_argument("--maia-sizes", nargs="+", default=["79m"])
         sp.set_defaults(fn=fn)
+    sp = sub.add_parser("front")
+    sp.add_argument("--test", type=Path, default=TEST_SAMPLE)
+    sp.add_argument("--n", type=int, default=2000)
+    sp.add_argument("--seed", type=int, default=2)
+    sp.add_argument("--boot", type=int, default=1000)
+    sp.add_argument("--prune", nargs="+", default=["p2", "p1", "p0.5", "none"])
+    sp.add_argument("--prune-big", nargs="*", default=[], help="rules to rerun at the large batch sizes")
+    sp.add_argument("--big-batches", type=int, nargs="*", default=[48])
+    sp.set_defaults(fn=cmd_front)
     sp = sub.add_parser("check-value")
     sp.add_argument("--sample", type=Path, default=CORPUS / "samples" / "test_value10k.parquet")
     sp.add_argument("--n", type=int, default=200)
