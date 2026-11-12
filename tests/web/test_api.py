@@ -188,20 +188,12 @@ def test_pgn_illegal(client):
     assert r.status_code == 400
 
 
-def test_engine(client):
-    r = client.get("/api/engine", params={"fen": START, "nodes": 5000})
-    assert r.status_code == 200, r.text
-    assert len(r.json()["moves"]) == 20
-    assert client.get("/api/engine", params={"fen": START, "nodes": 10}).status_code == 422
-
-
 def test_models_off():
     from tnh.web.models import NoModels
     c = TestClient(create_app(stats(), NoModels()))
     assert c.get("/api/info").json()["models"] == {"disabled": True}
     r = c.get("/api/model", params={"fen": START})
     assert r.status_code == 503 and "--no-models" in r.json()["detail"]
-    assert c.get("/api/engine", params={"fen": START}).status_code == 503
     assert c.get("/api/stats", params={"fen": START}).status_code == 200
 
 

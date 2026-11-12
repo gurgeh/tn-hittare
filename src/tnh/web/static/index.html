@@ -22,22 +22,13 @@
     <label>White <input id="white" type="number" min="0" max="4000" step="50"></label>
     <label>Black <input id="black" type="number" min="0" max="4000" step="50"></label>
   </span>
-  <span class="grp" title="Stockfish node budget for the whole MultiPV search (every legal move)">
-    <label>SF nodes <select id="nodes">
-      <option value="50000">50k</option><option value="200000">200k</option>
-      <option value="1000000">1M</option><option value="3000000">3M</option></select></label>
-    <label title="Fetch the engine on every position change"><input id="sfauto" type="checkbox"> auto</label>
-  </span>
-  <span class="grp" title="The repertoire builder's runs (tnh.builder.export), shown over the board and table">
-    <label>Repertoire <select id="run"></select></label> <select id="budget"></select>
-  </span>
   <span id="source" class="dim"></span>
 </header>
 <main>
   <section id="left">
     <div id="board"></div>
     <div id="nav">
-      <button data-k="start" title="Home">|&lt;</button><button data-k="back" title="←">&lt;</button><button data-k="forward" title="→">&gt;</button><button data-k="end" title="End">&gt;|</button><button data-k="flip" title="f">flip</button><button data-k="engine" title="e">engine</button><button data-k="delete" title="Del: delete this move and what follows">del</button><button data-k="promote" title="p: make this line the main line">promote</button>
+      <button data-k="start" title="Home">|&lt;</button><button data-k="back" title="←">&lt;</button><button data-k="forward" title="→">&gt;</button><button data-k="end" title="End">&gt;|</button><button data-k="flip" title="f">flip</button><button data-k="engine" title="e: the engine on or off">engine</button><button data-k="delete" title="Del: delete this move and what follows">del</button><button data-k="promote" title="p: make this line the main line">promote</button>
     </div>
     <div id="moves" tabindex="-1"></div>
     <textarea id="paste" rows="2" spellcheck="false" placeholder="Paste FEN or PGN, Enter to load (/ to focus, Ctrl+V anywhere)"></textarea>
@@ -48,6 +39,16 @@
     <div id="totals"></div>
     <div id="orders" class="dim"></div>
     <div id="models"></div>
+    <div id="engine">
+      <div id="enghead">
+        <label title="A UCI engine analysing the position shown, until it changes">Engine <select id="eng"></select></label>
+        <label title="How many lines (MultiPV)">Lines <select id="mpv"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>8</option></select></label>
+        <span id="engset"></span>
+        <span id="engstat" class="dim"></span>
+      </div>
+      <div id="englines"></div>
+      <div id="engstrings" class="dim mono"></div>
+    </div>
     <div id="repline" style="display:none"></div>
     <table id="tbl">
       <colgroup id="cols"></colgroup>
@@ -56,10 +57,9 @@
     </table>
     <div id="stubs">
       <button disabled title="Statistics under best play, with shrinkage toward the model: not wired yet (tnh.builder)">Best-play stats</button>
-      <button disabled title="Repertoire search from this position: not wired yet (tnh.builder)">Repertoire</button>
       <span class="dim">stubs</span>
     </div>
-    <div id="keys" class="dim">←/→ move · Home/End · ↑/↓ row · Enter play row · f flip · e engine · a all legal · Del delete · p promote · / paste</div>
+    <div id="keys" class="dim">←/→ move · Home/End · ↑/↓ row · Enter play row · f flip · e engine on/off · a all legal · Del delete · p promote · / paste</div>
     <div id="status" class="mono"></div>
   </section>
 </main>

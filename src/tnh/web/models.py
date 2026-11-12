@@ -5,7 +5,7 @@
 - **Model 2**, the result model: any object with `.wdl(queries)` (an array of win, draw,
   loss for the mover per query), by default `tnh.eval.result.ResultModel("cheap")` (network
   calls only); `result-full` adds Lc0 at 50 nodes, `frontier` is step 1's value head.
-- Stockfish on demand, as before.
+- Engines (Stockfish, Lc0, preppy) are not here: `tnh.web.engine` runs them.
 
 Models are named by a spec string (`load_move_model`, `load_value_model`): a preset, or
 `import:package.module:Name` for any class built without arguments, so a better model drops
@@ -37,7 +37,6 @@ VALUE_BATCH = 12     # queries per model-2 call unless the model sets `queries_p
 class ModelHub(Protocol):
     def move_probs(self, fen: str, moves: list[str], white: int, black: int) -> dict: ...
     def values(self, queries: list[Query], cancelled: Callable[[], bool] = ...) -> list[tuple[float, float, float]]: ...
-    def engine(self, fen: str, moves: list[str], nodes: int) -> dict: ...
     def status(self) -> dict: ...
     def close(self) -> None: ...
 
@@ -162,21 +161,19 @@ def terminal_wdl(board: chess.Board) -> tuple[float, float, float] | None:
 
 
 class Hub:
-    """Model 1, model 2 and Stockfish, created lazily from their specs (or given as objects)."""
+    """Model 1 and model 2, created lazily from their specs (or given as objects)."""
 
     def __init__(self, move_model: str | object = "policy-trees", value_model: str | object = "result-cheap",
-                 *, stockfish_processes: int = 1, cache_size: int = 20000) -> None:
+                 *, cache_size: int = 20000) -> None:
         self._move_spec, self._value_spec = move_model, value_model
         self._move = None if isinstance(move_model, str) else move_model
         self._value = None if isinstance(value_model, str) else value_model
-        self._sf = None
-        self.stockfish_processes = stockfish_processes
-        self._move_lock, self._value_lock, self._sf_lock = threading.Lock(), threading.Lock(), threading.Lock()
+        self._move_lock, self._value_lock = threading.Lock(), threading.Lock()
         if value_model == SHARED:
             # One object answers both (the default move model fills `wdl` from its own network
             # calls): one copy of the networks on the GPU, so one lock for both kinds of request.
             self._value_lock = self._move_lock
-        self._move_cache, self._value_cache, self._sf_cache = _LRU(cache_size), _LRU(cache_size * 4), _LRU(cache_size)
+        self._move_cache, self._value_cache = _LRU(cache_size), _LRU(cache_size * 4)
         self.load_s: dict[str, float] = {}
         self.counts = {"value_queries": 0, "value_cached": 0, "value_terminal": 0, "move_queries": 0}
 
@@ -265,49 +262,13 @@ class Hub:
     def value_name(self) -> str:
         return self._name(self._value, self._value_spec) if self._value is not None else str(self._value_spec)
 
-    # Stockfish ------------------------------------------------------------------
-
-    def _get_sf(self, nodes: int):
-        if self._sf is None:
-            t = time.perf_counter()
-            from tnh.models.stockfish import Stockfish
-            self._sf = Stockfish(nodes, processes=self.stockfish_processes)
-            self.load_s["stockfish"] = time.perf_counter() - t
-        return self._sf
-
-    def engine(self, fen: str, moves: list[str], nodes: int) -> dict:
-        board = _board(fen, moves)
-        key = (position_key(board), nodes)
-        hit = self._sf_cache.get(key)
-        if hit is not None:
-            return {**hit, "cached": True}
-        with self._sf_lock:
-            sf = self._get_sf(nodes)
-            sf.nodes = nodes   # read per search; the lock keeps it per call
-            t = time.perf_counter()
-            mv = sf.evaluate([Query(board.fen(), list(moves), 0, 0)])[0]
-            ms = (time.perf_counter() - t) * 1000
-        out = {
-            "model": f"{sf.engine_id}, {nodes} nodes, MultiPV all",
-            "nodes": nodes,
-            "moves": {m: {"value": _num(v), "cp": _num(c), "mate": int(k)}
-                      for m, v, c, k in zip(mv.moves, mv.value, mv.cp, mv.mate)},
-            "wdl": list(mv.wdl) if mv.wdl else None,
-            "ms": ms,
-        }
-        self._sf_cache.put(key, out)
-        return {**out, "cached": False}
-
     def status(self) -> dict:
         return {"move_model": self._name(self._move, self._move_spec) if self._move else str(self._move_spec),
                 "value_model": self.value_name(),
                 "move_loaded": self._move is not None, "value_loaded": self._value is not None,
-                "stockfish_loaded": self._sf is not None, "load_s": self.load_s, "counts": self.counts}
+                "load_s": self.load_s, "counts": self.counts}
 
     def close(self) -> None:
-        if self._sf is not None:
-            self._sf.close()
-            self._sf = None
         for m in (self._move, self._value):
             if m is not None and callable(getattr(m, "close", None)):
                 m.close()
@@ -320,9 +281,6 @@ class NoModels:
         raise ModelsOff("models are off (--no-models)")
 
     def values(self, queries, cancelled=lambda: False):
-        raise ModelsOff("models are off (--no-models)")
-
-    def engine(self, fen, moves, nodes):
         raise ModelsOff("models are off (--no-models)")
 
     def status(self) -> dict:

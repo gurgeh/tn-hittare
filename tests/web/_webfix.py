@@ -69,20 +69,11 @@ class RecordingValue:
 
 
 def fake_hub():
-    """The real `Hub` over the fake models, with a fixed stand-in for Stockfish."""
+    """The real `Hub` over the fake models."""
     from tnh.web.fakes import FakeMoveModel
-    from tnh.web.models import Hub, _board
+    from tnh.web.models import Hub
 
-    class TestHub(Hub):
-        def engine(self, fen, moves, nodes):
-            board = _board(fen, moves)
-            legal = [m.uci() for m in board.legal_moves]
-            vals = np.linspace(0.6, 0.4, len(legal))
-            return {"model": "fake engine", "nodes": nodes, "ms": 0.0, "wdl": None,
-                    "moves": {m: {"value": float(v), "cp": float(100 * (v - 0.5)), "mate": 0}
-                              for m, v in zip(legal, vals)}}
-
-    return TestHub(FakeMoveModel(), RecordingValue())
+    return Hub(FakeMoveModel(), RecordingValue())
 
 
 def write_run(directory: Path, name: str = "t"):

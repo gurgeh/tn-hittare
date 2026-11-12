@@ -112,9 +112,17 @@ def main() -> None:
         assert counts(page) == {"e7e6": 3, "g7g6": 1}, counts(page)
 
         # the repertoire layer: choose the run, see the learned move, follow a learned line
-        page.goto(BASE + "#t=all")
+        # the controls that are gone, and the engine section that replaces them
+        expect(page.locator("#nodes")).to_have_count(0)
+        expect(page.locator("#run")).to_have_count(0)
+        assert page.locator("#eng option").all_inner_texts()[:1] == ["Off"]
+        assert len(page.locator("#eng option").all_inner_texts()) == 4
+        expect(page.locator("#englines")).to_be_hidden()
+
+        # a run opens from a link: #rep=NAME&N=BUDGET (no control on the page)
+        page.goto(BASE + "#t=all&rep=t&N=3")
+        page.reload()
         settle(page)
-        page.locator("#run").select_option("t")
         page.wait_for_function("location.hash.includes('rep=t') && window.tnh.state.rep.pos")
         expect(page.locator("#repline")).to_contain_text("outside the run's graph")
         page.locator("#repline a[data-line]").click()                 # to the root of the run
@@ -126,7 +134,7 @@ def main() -> None:
         assert n_lines >= 2, n_lines
         page.locator("#replines a[data-line]").last.click()
         page.wait_for_function("window.tnh.state.rep.pos && window.tnh.state.rep.pos.in_graph && window.tnh.state.rep.pos.learned")
-        page.locator("#run").select_option("")
+        page.locator("#repclose").click()
         page.wait_for_function("!location.hash.includes('rep=')")
         expect(page.locator("#repline")).to_be_hidden()
 

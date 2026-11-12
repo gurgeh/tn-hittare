@@ -182,3 +182,19 @@ a.lnk:hover { text-decoration: underline; }
 .cmt { color: var(--dim); font-size: 11px; margin-right: 4px; }
 .cm-chessboard .arrow-learned .arrow-head { fill: #1a7f37; }
 .cm-chessboard .arrow-learned .arrow-line { stroke: #1a7f37; stroke-linecap: round; opacity: 0.65; }
+
+/* the engine section */
+#engine { font-size: 12px; border: 1px solid var(--line); border-radius: 3px; background: var(--panel); padding: 3px 6px; }
+#enghead { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: center; }
+#enghead input { width: 4.6em; }
+#enghead input.short { width: 4em; }
+#engstat { margin-left: auto; }
+#engstat .err, #engine .err { color: var(--err); }
+.eline { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.55; }
+.escore { display: inline-block; min-width: 4.2em; font-weight: 600; font-variant-numeric: tabular-nums; }
+.edepth { display: inline-block; min-width: 3.4em; color: var(--dim); font-variant-numeric: tabular-nums; }
+.epv a { margin-right: 4px; }
+.epv a.learned { color: var(--up); font-weight: 600; }
+.epv a.mine { color: var(--fg); }
+.epv sup { color: var(--dim); font-size: 9px; margin-right: 3px; }
+#engstrings { font-size: 11px; max-height: 8em; overflow-y: auto; }

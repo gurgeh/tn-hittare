@@ -18,6 +18,7 @@ const CHOICES = {
     defaultTempi: ["classical"],   // tempi when the URL names none: null = all, ["classical"] = classical only
     elo: "colours",         // "colours": W-Elo and B-Elo deltas; "chooser": the chooser's delta and the rating-gap delta
     trend: true,            // the per-year share column
+    engineColumn: true,     // a table column with the running engine's score for the moves among its lines
 }
 const API = 3                // the server's /api/info "api" this page needs
 
@@ -25,19 +26,19 @@ const state = {
     tree: new MoveTree(),
     orientation: COLOR.white,
     filters: {y0: "", y1: "", e0: "", e1: "", tempi: CHOICES.defaultTempi},
-    white: 2200, black: 2200, nodes: 200000, sfauto: false,
+    white: 2200, black: 2200,
     showAll: false,
     sort: {key: "n", desc: true},
     cursor: null,     // uci of the highlighted row
-    stats: null, model: null, engine: null,
+    stats: null, model: null,
     modelBusy: false,
     // The repertoire builder's run shown as a layer: name ("" = off), budget, its summary,
     // and the run's record for the position shown.
     rep: {name: "", N: null, summary: null, pos: null},
     info: null,
 }
-const cache = {stats: new Map(), model: new Map(), engine: new Map()}
-const inflight = {stats: null, model: null, engine: null}
+const cache = {stats: new Map(), model: new Map()}
+const inflight = {stats: null, model: null}
 const timing = {}
 
 // ---------------------------------------------------------------- URL state
@@ -56,8 +57,6 @@ function readUrl() {
         state.white = +(meWhite ? p.get("me") : p.get("opp") || 2200)
         state.black = +(meWhite ? p.get("opp") || 2200 : p.get("me"))
     }
-    if (p.has("nodes")) state.nodes = +p.get("nodes")
-    if (p.has("sf")) state.sfauto = p.get("sf") === "1"
     if (p.get("o") === "b") state.orientation = COLOR.black
     try {
         state.tree = new MoveTree(p.get("fen") || START_FEN)
@@ -87,8 +86,6 @@ function writeUrl() {
     }
     p.set("w", state.white)
     p.set("b", state.black)
-    if (state.nodes !== 200000) p.set("nodes", state.nodes)
-    if (state.sfauto) p.set("sf", "1")
     if (state.orientation === COLOR.black) p.set("o", "b")
     history.replaceState(null, "", "#" + p.toString().replace(/%2C/g, ","))
 }
@@ -109,15 +106,6 @@ function flipped() {
 const povScore = x => x == null ? null : flipped() ? 1 - x : x
 const povWdl = wdl => flipped() ? [wdl[2], wdl[1], wdl[0]] : wdl
 const VIEW = () => CHOICES.view === "white" ? "White" : "the side to move"
-
-function cpText(sf) {
-    if (!sf) return ""
-    const sign = flipped() ? -1 : 1
-    if (sf.mate) return (sign * sf.mate > 0 ? "M" : "-M") + Math.abs(sf.mate)
-    if (sf.cp == null) return "?"
-    const v = sign * sf.cp / 100
-    return (v > 0 ? "+" : "") + v.toFixed(2)
-}
 
 function sparkline(series, totals, flag) {
     const W = 64, H = 14
@@ -338,22 +326,6 @@ function fetchModel() {
     })
 }
 
-function fetchEngine(force) {
-    if (modelsOff() || oldServer()) return
-    const fen = state.tree.current.fen
-    const key = fen.split(" ").slice(0, 4).join(" ") + "|" + state.nodes
-    state.engine = cache.engine.get(key) || null
-    if (!state.engine && !force && !state.sfauto) return
-    if (new Chess(fen).isGameOver()) return
-    const moves = historyMoves()
-    state.engineBusy = !state.engine
-    load("engine", key, `/api/engine?fen=${encodeURIComponent(fen)}&moves=${moves.join(",")}&nodes=${state.nodes}`, d => {
-        state.engineBusy = false
-        if (state.tree.current.fen !== fen) return
-        state.engine = d
-        render()
-    })
-}
 
 // ---------------------------------------------------------------- table
 
@@ -397,7 +369,8 @@ function cols() {
         {k: "reach", h: "Reach", w: 62, t: "Games reaching the position after the move by any move order; unfiltered, all tempi"},
         ...(CHOICES.trend ? [{k: "trend", h: "Trend", num: false, w: 82, t: "Share per year. ▲/▼: recent share differs from the earlier share beyond chance"}] : []),
         ...repCols(),
-        {k: "sf", h: "SF", w: 52, t: () => `Stockfish after the move, pawns from ${VIEW()}'s view`},
+        ...(CHOICES.engineColumn && engineOn() ? [{k: "eng", h: (state.eng.snap && state.eng.snap.short) || "Eng", w: 52,
+            t: () => `${(state.eng.snap && state.eng.snap.label) || "The engine"}: its score for the moves among its lines, pawns from White's view; blank for the others`}] : []),
     ]
 }
 
@@ -405,7 +378,8 @@ function rows() {
     const fen = state.tree.current.fen
     const chess = new Chess(fen)
     const legal = new Map(chess.moves({verbose: true}).map(m => [m.from + m.to + (m.promotion || ""), m.san]))
-    const s = state.stats, md = state.model && state.model.moves, en = state.engine && state.engine.moves
+    const s = state.stats, md = state.model && state.model.moves
+    const en = engineMoves()
     const pList = (state.info && state.info.p_list) || 0.01
     const byUci = new Map()
     const add = uci => {
@@ -423,11 +397,7 @@ function rows() {
         }
         for (const r of byUci.values()) r.rp = rp.moves[r.uci] || null
     }
-    let bestSf = null
-    if (en) {
-        for (const [u, v] of Object.entries(en)) if (v.value != null && (!bestSf || v.value > en[bestSf].value)) bestSf = u
-        if (bestSf) add(bestSf)
-    }
+    if (en) for (const u of en.keys()) add(u)
     const total = s && s.status === "ok" ? s.total.played : 0
     const flip = !fen.includes(" w ") && CHOICES.view === "mover"
     const out = []
@@ -453,9 +423,9 @@ function rows() {
         if (flip && r.score != null) r.score = 1 - r.score
         r.elo1 = CHOICES.elo === "chooser" ? d.mover_elo_delta ?? null : d.w_elo_delta ?? null
         r.elo2 = CHOICES.elo === "chooser" ? d.gap_delta ?? null : d.b_elo_delta ?? null
-        r.sfv = en ? en[r.uci] : null
-        r.sf = r.sfv ? povScore(r.sfv.value) : null
-        r.best = r.uci === bestSf
+        r.engLine = en ? en.get(r.uci) || null : null
+        r.eng = r.engLine ? lineValue(r.engLine) : null
+        r.best = !!(r.engLine && r.engLine.multipv === 1)
         r.trend = d.trend ? d.trend.recent - d.trend.early : null
         r.learned = !!(rp && rp.learned === r.uci)
         const v = r.rp
@@ -595,7 +565,6 @@ function render() {
     const body = document.querySelector("#tbl tbody")
     body.innerHTML = rs.map(r => {
         const cls = [r.db ? "" : "nodb", r.uci === state.cursor ? "cursor" : "", r.learned ? "learned" : ""].join(" ")
-        const sfTitle = r.sfv ? `expected score ${pct(r.sf, 1)}%` : ""
         return `<tr data-uci="${r.uci}" class="${cls}">` +
             `<td class="san" ${r.learned ? `title="the move the repertoire learns here (budget ${state.rep.N})"` : ""}>${r.learned ? "★" : ""}${esc(r.san)}</td>` +
             `<td class="num${r.db ? "" : " dim"}">${r.n ?? ""}</td>` +
@@ -607,7 +576,7 @@ function render() {
             `<td class="num dim">${r.reach ?? ""}</td>` +
             (CHOICES.trend ? `<td>${trendCell(r, s)}</td>` : "") +
             repCells(r) +
-            `<td class="num ${r.best ? "best" : ""}" title="${sfTitle}">${cpText(r.sfv)}</td>` +
+            (CHOICES.engineColumn && engineOn() ? `<td class="num ${r.best ? "best" : ""}" title="${r.engLine ? "line " + r.engLine.multipv : ""}">${r.engLine ? scoreText(r.engLine) : ""}</td>` : "") +
             `</tr>`
     }).join("")
     if (!rs.length) body.innerHTML = `<tr><td colspan="${cols().length}" class="dim">${s ? "no moves to show" : ""}</td></tr>`
@@ -619,7 +588,7 @@ function render() {
 }
 
 function renderModels() {
-    const m = state.model, e = state.engine
+    const m = state.model
     let h
     if (oldServer()) {
         h = '<span class="warn">The server is older than this page: restart it (the database columns still work).</span>'
@@ -636,19 +605,13 @@ function renderModels() {
     } else {
         h = '<span class="dim">models: —</span>'
     }
-    if (e) {
-        const ew = e.wdl ? povWdl(e.wdl) : null
-        h += ` · <b>${esc(e.model)}</b>` + (ew ? ` W ${pct(ew[0])} D ${pct(ew[1])} L ${pct(ew[2])}` : "")
-    } else if (state.engineBusy) {
-        h += ' · <span class="dim">engine: running…</span>'
-    }
     $("models").innerHTML = h
 }
 
 function renderStatus() {
     const parts = []
     if (state.stats) parts.push(`stats ${state.stats.ms.toFixed(0)} ms server`)
-    for (const k of ["stats", "model", "engine"]) if (timing[k] != null) parts.push(`${k} ${timing[k].toFixed(0)} ms`)
+    for (const k of ["stats", "model"]) if (timing[k] != null) parts.push(`${k} ${timing[k].toFixed(0)} ms`)
     if (!$("status").classList.contains("err")) $("status").textContent = parts.join(" · ")
 }
 
@@ -670,7 +633,7 @@ function update() {
     writeUrl()
     fetchStats()
     fetchModel()
-    fetchEngine(false)
+    engineGo()
     fetchRepPos()
     render()
 }
@@ -694,12 +657,19 @@ async function initRep() {
     } catch (e) {
         status("runs: " + e.message, true)
     }
-    $("run").innerHTML = `<option value="">off</option>` + names.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join("")
-    if (state.rep.name && !names.includes(state.rep.name)) state.rep.name = ""
-    $("run").value = state.rep.name
-    $("run").addEventListener("change", () => { state.rep.name = $("run").value; loadRun() })
-    $("budget").addEventListener("change", () => { state.rep.N = +$("budget").value; writeUrl(); fetchRepPos(); render() })
+    // No control on the page: a run opens from a link (#rep=NAME&N=BUDGET) and closes from its line.
+    if (state.rep.name && !names.includes(state.rep.name)) {
+        status(`no repertoire run ${state.rep.name}`, true)
+        state.rep.name = ""
+    }
     document.addEventListener("click", e => {
+        if (e.target.id === "repclose") {
+            e.preventDefault()
+            state.rep = {name: "", N: null, summary: null, pos: null}
+            writeUrl()
+            render()
+            return
+        }
         const a = e.target.closest("[data-line]")
         if (!a) return
         e.preventDefault()
@@ -715,7 +685,7 @@ async function initRep() {
 async function loadRun() {
     state.rep.summary = null
     state.rep.pos = null
-    if (!state.rep.name) { $("budget").innerHTML = ""; writeUrl(); render(); return }
+    if (!state.rep.name) { writeUrl(); render(); return }
     try {
         const r = await fetch(`/api/run?name=${encodeURIComponent(state.rep.name)}`)
         const d = await r.json()
@@ -727,8 +697,6 @@ async function loadRun() {
     }
     const bs = state.rep.summary.budgets
     if (!bs.includes(state.rep.N)) state.rep.N = bs[bs.length - 1]
-    $("budget").innerHTML = bs.map(b => `<option value="${b}">N=${b}</option>`).join("")
-    $("budget").value = String(state.rep.N)
     writeUrl()
     fetchRepPos()
     render()
@@ -811,7 +779,7 @@ function renderRep() {
     else if (!p.in_graph) h += `<span class="warn">this position is outside the run's graph</span>`
     else h += `reach ${(100 * p.reach).toFixed(p.reach < 0.01 ? 2 : 1)}% · value White ${pct(p.value, 1)}% · ${STATE_TEXT[p.state] || p.state}` +
         (p.learned ? ` · learned <b>${esc(sanOf(p.learned))}</b>` : "")
-    h += ` · ${root}`
+    h += ` · ${root} · <a href="#" class="lnk dim" id="repclose" title="close the run (open again with #rep=${esc(sm.name)}&amp;N=${N})">× close</a>`
     const atRoot = state.tree.current.fen.split(" ").slice(0, 4).join(" ") === sm.root_fen.split(" ").slice(0, 4).join(" ")
     if (atRoot && sm.forced.length) {
         const bs = sm.budgets
@@ -846,6 +814,7 @@ function setFilter() {
     writeUrl()
     fetchStats()
     fetchModel()
+    if (feedsSides()) engineGo()     // Tempo
     render()
 }
 
@@ -870,12 +839,9 @@ function initControls() {
         state[id] = +$(id).value
         writeUrl()
         fetchModel()
+        if (feedsSides()) engineGo()
         render()
     })
-    $("nodes").value = String(state.nodes)
-    $("nodes").addEventListener("change", () => { state.nodes = +$("nodes").value; writeUrl(); fetchEngine(true); render() })
-    $("sfauto").checked = state.sfauto
-    $("sfauto").addEventListener("change", () => { state.sfauto = $("sfauto").checked; writeUrl(); fetchEngine(false); render() })
 
     $("nav").addEventListener("click", e => { if (e.target.dataset.k) command(e.target.dataset.k) })
     $("moves").addEventListener("click", e => {
@@ -959,8 +925,9 @@ function command(k) {
             state.orientation = state.orientation === COLOR.white ? COLOR.black : COLOR.white
             board.setOrientation(state.orientation)
             writeUrl()
+            if (feedsSides()) engineGo()
             return
-        case "engine": fetchEngine(true); render(); return
+        case "engine": toggleEngine(); return
         case "all": state.showAll = !state.showAll; render(); return
         default: return
     }
@@ -1008,8 +975,254 @@ async function main() {
     initControls()
     initBoard()
     initRep()
-    window.tnh = {state, play, command, render, CHOICES}   // for the end-to-end test and the console
+    initEngine()
+    window.tnh = {state, play, command, render, CHOICES, engineGo}   // for the end-to-end test and the console
     update()
 }
 
 main()
+
+// ---------------------------------------------------------------- engine section
+// One UCI engine on the server analyses the position shown until it changes; the page polls
+// its lines a few times a second. The choice is kept per browser.
+
+const ENG_STORE = "tnh.engine"
+// Options the page feeds from its own controls rather than a settings box (preppy's).
+const FED = ["MyElo", "OppElo", "Side", "Tempo"]
+
+function storeGet() {
+    try {
+        return JSON.parse(localStorage.getItem(ENG_STORE) || "{}")
+    } catch (e) {
+        return {}
+    }
+}
+
+function storePut() {
+    try {
+        localStorage.setItem(ENG_STORE, JSON.stringify({name: state.eng.name, last: state.eng.last,
+                                                        multipv: state.eng.multipv, settings: state.eng.settings}))
+    } catch (e) { /* private window or blocked storage: the choice is not kept */ }
+}
+
+state.eng = {name: "off", last: "stockfish", multipv: 3, settings: {}, list: [], snap: null, want: null, poll: null, err: null}
+
+const engineOn = () => state.eng.name !== "off"
+
+async function initEngine() {
+    const saved = storeGet()
+    try {
+        const r = await fetch("/api/uci/engines")
+        if (r.ok) state.eng.list = (await r.json()).engines
+    } catch (e) {
+        status("engines: " + e.message, true)
+    }
+    const names = state.eng.list.map(e => e.name)
+    $("eng").innerHTML = `<option value="off">Off</option>` + state.eng.list.map(e =>
+        `<option value="${e.name}" ${e.unavailable ? `disabled title="${esc(e.unavailable)}"` : ""}>${esc(e.label)}</option>`).join("")
+    state.eng.multipv = saved.multipv || 3
+    state.eng.settings = saved.settings || {}
+    state.eng.last = saved.last && names.includes(saved.last) ? saved.last : "stockfish"
+    state.eng.name = saved.name && names.includes(saved.name) ? saved.name : "off"
+    $("eng").value = state.eng.name
+    $("mpv").value = String(state.eng.multipv)
+    $("eng").addEventListener("change", () => { setEngine($("eng").value) })
+    $("mpv").addEventListener("change", () => { state.eng.multipv = +$("mpv").value; storePut(); engineGo() })
+    $("englines").addEventListener("click", e => {
+        const a = e.target.closest("[data-pv]")
+        if (!a) return
+        e.preventDefault()
+        const moves = a.dataset.pv.split(".").filter(Boolean)
+        for (const m of moves) if (!state.tree.play(m)) { status("illegal move in the engine's line: " + m, true); break }
+        update()
+    })
+    $("engset").addEventListener("change", e => {
+        const el = e.target.closest("[data-opt]")
+        if (!el) return
+        state.eng.settings[el.dataset.opt] = el.value
+        storePut()
+        engineGo()
+    })
+    engineGo()
+}
+
+function setEngine(name) {
+    state.eng.name = name
+    if (name !== "off") state.eng.last = name
+    $("eng").value = name
+    storePut()
+    state.eng.snap = null
+    engineGo()
+    render()
+}
+
+function toggleEngine() {
+    setEngine(engineOn() ? "off" : state.eng.last)
+}
+
+// preppy's MyElo, OppElo, Side and Tempo come from the page: "me" is the side at the bottom
+// of the board, my rating that side's box; Tempo is blitz when only blitz games are shown.
+function feedsSides() {
+    const e = state.eng.list.find(x => x.name === state.eng.name)
+    return !!(e && e.settings.some(k => FED.includes(k)))
+}
+
+function fedSettings() {
+    const meWhite = state.orientation === COLOR.white
+    const t = state.filters.tempi
+    const all = {
+        Side: meWhite ? "white" : "black",
+        MyElo: String(meWhite ? state.white : state.black),
+        OppElo: String(meWhite ? state.black : state.white),
+        Tempo: t && t.length === 1 && t[0] === "blitz" ? "blitz" : "classical",
+    }
+    const e = state.eng.list.find(x => x.name === state.eng.name)
+    return Object.fromEntries(Object.entries(all).filter(([k]) => e && e.settings.includes(k)))
+}
+
+let engineSeq = 0
+
+async function engineGo() {
+    const e = state.eng.list.find(x => x.name === state.eng.name)
+    const settings = {}
+    if (e) {
+        for (const k of e.settings) if (state.eng.settings[k] != null && state.eng.settings[k] !== "") settings[k] = state.eng.settings[k]
+        if (e.settings.some(k => FED.includes(k))) Object.assign(settings, fedSettings())
+    }
+    const fen = state.tree.current.fen
+    const seq = ++engineSeq
+    state.eng.want = {fen, seq}
+    state.eng.err = null
+    try {
+        const r = await fetch("/api/uci/go", {method: "POST", headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({engine: state.eng.name, fen, moves: historyMoves(), multipv: state.eng.multipv, settings})})
+        const d = await r.json()
+        if (!r.ok) throw new Error(d.detail || r.status)
+        if (seq === engineSeq) state.eng.want.gen = d.gen
+    } catch (err) {
+        if (seq === engineSeq) {
+            state.eng.err = err.message
+            renderEngine()
+        }
+        return
+    }
+    if (engineOn() && !state.eng.poll) state.eng.poll = setInterval(pollEngine, 330)
+    if (!engineOn() && state.eng.poll) { clearInterval(state.eng.poll); state.eng.poll = null }
+    renderEngine()
+}
+
+async function pollEngine() {
+    if (!engineOn()) return
+    try {
+        const r = await fetch("/api/uci/state")
+        const d = await r.json()
+        const w = state.eng.want
+        // Only lines of the position shown and of the search asked for it.
+        if (w && d.fen === state.tree.current.fen && (w.gen == null || d.gen >= w.gen)) {
+            state.eng.snap = d
+        } else if (d.error) {
+            state.eng.snap = d
+        } else {
+            state.eng.snap = {...d, lines: [], strings: []}
+        }
+        renderEngine()
+        if (CHOICES.engineColumn) render()
+    } catch (e) { /* the next poll tries again; a dead server shows in the other panels */ }
+}
+
+function lineValue(l) {
+    if (l.preppy && l.preppy.white != null) return l.preppy.white
+    if (l.mate != null) return l.mate > 0 ? 1e6 - l.mate : -1e6 - l.mate
+    return l.cp
+}
+
+function scoreText(l) {
+    // preppy: its expected score from White's side (the info string's exact value), not cp
+    if (l.preppy && l.preppy.white != null) return (100 * l.preppy.white).toFixed(1) + "%"
+    if (l.mate != null) return (l.mate > 0 ? "#" : "#-") + Math.abs(l.mate)
+    if (l.cp == null) return ""
+    const v = l.cp / 100
+    return (v > 0 ? "+" : v < 0 ? "−" : "") + Math.abs(v).toFixed(2) + (l.bound ? (l.bound === "lowerbound" ? "↑" : "↓") : "")
+}
+
+function engineMoves() {
+    const s = state.eng.snap
+    if (!engineOn() || !s || !s.lines || !s.lines.length) return null
+    const m = new Map()
+    for (const l of s.lines) if (l.pv.length && !m.has(l.pv[0])) m.set(l.pv[0], l)
+    return m
+}
+
+function sanLine(l) {
+    const parts = state.tree.current.fen.split(" ")
+    let num = parseInt(parts[5], 10), white = parts[1] === "w"
+    const out = []
+    const flags = l.preppy ? l.preppy.flags : []
+    l.san.forEach((s, i) => {
+        const label = white ? `${num}.${s}` : (i === 0 ? `${num}…${s}` : s)
+        // preppy: L = my move, learned; M = my move, not learned; else his probability
+        const f = flags[i]
+        const cls = f === "L" ? "lnk learned" : f === "M" ? "lnk mine" : "lnk"
+        const tip = f === "L" ? "my move, learned" : f === "M" ? "my move, not learned (my model's most likely)"
+            : f != null ? `his move, probability ${(100 * +f).toFixed(1)}%` : ""
+        const prob = f != null && f !== "L" && f !== "M" ? `<sup>${(100 * +f).toFixed(0)}</sup>` : ""
+        out.push(`<a href="#" class="${cls}" data-pv="${l.pv.slice(0, i + 1).join(".")}" title="${tip}">${esc(label)}</a>${prob}`)
+        if (!white) num += 1
+        white = !white
+    })
+    return out.join(" ")
+}
+
+function renderEngine() {
+    const on = engineOn()
+    $("englines").style.display = on ? "" : "none"
+    $("engstrings").style.display = on ? "" : "none"
+    const s = state.eng.snap
+    const e = state.eng.list.find(x => x.name === state.eng.name)
+    // the engine's settings: those it declared that the page lets the user set
+    let set = ""
+    if (on && s && s.options && e) {
+        set = s.options.filter(o => !FED.includes(o.name)).map(o => {
+            const v = state.eng.settings[o.name] ?? o.default ?? ""
+            if (o.type === "combo") return `<label>${esc(o.name)} <select data-opt="${esc(o.name)}">${o.vars.map(x => `<option ${x === v ? "selected" : ""}>${esc(x)}</option>`).join("")}</select></label>`
+            if (o.type === "spin") return `<label>${esc(o.name)} <input data-opt="${esc(o.name)}" type="number" min="${o.min ?? ""}" max="${o.max ?? ""}" value="${esc(v)}"></label>`
+            if (o.type === "check") return `<label>${esc(o.name)} <select data-opt="${esc(o.name)}"><option ${v === "true" ? "selected" : ""}>true</option><option ${v !== "true" ? "selected" : ""}>false</option></select></label>`
+            return `<label>${esc(o.name)} <input data-opt="${esc(o.name)}" class="short" value="${esc(v)}"></label>`
+        }).join(" ")
+        if (feedsSides()) {
+            const f = fedSettings()
+            set += ` <span class="dim" title="Fed from the page: me = the side at the bottom (f flips), the ratings from the White and Black boxes, Tempo blitz when only blitz games are shown">me ${f.Side} ${f.MyElo} v ${f.OppElo}${f.Tempo ? ", " + f.Tempo : ""}</span>`
+        }
+    }
+    if (!$("engset").contains(document.activeElement)) $("engset").innerHTML = set
+    let stat = ""
+    if (state.eng.err) stat = `<span class="err">${esc(state.eng.err)}</span>`
+    else if (s && s.error) stat = `<span class="err">${esc(s.error)}</span>`
+    else if (on && s && s.lines && s.lines.length) {
+        const l = s.lines[0]
+        stat = [l.depth != null ? `depth ${l.depth}` : "", l.nodes != null ? `${fmtNodes(l.nodes)} nodes` : "",
+                l.nps ? `${fmtNodes(l.nps)}/s` : ""].filter(Boolean).join(" · ")
+    } else if (on && s && s.phase === "starting") stat = "loading (models load at the first isready)…"
+    else if (on) stat = "starting…"
+    $("engstat").innerHTML = stat
+    if (!on) { $("englines").innerHTML = ""; $("engstrings").innerHTML = ""; return }
+    const lines = (s && s.lines) || []
+    $("englines").innerHTML = lines.map(l => {
+        const wdl = l.wdl ? ` title="W ${(l.wdl[0] / 10).toFixed(1)} D ${(l.wdl[1] / 10).toFixed(1)} L ${(l.wdl[2] / 10).toFixed(1)} % (White)"` : ""
+        const dn = l.depth != null ? `d${l.depth}` : l.nodes != null ? fmtNodes(l.nodes) : ""
+        return `<div class="eline"><span class="escore"${wdl}>${scoreText(l)}</span><span class="edepth">${dn}</span><span class="epv">${sanLine(l)}</span></div>`
+    }).join("")
+    const extra = lines.some(l => l.preppy) ? lines.map(l => l.preppy ? `<div>line ${l.multipv}: value White ${(100 * l.preppy.white).toFixed(1)}%` +
+        (l.preppy.net != null ? ` · net (me) ${(100 * l.preppy.net).toFixed(1)}%` : "") +
+        ` · non-obvious ${l.preppy.nonobvious} · reach ${(100 * l.preppy.reach).toFixed(1)}%</div>` : "").join("") : ""
+    const r = s && s.root
+    const rootLine = r ? `<div title="the search's root: value from White's side; net, price and cost for me; how much of the reach ends in stand-ins, frontier and finished positions">root: value White ${(100 * r.white).toFixed(1)}% · net ${(100 * r.net).toFixed(1)}% · price ${r.price} · cost ${r.cost}` +
+        (r.cap && r.cap !== "-" ? ` (cap ${r.cap})` : "") +
+        ` · stand-in ${(100 * r.stand_in).toFixed(1)}% · frontier ${(100 * r.frontier).toFixed(1)}% · finished ${(100 * r.finished).toFixed(1)}% · ${r.expanded} expanded</div>` : ""
+    const other = ((s && s.strings) || []).filter(x => !x.startsWith("preppy root")).map(x => `<div>${esc(x)}</div>`).join("")
+    $("engstrings").innerHTML = rootLine + extra + other
+}
+
+function fmtNodes(n) {
+    return n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(0) + "k" : String(n)
+}

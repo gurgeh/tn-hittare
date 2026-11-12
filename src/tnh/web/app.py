@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import os
 import re
@@ -15,7 +16,9 @@ import chess.svg
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
+from tnh.web.engine import EngineError, EngineManager
 from tnh.web.models import ModelHub, ModelsOff, Superseded, _LRU, query
 from tnh.web.repertoire import RunMissing, Store
 from tnh.web.models import _board as _models_board
@@ -24,7 +27,6 @@ from tnh.web.stats import TEMPI, Filters, Shrink, Stats, TrendRule, model_table,
 # $TNH_WEB_STATIC serves another copy of the page, so it can be changed without touching the
 # one a running server serves from the working tree.
 STATIC = Path(os.environ.get("TNH_WEB_STATIC", Path(__file__).parent / "static"))
-MAX_ENGINE_NODES = 5_000_000
 API_VERSION = 3      # the page checks it: an older server lacks /api/model and the Elo deltas
 P_LIST = 0.01        # model 1's moves at or above this probability are listed beside the database's
 
@@ -99,8 +101,14 @@ def _board_with(fen: str, moves: list[str]) -> chess.Board:
 
 
 def create_app(stats: Stats, hub: ModelHub, *, trend_rule: TrendRule = TrendRule(),
-               shrink: Shrink = Shrink(), runs: Store | None = None) -> FastAPI:
-    app = FastAPI(title="tn-hittare", docs_url=None, redoc_url=None, openapi_url=None)
+               shrink: Shrink = Shrink(), runs: Store | None = None, engines: EngineManager | None = None) -> FastAPI:
+    @contextlib.asynccontextmanager
+    async def lifespan(_app):
+        yield
+        if engines is not None:          # the engine process goes with the server
+            engines.close()
+
+    app = FastAPI(title="tn-hittare", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
     @app.get("/")
@@ -190,15 +198,38 @@ def create_app(stats: Stats, hub: ModelHub, *, trend_rule: TrendRule = TrendRule
         }
         return out
 
-    @app.get("/api/engine")
-    def engine(fen: str, moves: str = "", nodes: int = Query(200_000, ge=1000, le=MAX_ENGINE_NODES)):
-        board = _board(fen)
-        if board.is_game_over():
-            raise HTTPException(400, "game over in this position")
+    @app.get("/api/uci/engines")
+    def uci_engines():
+        """The engines the engine section offers, and whether each can start."""
+        if engines is None:
+            return {"engines": []}
+        return {"engines": [{"name": s.name, "label": s.label, "short": s.short, "settings": list(s.settings),
+                             "unavailable": s.available()} for s in engines.specs.values()]}
+
+    @app.post("/api/uci/go")
+    async def uci_go(request: Request):
+        """Analyse a position: {engine, fen, moves, multipv, settings}; engine "off" quits it."""
+        if engines is None:
+            raise HTTPException(404, "no engines on this server")
+        body = await request.json()
+        name = body.get("engine", "off")
+        fen = body.get("fen") or chess.STARTING_FEN
+        _board(fen)
+        moves = [m for m in body.get("moves", []) if m]
+        multipv = int(body.get("multipv", 3))
+        if not 1 <= multipv <= 20:
+            raise HTTPException(400, "multipv must be 1-20")
         try:
-            return hub.engine(fen, _moves(moves), nodes)
-        except ValueError as e:
-            raise HTTPException(400, str(e)) from e
+            gen = await run_in_threadpool(engines.go, name, fen, moves, multipv, body.get("settings") or {})
+        except EngineError as e:
+            raise HTTPException(503, str(e)) from e
+        return {"gen": gen}
+
+    @app.get("/api/uci/state")
+    def uci_state():
+        if engines is None:
+            return {"engine": "off", "lines": [], "strings": [], "error": None, "gen": 0, "fen": None}
+        return engines.snapshot()
 
     @app.get("/api/runs")
     def run_names():

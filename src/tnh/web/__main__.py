@@ -21,6 +21,7 @@ import uvicorn
 
 from tnh.paths import DATA_ROOT
 from tnh.web.app import create_app
+from tnh.web.engine import EngineManager, default_specs
 from tnh.web.models import Hub, NoModels
 from tnh.web.repertoire import Store
 from tnh.web.stats import open_stats
@@ -38,6 +39,14 @@ def main(argv: list[str] | None = None) -> None:
                     help="model 2: shared (the move model's own wdl, one copy of the networks), result-cheap, "
                          "result-full, frontier, fake, or import:module:Name (any object with .wdl(queries))")
     ap.add_argument("--no-models", action="store_true", help="the database alone: no models and no engine")
+    ap.add_argument("--engine-threads", type=int, default=4,
+                    help="Stockfish's threads in the engine section (the owner's rule: at most 8 engine and worker "
+                         "threads on the machine, so 4 unless he asks)")
+    ap.add_argument("--lc0-minibatch", type=int, default=12,
+                    help="Lc0's minibatch in the engine section (above 12 gave wrong answers on this GPU)")
+    ap.add_argument("--preppy-fake", action="store_true",
+                    help="run preppy with its fake models (python -m tnh.engine.uci --fake): no GPU, for trying the page")
+    ap.add_argument("--engine-idle", type=float, default=60.0, help="quit the engine after this many seconds unasked")
     ap.add_argument("--repertoires", type=Path, default=DATA_ROOT / "repertoires",
                     help="directory of the repertoire builder's runs (tnh.builder.export), shown as a layer")
     args = ap.parse_args(argv)
@@ -57,11 +66,18 @@ def main(argv: list[str] | None = None) -> None:
     print(f"table {info['table']} ({info['why']}): {info['games']} games, years {info['year_min']}-{info['year_max']}, "
           f"opened in {time.perf_counter() - t:.2f}s", file=sys.stderr)
     hub = NoModels() if args.no_models else Hub(args.move_model, args.value_model)
-    app = create_app(stats, hub, runs=Store(args.repertoires))
+    specs = default_specs(threads=args.engine_threads, lc0_minibatch=args.lc0_minibatch)
+    if args.preppy_fake:
+        p = specs["preppy"]
+        p.cmd, p.gpu_mb, p.label = p.cmd + ["--fake"], 0, "preppy (fake)"
+        p.settings = tuple(k for k in p.settings if k != "Tempo")     # the fake has its own tempo
+    engines = EngineManager(specs, idle_s=args.engine_idle)
+    app = create_app(stats, hub, runs=Store(args.repertoires), engines=engines)
     print(f"tn-hittare: http://{HOST}:{args.port}/", file=sys.stderr)
     try:
         uvicorn.run(app, host=HOST, port=args.port, log_level="warning")
     finally:
+        engines.close()
         hub.close()
 
 
