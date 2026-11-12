@@ -654,6 +654,23 @@ class EdgeDB:
             moves = moves.with_columns(child_n=pl.lit(None, pl.UInt32))
         return {"total": total, "moves": moves, "by_year": self._summarise(rows, white, ["year"])}
 
+    def counts_many(self, positions, *, years: Filter = None, elo_bands: Filter = None,
+                    tempi: Filter = None) -> pl.DataFrame:
+        """Games per (position, move) under the filters for many positions in one read of the
+        edge table: columns ``pos_hash``, ``move``, ``n``, sorted. Positions without games
+        under the filters have no rows. (For the repertoire engine, which needs the counts of
+        a whole batch of positions at once; ``moves`` is the one-position view.)"""
+        keys = [_key(p) for p in positions]
+        empty = pl.DataFrame(schema={"pos_hash": pl.UInt64, "move": pl.String, "n": pl.UInt32})
+        if not keys:
+            return empty
+        rows = self._edges.rows(keys, ["pos_hash", "move", "n", "year", "elo_band", "tempo"])
+        rows = rows.filter(_match("year", years) & _match("elo_band", elo_bands) & _match("tempo", tempi))
+        if rows.height == 0:
+            return empty
+        return (rows.group_by("pos_hash", "move").agg(pl.col("n").sum().cast(pl.UInt32))
+                .sort("pos_hash", "move"))
+
     def totals_many(self, positions) -> pl.DataFrame:
         """``total`` for many positions in one read: the pos_index rows of those reached by
         two or more games (the others are absent), sorted by ``pos_hash``."""
