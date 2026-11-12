@@ -116,7 +116,8 @@ class Encoder:
 
 _NAME_RE = re.compile(
     r"(?:offset(?P<m>[+-]\d+(?:\.\d+)?)(?:-opp(?P<o>[+-]\d+(?:\.\d+)?))?"
-    r"|fixed(?P<s>\d+(?:\.\d+)?)-(?P<f>\d+(?:\.\d+)?))"
+    r"|fixed(?P<s>\d+(?:\.\d+)?)-(?P<f>\d+(?:\.\d+)?)"
+    r"|map(?P<a>[+-]?\d+(?:\.\d+)?)(?P<b>[+-]\d+(?:\.\d+)?)x)"
     r"(?:-clamp(?P<lo>\d+(?:\.\d+)?)-(?P<hi>\d+(?:\.\d+)?))?"
 )
 
@@ -126,11 +127,14 @@ class Elo:
     """The ratings given to the network, one of:
 
     - fixed: `self_elo` and `oppo_elo`, whatever the players' real ratings;
-    - offset: the network gets `mover_elo + mover_offset` and `opp_elo + opp_offset`.
+    - offset: the network gets `mover_elo + mover_offset` and `opp_elo + opp_offset`;
+    - mapped: the network gets `map_a + map_b * rating` for each player (step 1's map
+      from FIDE to Maia's scale is `map1580+0.558x`, see docs/DESIGN.md).
 
-    Both are clamped to `clamp`, by default the network's own [0, 5000]. The name is
+    All are clamped to `clamp`, by default the network's own [0, 5000]. The name is
     the variant directory: `offset+300` (both sides +300), `offset+300-opp+100`
-    (mover +300, opponent +100), `fixed2200-2200`, with `-clampLO-HI` when not default.
+    (mover +300, opponent +100), `fixed2200-2200`, `map1580+0.558x`, with `-clampLO-HI`
+    when not default.
     """
 
     self_elo: float | None = None
@@ -138,12 +142,15 @@ class Elo:
     mover_offset: float | None = None
     opp_offset: float | None = None
     clamp: tuple[float, float] = ELO_RANGE
+    map_a: float | None = None
+    map_b: float | None = None
 
     def __post_init__(self) -> None:
-        fixed = (self.self_elo is not None, self.oppo_elo is not None)
-        offset = (self.mover_offset is not None, self.opp_offset is not None)
-        if not ((all(fixed) and not any(offset)) or (all(offset) and not any(fixed))):
-            raise ValueError(f"give self_elo and oppo_elo, or mover_offset and opp_offset: {self}")
+        kinds = [(self.self_elo, self.oppo_elo), (self.mover_offset, self.opp_offset), (self.map_a, self.map_b)]
+        given = [all(x is not None for x in k) for k in kinds]
+        partial = [any(x is not None for x in k) and not all(x is not None for x in k) for k in kinds]
+        if sum(given) != 1 or any(partial):
+            raise ValueError(f"give self_elo and oppo_elo, or mover_offset and opp_offset, or map_a and map_b: {self}")
 
     @classmethod
     def fixed(cls, self_elo: float, oppo_elo: float, clamp: tuple[float, float] = ELO_RANGE) -> "Elo":
@@ -154,6 +161,10 @@ class Elo:
         return cls(mover_offset=float(mover), opp_offset=float(mover if opp is None else opp), clamp=clamp)
 
     @classmethod
+    def mapped(cls, a: float, b: float, clamp: tuple[float, float] = ELO_RANGE) -> "Elo":
+        return cls(map_a=float(a), map_b=float(b), clamp=clamp)
+
+    @classmethod
     def parse(cls, name: str) -> "Elo":
         m = _NAME_RE.fullmatch(name)
         if m is None:
@@ -161,6 +172,8 @@ class Elo:
         clamp = (float(m["lo"]), float(m["hi"])) if m["lo"] is not None else ELO_RANGE
         if m["m"] is not None:
             return cls.offset(float(m["m"]), None if m["o"] is None else float(m["o"]), clamp)
+        if m["a"] is not None:
+            return cls.mapped(float(m["a"]), float(m["b"]), clamp)
         return cls.fixed(float(m["s"]), float(m["f"]), clamp)
 
     @property
@@ -169,6 +182,8 @@ class Elo:
             v = f"offset{self.mover_offset:+g}"
             if self.opp_offset != self.mover_offset:
                 v += f"-opp{self.opp_offset:+g}"
+        elif self.map_a is not None:
+            v = f"map{self.map_a:g}{self.map_b:+g}x"
         else:
             v = f"fixed{self.self_elo:g}-{self.oppo_elo:g}"
         if self.clamp != ELO_RANGE:
@@ -178,6 +193,8 @@ class Elo:
     def of(self, query: Query) -> tuple[float, float]:
         if self.mover_offset is not None:
             s, o = query.mover_elo + self.mover_offset, query.opp_elo + self.opp_offset
+        elif self.map_a is not None:
+            s, o = self.map_a + self.map_b * query.mover_elo, self.map_a + self.map_b * query.opp_elo
         else:
             s, o = self.self_elo, self.oppo_elo
         lo, hi = self.clamp

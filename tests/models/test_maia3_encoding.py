@@ -105,10 +105,12 @@ def test_elo_settings_names_and_clamp():
     assert Elo.offset(300, -100).of(q) == (2400.0, 4800.0)
     assert Elo.fixed(1800, 2600).of(q) == (1800.0, 2600.0)
     assert Elo.fixed(3000, 2200, clamp=(600, 2600)).of(q) == (2600.0, 2200.0)
+    assert Elo.mapped(1580, 0.558).of(Query("", [], 2200, 1800)) == (1580 + 0.558 * 2200, 1580 + 0.558 * 1800)
     names = {
         "offset+300": Elo.offset(300), "offset-200": Elo.offset(-200), "offset+0": Elo.offset(0),
         "offset+300-opp+100": Elo.offset(300, 100), "offset+0-opp-100": Elo.offset(0, -100),
         "fixed2200-2200": Elo.fixed(2200, 2200), "offset+300-clamp600-2600": Elo.offset(300, clamp=(600, 2600)),
+        "map1580+0.558x": Elo.mapped(1580, 0.558),
     }
     for name, e in names.items():
         assert e.name == name and Elo.parse(name) == e
