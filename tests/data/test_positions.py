@@ -27,6 +27,7 @@ def game(gid, moves_san, welo, belo, tempo="classical", clocks=None, result="1-0
 @pytest.fixture()
 def built(tmp_path, monkeypatch):
     monkeypatch.setattr(positions, "CORPUS", tmp_path)
+    monkeypatch.setattr(positions, "DATA_ROOT", tmp_path)
     games = [
         # counted (both >= 1800) and emitted (classical)
         game("g1", ["e4", "e5", "Nf3", "Nc6"], 2000, 1900, clocks=[5420, 5425, 5300, 5000], result="0-1"),
