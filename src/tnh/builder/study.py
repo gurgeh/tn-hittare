@@ -242,8 +242,40 @@ def run(a) -> None:
         root = ex.graph.nodes[ex.graph.root]
         ex.expand(root)
         game = Game(ex.graph, params)
+        cheap = sound_root_moves(game)
+        say(f"root: {len(root.moves)} legal moves, sound within {a.eps} at {a.sf_nodes} nodes per move: "
+            f"{[san([m]) for m in cheap]}")
+        checker = DeepChecker(a.deep_nodes) if a.deep_nodes else None
+        if checker and a.root_candidates:
+            # the root decides the comparison: judge its candidates at the deep budget
+            order = np.argsort(-np.nan_to_num(root.engine, nan=-1.0))[: a.root_candidates]
+            deep_v = {}
+            cheap_v = {root.moves[int(j)]: float(root.engine[int(j)]) for j in order}
+            for j in order:
+                m = root.moves[int(j)]
+                _, v, depth = checker._search(board, [chess.Move.from_uci(m)])
+                deep_v[m] = v
+            best = max(deep_v.values())
+            eng = np.full(len(root.moves), np.nan)
+            for m, v in deep_v.items():
+                eng[root.moves.index(m)] = v
+            root.engine = eng
+            say("root at " + f"{a.deep_nodes} nodes: " + ", ".join(f"{san([m])} {v:.3f}" for m, v in
+                                                                  sorted(deep_v.items(), key=lambda t: -t[1])))
+            game = Game(ex.graph, params)
+            # children of moves that became sound need real values and engine calls
+            for m in sound_root_moves(game):
+                c = ex.graph.child(root, m)
+                if c.info.get("stand_in"):
+                    ex._values([(c.key, ex.boards[c.id], c.path)])
+                    s_ = ex._val[c.key]
+                    c.value = s_ if c.me_to_move else 1.0 - s_
+                    del c.info["stand_in"]
+            ex._propagate(root)
+        else:
+            deep_v, cheap_v = {}, {}
         sound = sound_root_moves(game)
-        say(f"root: {len(root.moves)} legal moves, sound within {a.eps}: {[san([m]) for m in sound]}")
+        say(f"sound fourth moves for the comparison: {[san([m]) for m in sound]}")
         for m in sound:
             c = ex.graph.child(root, m)
             tg = time.perf_counter()
@@ -256,7 +288,6 @@ def run(a) -> None:
         say(f"growth: {grow_stats}, seconds {grow_seconds}")
 
         # the free choice, deep-checked
-        checker = DeepChecker(a.deep_nodes) if a.deep_nodes else None
         cache: dict = {}
 
         def check(k, m):
@@ -274,6 +305,32 @@ def run(a) -> None:
             _, sols = solve(Game(ex.graph, params), K, improve_at=budgets)
             params_c, results = params, {}
         say(f"free solve and deep check: {time.perf_counter() - ts:.0f} s")
+        history = []
+        for r in range(a.stable_rounds):
+            prev = {N: dict(sols[N].learned) for N in a.stable_budgets}
+            union = {}
+            for N in a.stable_budgets:
+                union.update(prev[N])
+            from tnh.builder.drift import grow_below
+            ex.params = params_c
+            n_grown = grow_below(ex, union, a.stable_per_round)
+            g2 = Game(ex.graph, params_c)
+            before = {N: sols[N].value for N in a.stable_budgets}
+            after = {N: g2.evaluate(prev[N]) for N in a.stable_budgets}
+            if checker:
+                sols, params_c, results2, clog = check_budgets(ex.graph, params_c, K, budgets, check)
+                results.update(results2)
+                for line in clog:
+                    say(line)
+            else:
+                _, sols = solve(g2, K, improve_at=budgets)
+            same = {N: sols[N].learned == prev[N] for N in a.stable_budgets}
+            history.append((r, len(ex.graph), n_grown, before, after, {N: sols[N].value for N in a.stable_budgets}, same))
+            say(f"stability round {r}: grew {n_grown} below the chosen sets, {len(ex.graph)} positions; "
+                + "; ".join(f"N={N}: {before[N]:.4f} -> {after[N]:.4f} after growing, new choice {sols[N].value:.4f}"
+                            f"{' (same set)' if same[N] else ' (new set)'}" for N in a.stable_budgets))
+        with open(out / "graph.pkl", "wb") as f:
+            pickle.dump({"graph": ex.graph, "root_moves": root_moves, "args": {k: v for k, v in vars(a).items() if k != "fn"}}, f)
         game = Game(ex.graph, params_c)
         root_board = board
 
@@ -317,6 +374,31 @@ def run(a) -> None:
                              ss[0].value))
         say(f"sensitivity and side tables done; total engine calls {ex.stats['engine calls']}")
 
+        # would a cruder value have done for rarely played positions that were never expanded?
+        g_all = ex.graph
+        real_front = [n for n in g_all.nodes if n.children is None and n.moves and not n.info.get("stand_in")]
+        real_all = [n for n in g_all.nodes if not n.info.get("stand_in")]
+        n_stand = sum(1 for n in g_all.nodes if n.info.get("stand_in"))
+        crude = []
+        for t in a.crude_p:
+            gm = Game(g_all, params_c)
+            chosen = []
+            for n in real_front:
+                if n.id not in gm.parent:
+                    continue
+                pi, j = gm.parent[n.id]
+                if pi in gm.dist and gm.dist[pi][j] < t:
+                    chosen.append((n, g_all.nodes[pi].value))
+            saved_v = [(n, n.value) for n, _ in chosen]
+            for n, pv in chosen:
+                n.value = pv
+            _, cs = solve(Game(g_all, params_c), K, improve_at=budgets)
+            for n, v in saved_v:
+                n.value = v
+            crude.append((t, len(chosen), {N: (cs[N].value, len(set(cs[N].learned.items()) & set(sols[N].learned.items())),
+                                               len(cs[N].learned), cs[N].learned.get(root.key, "-")) for N in budgets}))
+        say("crude-value test done")
+
         # rows for the free choice
         free_rows = {N: rows(game, sols, N, ensure=ex.ensure_engine,
                              deep={k: d for (k, m), d in results.items() if sols[N].learned.get(k) == m})
@@ -330,8 +412,6 @@ def run(a) -> None:
     wall = time.perf_counter() - t0
 
     # -- the report --
-    name_of = lambda learned: ", ".join(sorted(san(rel_path(ex.graph.nodes[game.by_key[k][0]]) + [m]).split()[-1] + " in "  # noqa: E731
-                                                 + (san(rel_path(ex.graph.nodes[game.by_key[k][0]])) or "root") for k, m in learned.items()))
     rd = ex.graph.nodes[ex.graph.root]
     rep.append(f"# Repertoire builder, round 3: {san([])} {board.fen()}\n")
     rep.append(f"Position after {' '.join(root_moves)}; me {a.me}, {a.elo} against {a.opp_elo}. Move model "
@@ -356,6 +436,16 @@ def run(a) -> None:
         rep.append(f"| {san([m])} | {rd.p_model[j]:.0%} | {rd.engine[j]:.3f} | {int(cnt_root[j]) if cnt_root is not None else 0} | "
                    + " | ".join(fmt(v) for v in vals) + " |")
     rep.append("| free choice | | | | " + " | ".join(f"{(sols[N].value):.4f}" for N in [0] + sorted(budgets)) + " |\n")
+    if deep_v:
+        best_d = max(deep_v.values())
+        rep.append(f"Which fourth moves are sound: the {len(deep_v)} best at {a.sf_nodes} nodes per move, searched "
+                   f"again at {a.deep_nodes} nodes each; sound means within eps {a.eps} of the best.\n")
+        rep.append("| 4th move | search budget | deep | loss against the best | sound |")
+        rep.append("|---|---:|---:|---:|---|")
+        for m, v in sorted(deep_v.items(), key=lambda t: -t[1]):
+            rep.append(f"| {san([m])} | {cheap_v[m]:.3f} | {v:.3f} | {best_d - v:.3f} | "
+                       f"{'yes' if best_d - v <= a.eps + 1e-12 else 'no'} |")
+        rep.append(f"\nThe other {len(rd.moves) - len(deep_v)} legal moves were below these at the search budget.\n")
     rep.append("Forced: the fourth move is played whatever, and pays its own cost out of the budget "
                "(1 unless my model plays it at least the threshold), so N=0 is infeasible for a non-obvious move.\n")
     for N in sorted(budgets):
@@ -363,9 +453,30 @@ def run(a) -> None:
                    f"{sols[N].cost} non-obvious moves, {len(sols[N].learned)} positions learned\n")
         rep.append(table(free_rows[N], root_board))
         rep.append(f"\nFrontier mass: {', '.join(f'{k} {v:.3f}' for k, v in fm[N].items())}\n")
+    rep.append("## Stability\n")
+    if history:
+        rep.append(f"Each round grows {a.stable_per_round} positions below the chosen sets at N in {a.stable_budgets}, "
+                   "re-values the old sets on the grown graph and solves again (with the deep check).\n")
+        rep.append("| round | positions | grown | " + " | ".join(f"N={N}: value, after growing, new choice, same set?"
+                                                         for N in a.stable_budgets) + " |")
+        rep.append("|" + "---|" * (3 + len(a.stable_budgets)))
+        for r, npos, ng, before, after, new, same in history:
+            rep.append(f"| {r} | {npos} | {ng} | " + " | ".join(
+                f"{before[N]:.4f}, {after[N]:.4f}, {new[N]:.4f}, {'yes' if same[N] else 'no'}" for N in a.stable_budgets) + " |")
+        last = history[-1]
+        stable = all(last[6].values()) and all(abs(last[4][N] - last[3][N]) < a.stable_tol for N in a.stable_budgets)
+        rep.append(f"\nStable by the rule (same set as the round before and moved less than {a.stable_tol} when grown): "
+                   f"{'yes' if stable else 'no'}.\n")
+    else:
+        rep.append("Not checked (no stability rounds).\n")
     rep.append("## The curve (free choice)\n")
-    rep.append("```\n" + curve_text(sols) + "\n```\n")
-    rep.append("```\n" + steps_text(sols, lambda k: san(rel_path(ex.graph.nodes[game.by_key[k][0]])) or "root") + "\n```\n")
+    ct = curve_text(sols).splitlines()
+    keep = [ct[0]] + [ln for N, ln in enumerate(ct[1:]) if N == 0 or N in budgets
+                      or abs(sols[N].value - sols[N - 1].value) > 1e-9]
+    rep.append("```\n" + "\n".join(keep) + "\n```\n(rows where the curve does not move are left out, except the budgets)\n")
+    st = steps_text(sols, lambda k: san(rel_path(ex.graph.nodes[game.by_key[k][0]])) or "root").splitlines()
+    st = [st[0]] + [ln for ln in st[1:] if "+" in ln.split("marginal")[-1][12:] or "-" in ln[40:]]
+    rep.append("```\n" + "\n".join(st) + "\n```\n")
     rep.append("Budget for a price per non-obvious move: " + ", ".join(f"mu {mu:g} -> N={budget_for_price(sols, mu)}"
                                                                      for mu in (0.002, 0.001, 0.0005, 0.0002)) + "\n")
     rep.append("## Where the difference comes from\n")
@@ -394,6 +505,23 @@ def run(a) -> None:
         for name, d, v0 in side:
             rep.append(f"| {name} | {v0:.4f} | " + " | ".join(f"{d[N][0]:.4f} ({san([d[N][1]]) if d[N][1] != '-' else '-'})"
                                                             for N in sorted(budgets)) + " |")
+    rep.append("\n## The frontier value: where its calls went\n")
+    n_real = len(real_all)
+    n_front = len(real_front)
+    rep.append(f"- {n_real} positions have a value of their own (a FrontierValue call, or the result where the game "
+               f"is over); {n_front} of the live ones ({n_front / max(n_real, 1):.0%} of all valued) were never "
+               f"expanded, so their value enters the objective directly. {n_stand} more positions stood in with "
+               f"their parent's value and got no call.")
+    rep.append(f"- Mass on stand-ins under the free choice: " + ", ".join(f"N={N} {fm[N]['stand_in']:.3f}" for N in sorted(budgets)) + ".")
+    rep.append("- Test of a cruder value for rarely played positions: never-expanded positions whose move is "
+               "played with probability below t get their parent's value instead of their own (cruder than any "
+               "cheap network read), and the search runs again.\n")
+    rep.append("| t | positions replaced | " + " | ".join(f"N={N}: value (main run), shared, 4th move" for N in sorted(budgets)) + " |")
+    rep.append("|" + "---|" * (2 + len(budgets)))
+    for t, cnt, d in crude:
+        rep.append(f"| {t:g} | {cnt} | " + " | ".join(
+            f"{d[N][0]:.4f} ({sols[N].value:.4f}), {d[N][1]}/{d[N][2]}, {san([d[N][3]]) if d[N][3] != '-' else '-'}"
+            for N in sorted(budgets)) + " |")
     rep.append("\n## Cost\n")
     rep.append(f"- Graph: {len(ex.graph)} positions, {final_stats.get('expanded', 0)} expanded, "
                f"{final_stats.get('stand-ins', 0)} stand-ins, {final_stats.get('transpositions merged', 0)} transpositions merged.")
