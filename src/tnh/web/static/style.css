@@ -167,3 +167,18 @@ b.down { color: var(--down); font-size: 10px; margin-left: 2px; }
     main { grid-template-columns: 1fr; }
     #left { max-width: 440px; }
 }
+
+/* the repertoire layer */
+#repline { font-size: 12px; }
+#repline table.forced { border-collapse: collapse; margin: 3px 0 0; font-size: 12px; }
+#repline table.forced th, #repline table.forced td { padding: 0 8px 0 0; text-align: right; font-variant-numeric: tabular-nums; }
+#repline table.forced td:first-child, #repline table.forced th:first-child { text-align: left; }
+#replines { max-height: 24vh; overflow-y: auto; font-size: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 3px; padding: 3px 6px; }
+#replines .num { display: inline-block; min-width: 3.4em; text-align: right; font-variant-numeric: tabular-nums; color: var(--dim); }
+a.lnk { color: inherit; text-decoration: none; }
+a.lnk:hover { text-decoration: underline; }
+#tbl tr.learned td.san { color: var(--up); }
+#tbl td.note { font-size: 11px; color: var(--dim); }
+.cmt { color: var(--dim); font-size: 11px; margin-right: 4px; }
+.cm-chessboard .arrow-learned .arrow-head { fill: #1a7f37; }
+.cm-chessboard .arrow-learned .arrow-line { stroke: #1a7f37; stroke-linecap: round; opacity: 0.65; }

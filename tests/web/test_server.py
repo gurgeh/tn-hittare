@@ -13,7 +13,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from _webfix import write_tables
+from _webfix import write_run, write_tables
 from tnh.paths import DATA_ROOT
 
 STATIC = Path(__file__).parents[2] / "src" / "tnh" / "web" / "static"
@@ -47,6 +47,7 @@ def server(tmp_path_factory):
     data = tmp_path_factory.mktemp("web")
     write_tables(data / "corpus", "dev")
     (data / "weights").symlink_to(DATA_ROOT / "weights")   # Maia's weights live under TNH_DATA
+    write_run(data / "repertoires")                         # one repertoire run for the page
     port = free_port()
     env = {**os.environ, "PYTHONUNBUFFERED": "1", "TNH_DATA": str(data)}
     env.pop("TNH_WEB_TABLE", None)

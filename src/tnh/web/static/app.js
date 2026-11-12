@@ -10,6 +10,7 @@ import {MoveTree, START_FEN} from "./tree.js"
 const $ = id => document.getElementById(id)
 const LAST_MOVE = {class: "marker-last", slice: "markerSquare"}
 const CURSOR_ARROW = {class: "arrow-cursor"}
+const LEARNED_ARROW = {class: "arrow-learned"}
 // Choices of presentation; each is one switch here. Decided by the owner on 2026-11-12:
 // always from White, classical games as the default tempo.
 const CHOICES = {
@@ -30,6 +31,9 @@ const state = {
     cursor: null,     // uci of the highlighted row
     stats: null, model: null, engine: null,
     modelBusy: false,
+    // The repertoire builder's run shown as a layer: name ("" = off), budget, its summary,
+    // and the run's record for the position shown.
+    rep: {name: "", N: null, summary: null, pos: null},
     info: null,
 }
 const cache = {stats: new Map(), model: new Map(), engine: new Map()}
@@ -43,6 +47,8 @@ function readUrl() {
     const f = state.filters
     for (const k of ["y0", "y1", "e0", "e1"]) if (p.has(k)) f[k] = p.get(k)
     if (p.has("t")) f.tempi = p.get("t") === "all" ? null : p.get("t") ? p.get("t").split(",") : []
+    if (p.has("rep")) state.rep.name = p.get("rep")
+    if (p.has("N")) state.rep.N = +p.get("N")
     if (p.has("w")) state.white = +p.get("w")
     if (p.has("b")) state.black = +p.get("b")
     if (p.has("me") && !p.has("w")) {   // links from before 2026-11-12: me/opp, me at the bottom
@@ -75,6 +81,10 @@ function writeUrl() {
     const f = state.filters
     for (const k of ["y0", "y1", "e0", "e1"]) if (f[k] !== "") p.set(k, f[k])
     if (JSON.stringify(f.tempi) !== JSON.stringify(CHOICES.defaultTempi)) p.set("t", f.tempi ? f.tempi.join(",") : "all")
+    if (state.rep.name) {
+        p.set("rep", state.rep.name)
+        if (state.rep.N) p.set("N", state.rep.N)
+    }
     p.set("w", state.white)
     p.set("b", state.black)
     if (state.nodes !== 200000) p.set("nodes", state.nodes)
@@ -208,16 +218,28 @@ function renderMoves() {
         s.textContent = (white ? number + ". " : num ? number + "... " : "") + n.san
         return s
     }
+    // A move and its PGN comment, if the pasted PGN had one (the builder's carry reach,
+    // value and cost).
+    const put = (el, n, num) => {
+        el.appendChild(span(n, num))
+        if (n.comment) {
+            const c = document.createElement("span")
+            c.className = "cmt"
+            c.textContent = "{" + n.comment + "}"
+            el.appendChild(c)
+            return true
+        }
+        return false
+    }
     const walk = (parent, el, forceNum) => {
         let p = parent, num = forceNum
         while (p.children.length) {
             const main = p.children[0]
-            el.appendChild(span(main, num))
-            num = false
+            num = put(el, main, num)
             for (const v of p.children.slice(1)) {
                 const box = document.createElement("span")
                 box.className = "var"
-                box.appendChild(span(v, true))
+                put(box, v, true)
                 walk(v, box, false)
                 el.appendChild(box)
                 num = true
@@ -369,6 +391,7 @@ function cols() {
         {k: "last_year", h: "Last", w: 44, t: "Last year the move was played"},
         {k: "reach", h: "Reach", w: 62, t: "Games reaching the position after the move by any move order; unfiltered, all tempi"},
         ...(CHOICES.trend ? [{k: "trend", h: "Trend", num: false, w: 82, t: "Share per year. ▲/▼: recent share differs from the earlier share beyond chance"}] : []),
+        ...repCols(),
         {k: "sf", h: "SF", w: 52, t: () => `Stockfish after the move, pawns from ${VIEW()}'s view`},
     ]
 }
@@ -388,6 +411,13 @@ function rows() {
     if (md) for (const [u, v] of Object.entries(md)) if (v.p_model >= pList || v.n > 0 || state.showAll) add(u).m = v
     if (md) for (const r of byUci.values()) r.m = md[r.uci] || r.m
     if (state.showAll) for (const u of legal.keys()) add(u)
+    const rp = repPos()
+    if (rp) {
+        for (const [u, v] of Object.entries(rp.moves)) {
+            if (u === rp.learned || (rp.me_to_move ? v.sound : (v.p_mixed || 0) >= pList)) add(u)
+        }
+        for (const r of byUci.values()) r.rp = rp.moves[r.uci] || null
+    }
     let bestSf = null
     if (en) {
         for (const [u, v] of Object.entries(en)) if (v.value != null && (!bestSf || v.value > en[bestSf].value)) bestSf = u
@@ -422,6 +452,11 @@ function rows() {
         r.sf = r.sfv ? povScore(r.sfv.value) : null
         r.best = r.uci === bestSf
         r.trend = d.trend ? d.trend.recent - d.trend.early : null
+        r.learned = !!(rp && rp.learned === r.uci)
+        const v = r.rp
+        r.r_val = v ? v.value_after : null
+        r.r_a = !v ? null : rp.me_to_move ? v.loss : v.p_mixed
+        r.r_b = !v ? null : rp.me_to_move ? v.p_model : v.db_count
         out.push(r)
     }
     const {key, desc} = state.sort
@@ -554,10 +589,10 @@ function render() {
     if (state.cursor && !rs.find(r => r.uci === state.cursor)) state.cursor = null
     const body = document.querySelector("#tbl tbody")
     body.innerHTML = rs.map(r => {
-        const cls = [r.db ? "" : "nodb", r.uci === state.cursor ? "cursor" : ""].join(" ")
+        const cls = [r.db ? "" : "nodb", r.uci === state.cursor ? "cursor" : "", r.learned ? "learned" : ""].join(" ")
         const sfTitle = r.sfv ? `expected score ${pct(r.sf, 1)}%` : ""
         return `<tr data-uci="${r.uci}" class="${cls}">` +
-            `<td class="san">${esc(r.san)}</td>` +
+            `<td class="san" ${r.learned ? `title="the move the repertoire learns here (budget ${state.rep.N})"` : ""}>${r.learned ? "★" : ""}${esc(r.san)}</td>` +
             `<td class="num${r.db ? "" : " dim"}">${r.n ?? ""}</td>` +
             probCell(r) +
             `<td class="num model">${r.p_model == null ? "" : pctShare(r.p_model)}</td>` +
@@ -566,12 +601,15 @@ function render() {
             `<td class="num">${r.last_year ?? ""}</td>` +
             `<td class="num dim">${r.reach ?? ""}</td>` +
             (CHOICES.trend ? `<td>${trendCell(r, s)}</td>` : "") +
+            repCells(r) +
             `<td class="num ${r.best ? "best" : ""}" title="${sfTitle}">${cpText(r.sfv)}</td>` +
             `</tr>`
     }).join("")
     if (!rs.length) body.innerHTML = `<tr><td colspan="${cols().length}" class="dim">${s ? "no moves to show" : ""}</td></tr>`
     showArrow(state.cursor)
+    showLearned()
     renderModels()
+    renderRep()
     renderStatus()
 }
 
@@ -628,7 +666,170 @@ function update() {
     fetchStats()
     fetchModel()
     fetchEngine(false)
+    fetchRepPos()
     render()
+}
+
+// ---------------------------------------------------------------- repertoire layer
+// The builder's run over the board and table: a stopgap until the builder runs as an
+// engine (docs/DESIGN.md, "Where the builder is going"). Values are White's.
+
+const repCache = new Map()
+
+function repPos() {
+    const p = state.rep.name && state.rep.pos
+    return p && p.in_graph ? p : null
+}
+
+async function initRep() {
+    let names = []
+    try {
+        const r = await fetch("/api/runs")
+        if (r.ok) names = (await r.json()).runs
+    } catch (e) {
+        status("runs: " + e.message, true)
+    }
+    $("run").innerHTML = `<option value="">off</option>` + names.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join("")
+    if (state.rep.name && !names.includes(state.rep.name)) state.rep.name = ""
+    $("run").value = state.rep.name
+    $("run").addEventListener("change", () => { state.rep.name = $("run").value; loadRun() })
+    $("budget").addEventListener("change", () => { state.rep.N = +$("budget").value; writeUrl(); fetchRepPos(); render() })
+    document.addEventListener("click", e => {
+        const a = e.target.closest("[data-line]")
+        if (!a) return
+        e.preventDefault()
+        const moves = a.dataset.line.split(".").filter(Boolean)
+        state.tree.start()
+        for (const m of moves) if (!state.tree.play(m)) { status("illegal move in the run's line: " + m, true); break }
+        update()
+    })
+    if (state.rep.name) await loadRun()
+    else renderRep()
+}
+
+async function loadRun() {
+    state.rep.summary = null
+    state.rep.pos = null
+    if (!state.rep.name) { $("budget").innerHTML = ""; writeUrl(); render(); return }
+    try {
+        const r = await fetch(`/api/run?name=${encodeURIComponent(state.rep.name)}`)
+        const d = await r.json()
+        if (!r.ok) throw new Error(d.detail || r.status)
+        state.rep.summary = d
+    } catch (e) {
+        status("run: " + e.message, true)
+        return
+    }
+    const bs = state.rep.summary.budgets
+    if (!bs.includes(state.rep.N)) state.rep.N = bs[bs.length - 1]
+    $("budget").innerHTML = bs.map(b => `<option value="${b}">N=${b}</option>`).join("")
+    $("budget").value = String(state.rep.N)
+    writeUrl()
+    fetchRepPos()
+    render()
+}
+
+function fetchRepPos() {
+    state.rep.pos = null
+    if (!state.rep.name || !state.rep.summary) return
+    const fen = state.tree.current.fen, name = state.rep.name, N = state.rep.N
+    const key = [name, N, fen].join("|")
+    if (repCache.has(key)) { state.rep.pos = repCache.get(key); return }
+    fetch(`/api/run/position?name=${encodeURIComponent(name)}&budget=${N}&fen=${encodeURIComponent(fen)}`)
+        .then(async r => {
+            const d = await r.json()
+            if (!r.ok) throw new Error(d.detail || r.status)
+            repCache.set(key, d)
+            if (state.tree.current.fen === fen && state.rep.name === name && state.rep.N === N) {
+                state.rep.pos = d
+                render()
+            }
+        }).catch(e => status("run position: " + e.message, true))
+}
+
+function repCols() {
+    if (!state.rep.name || !state.rep.summary) return []
+    const p = repPos(), N = state.rep.N, me = p ? p.me_to_move : true
+    return [
+        {k: "r_val", h: `R${N}`, w: 48, t: `The run, budget ${N}: White's expected score after the move, the opponent then playing as the builder modelled him and I my learned moves where I have them, %`},
+        me ? {k: "r_a", h: "Loss", w: 46, t: "My move: the engine's loss against its best move, percentage points of expected score"}
+           : {k: "r_a", h: "p used", w: 50, t: "His move: the probability the builder used, the database's count mixed with model 1 (κ in the run's parameters), %"},
+        me ? {k: "r_b", h: "M1·cost", w: 62, t: "My move: model 1's probability at my rating, %, and what learning it costs: 0 when it is obvious (model 1 at or above the run's threshold), else 1"}
+           : {k: "r_b", h: "his n", w: 50, t: "His move: the games behind the builder's distribution at his level"},
+        {k: "r_note", h: "Run", num: false, w: 118, t: "Why the builder did not use the move: unsound (outside eps of the engine's best), banned (failed the deep check), stand-in (rarely played: no value call of its own), pruned (no record: never reached with 1e-5 under any budget)"},
+    ]
+}
+
+function noteOf(rp, v) {
+    if (!v) return ""
+    const f = v.flags || []
+    const out = []
+    if (rp.me_to_move && v.sound === false && !f.includes("banned")) out.push("unsound")
+    if (f.includes("banned")) out.push("banned")
+    if (f.includes("stand_in")) out.push("stand-in")
+    else if (f.includes("not_exported")) out.push("pruned")
+    if (f.includes("no_engine_value")) out.push("no engine")
+    return out.join(", ")
+}
+
+function repCells(r) {
+    if (!state.rep.name || !state.rep.summary) return ""
+    const rp = repPos(), v = r.rp
+    if (!rp || !v) return `<td></td><td></td><td></td><td></td>`
+    const b = rp.me_to_move
+        ? `${pctShare(v.p_model)}<span class="dim"> · </span>` + (v.obvious ? '<span title="obvious: model 1 at or above the threshold, costs nothing">ob</span>' : `${v.cost}`)
+        : (v.db_count ?? "")
+    return `<td class="num">${pct(v.value_after, 1)}</td>` +
+        `<td class="num">${rp.me_to_move ? (v.loss == null ? "" : (100 * v.loss).toFixed(1)) : pctShare(v.p_mixed)}</td>` +
+        `<td class="num">${b}</td>` +
+        `<td class="note">${noteOf(rp, v)}</td>`
+}
+
+function showLearned() {
+    board.removeArrows(LEARNED_ARROW)
+    const rp = repPos()
+    if (rp && rp.learned) board.addArrow(LEARNED_ARROW, rp.learned.slice(0, 2), rp.learned.slice(2, 4))
+}
+
+const STATE_TEXT = {expanded: "expanded", frontier: "frontier: value only", stand_in: "stand-in: its parent's value",
+                    game_over: "game over"}
+
+function renderRep() {
+    const sm = state.rep.summary, on = !!(state.rep.name && sm)
+    $("repline").style.display = on ? "" : "none"
+    $("replines").style.display = on ? "" : "none"
+    if (!on) return
+    const N = state.rep.N, p = state.rep.pos
+    const root = `<a href="#" data-line="${sm.root_moves.join(".")}" class="lnk">↑ root of the run</a>`
+    let h = `<b>${esc(sm.name)}</b>, N=${N} (${sm.me} ${sm.me_elo} v ${sm.opp_elo}) · `
+    if (p == null) h += '<span class="dim">…</span>'
+    else if (!p.in_graph) h += `<span class="warn">this position is outside the run's graph</span>`
+    else h += `reach ${(100 * p.reach).toFixed(p.reach < 0.01 ? 2 : 1)}% · value White ${pct(p.value, 1)}% · ${STATE_TEXT[p.state] || p.state}` +
+        (p.learned ? ` · learned <b>${esc(sanOf(p.learned))}</b>` : "")
+    h += ` · ${root}`
+    const atRoot = state.tree.current.fen.split(" ").slice(0, 4).join(" ") === sm.root_fen.split(" ").slice(0, 4).join(" ")
+    if (atRoot && sm.forced.length) {
+        const bs = sm.budgets
+        h += `<table class="forced"><tr><th title="White's expected score with this first move forced, by budget">forced</th>${bs.map(b => `<th>N=${b}</th>`).join("")}</tr>` +
+            sm.forced.map(f => `<tr><td>${esc(f.san)}</td>${bs.map(b => `<td title="cost ${f.costs[b]}">${pct(f.values[b], 1)}</td>`).join("")}</tr>`).join("") +
+            `<tr class="dim"><td title="the free choice">free</td>${bs.map(b => `<td>${pct(sm.solutions[b].value, 1)}</td>`).join("")}</tr></table>`
+    }
+    $("repline").innerHTML = h
+    const lines = sm.lines[String(N)] || []
+    $("replines").innerHTML = `<div class="dim">learned at N=${N}, by reach · ${root}</div>` +
+        // A click lands on the position where the line's last move is learned, so the arrow
+        // shows it and → plays it.
+        lines.map(l => `<div><a href="#" class="lnk" data-line="${l.moves.slice(0, -1).join(".")}" title="value White ${pct(l.value, 1)}%, cost ${l.cost}; the click stops before the learned move">` +
+            `<span class="num">${(100 * l.reach).toFixed(1)}%</span> ${esc(l.san)}</a></div>`).join("")
+}
+
+function sanOf(uci) {
+    const c = new Chess(state.tree.current.fen)
+    try {
+        return c.move({from: uci.slice(0, 2), to: uci.slice(2, 4), promotion: uci[4]}).san
+    } catch (e) {
+        return uci
+    }
 }
 
 function setFilter() {
@@ -801,6 +1002,7 @@ async function main() {
     }
     initControls()
     initBoard()
+    initRep()
     window.tnh = {state, play, command, render, CHOICES}   // for the end-to-end test and the console
     update()
 }

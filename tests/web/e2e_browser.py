@@ -111,6 +111,30 @@ def main() -> None:
         settle(page)
         assert counts(page) == {"e7e6": 3, "g7g6": 1}, counts(page)
 
+        # the repertoire layer: choose the run, see the learned move, follow a learned line
+        page.goto(BASE + "#t=all")
+        settle(page)
+        page.locator("#run").select_option("t")
+        page.wait_for_function("location.hash.includes('rep=t') && window.tnh.state.rep.pos")
+        expect(page.locator("#repline")).to_contain_text("outside the run's graph")
+        page.locator("#repline a[data-line]").click()                 # to the root of the run
+        page.wait_for_function("location.hash.includes('m=e2e4.e7e5') && window.tnh.state.rep.pos && window.tnh.state.rep.pos.in_graph")
+        expect(page.locator("#repline")).to_contain_text("reach 100.0%")
+        expect(page.locator("#tbl tr.learned")).to_have_count(1)
+        expect(page.locator("#tbl thead")).to_contain_text("M1·cost")
+        n_lines = page.locator("#replines a[data-line]").count()
+        assert n_lines >= 2, n_lines
+        page.locator("#replines a[data-line]").last.click()
+        page.wait_for_function("window.tnh.state.rep.pos && window.tnh.state.rep.pos.in_graph && window.tnh.state.rep.pos.learned")
+        page.locator("#run").select_option("")
+        page.wait_for_function("!location.hash.includes('rep=')")
+        expect(page.locator("#repline")).to_be_hidden()
+
+        # a builder PGN: its comments show in the move list
+        page.locator("#paste").fill("1. e4 e5 2. Nf3 { reach 1.000 value 0.550 cost 1 } *")
+        page.locator("#paste").press("Enter")
+        expect(page.locator("#moves .cmt")).to_have_text("{reach 1.000 value 0.550 cost 1}")
+
         # paste a FEN: unknown position, Maia warns that it has no history
         page.locator("#paste").fill("8/8/8/4k3/8/8/4K3/7R w - - 0 1")
         page.locator("#paste").press("Enter")

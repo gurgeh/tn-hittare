@@ -28,6 +28,9 @@
       <option value="1000000">1M</option><option value="3000000">3M</option></select></label>
     <label title="Fetch the engine on every position change"><input id="sfauto" type="checkbox"> auto</label>
   </span>
+  <span class="grp" title="The repertoire builder's runs (tnh.builder.export), shown over the board and table">
+    <label>Repertoire <select id="run"></select></label> <select id="budget"></select>
+  </span>
   <span id="source" class="dim"></span>
 </header>
 <main>
@@ -39,11 +42,13 @@
     <div id="moves" tabindex="-1"></div>
     <textarea id="paste" rows="2" spellcheck="false" placeholder="Paste FEN or PGN, Enter to load (/ to focus, Ctrl+V anywhere)"></textarea>
     <div id="fen" class="dim mono" title="FEN of the position shown (click to copy)"></div>
+    <div id="replines" style="display:none"></div>
   </section>
   <section id="right">
     <div id="totals"></div>
     <div id="orders" class="dim"></div>
     <div id="models"></div>
+    <div id="repline" style="display:none"></div>
     <table id="tbl">
       <colgroup id="cols"></colgroup>
       <thead><tr></tr></thead>

@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from tnh.web.models import ModelHub, ModelsOff, Superseded, _LRU, query
+from tnh.web.repertoire import RunMissing, Store
 from tnh.web.models import _board as _models_board
 from tnh.web.stats import TEMPI, Filters, Shrink, Stats, TrendRule, model_table, report
 
@@ -65,7 +66,8 @@ def _pgn_tree(text: str) -> dict:
     def walk(node: chess.pgn.GameNode) -> list[dict]:
         out = []
         for child in node.variations:
-            out.append({"uci": child.move.uci(), "san": child.san(), "children": walk(child)})
+            out.append({"uci": child.move.uci(), "san": child.san(), "comment": child.comment or None,
+                        "children": walk(child)})
         return out
 
     root = game.board()
@@ -97,7 +99,7 @@ def _board_with(fen: str, moves: list[str]) -> chess.Board:
 
 
 def create_app(stats: Stats, hub: ModelHub, *, trend_rule: TrendRule = TrendRule(),
-               shrink: Shrink = Shrink()) -> FastAPI:
+               shrink: Shrink = Shrink(), runs: Store | None = None) -> FastAPI:
     app = FastAPI(title="tn-hittare", docs_url=None, redoc_url=None, openapi_url=None)
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
@@ -195,6 +197,32 @@ def create_app(stats: Stats, hub: ModelHub, *, trend_rule: TrendRule = TrendRule
             raise HTTPException(400, "game over in this position")
         try:
             return hub.engine(fen, _moves(moves), nodes)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+
+    @app.get("/api/runs")
+    def run_names():
+        """The repertoire builder's runs (`tnh.builder.export` output) the server can show."""
+        return {"dir": str(runs.dir) if runs else None, "runs": runs.names() if runs else []}
+
+    @app.get("/api/run")
+    def run_summary(name: str):
+        if runs is None:
+            raise HTTPException(404, "no repertoire directory")
+        try:
+            return runs.get(name).summary()
+        except RunMissing as e:
+            raise HTTPException(404, str(e)) from e
+
+    @app.get("/api/run/position")
+    def run_position(name: str, budget: int, fen: str):
+        if runs is None:
+            raise HTTPException(404, "no repertoire directory")
+        board = _board(fen)
+        try:
+            return runs.get(name).position(board, budget)
+        except RunMissing as e:
+            raise HTTPException(404, str(e)) from e
         except ValueError as e:
             raise HTTPException(400, str(e)) from e
 

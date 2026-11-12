@@ -15,11 +15,14 @@ import argparse
 import socket
 import sys
 import time
+from pathlib import Path
 
 import uvicorn
 
+from tnh.paths import DATA_ROOT
 from tnh.web.app import create_app
 from tnh.web.models import Hub, NoModels
+from tnh.web.repertoire import Store
 from tnh.web.stats import open_stats
 
 HOST = "127.0.0.1"
@@ -34,6 +37,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--value-model", default="frontier",
                     help="model 2: frontier, fake, or import:module:Name (any object with .wdl(queries))")
     ap.add_argument("--no-models", action="store_true", help="the database alone: no models and no engine")
+    ap.add_argument("--repertoires", type=Path, default=DATA_ROOT / "repertoires",
+                    help="directory of the repertoire builder's runs (tnh.builder.export), shown as a layer")
     args = ap.parse_args(argv)
 
     with socket.socket() as s:
@@ -48,7 +53,7 @@ def main(argv: list[str] | None = None) -> None:
     print(f"table {info['table']} ({info['why']}): {info['games']} games, years {info['year_min']}-{info['year_max']}, "
           f"opened in {time.perf_counter() - t:.2f}s", file=sys.stderr)
     hub = NoModels() if args.no_models else Hub(args.move_model, args.value_model)
-    app = create_app(stats, hub)
+    app = create_app(stats, hub, runs=Store(args.repertoires))
     print(f"tn-hittare: http://{HOST}:{args.port}/", file=sys.stderr)
     try:
         uvicorn.run(app, host=HOST, port=args.port, log_level="warning")
