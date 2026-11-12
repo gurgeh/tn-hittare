@@ -11,6 +11,7 @@ Expects the server to serve the eight games of `_webfix.GAMES` with the fake mod
 
 from __future__ import annotations
 
+import re
 import sys
 
 from playwright.sync_api import expect, sync_playwright
@@ -142,6 +143,14 @@ def main() -> None:
         mode = page.locator("#engset select[data-opt='Mode']")
         assert sorted(mode.locator("option").all_inner_texts()) == ["bestmove", "repertoire"]
         expect(page.locator("#engset input[data-opt='Price']")).to_be_enabled()
+        expect(page.locator("#engset input[data-opt='Alpha']")).to_be_disabled()          # repertoire mode
+        expect(page.locator("#engset [data-group='bestmove']")).to_have_class(re.compile("off"))
+        for k in ("Blunder", "PriorMin"):
+            expect(page.locator(f"#engset input[data-opt='{k}']")).to_be_enabled()
+        # the settings for both modes come first, then the repertoire group, then the bestmove one
+        order = page.evaluate("[...document.querySelectorAll('#engset [data-opt]')].map(e => e.dataset.opt)")
+        assert order.index("Mode") < order.index("Price") < order.index("Alpha"), order
+        assert order.index("Blunder") < order.index("Price") and order.index("PriorMin") < order.index("Price"), order
         mode.select_option("bestmove")
         for k in ("Price", "Cap", "Obvious"):
             expect(page.locator(f"#engset input[data-opt='{k}']")).to_be_disabled()
@@ -157,6 +166,7 @@ def main() -> None:
         assert page.evaluate("document.contains(window.__row) && window.tnh.tableBuilds() === window.__builds")
         mode.select_option("repertoire")
         expect(page.locator("#engset input[data-opt='Price']")).to_be_enabled()
+        expect(page.locator("#engset input[data-opt='Alpha']")).to_be_disabled()
 
         page.locator("#eng").select_option("off")
         page.wait_for_function("document.querySelector('#tbl thead th[data-k=eng]') === null")

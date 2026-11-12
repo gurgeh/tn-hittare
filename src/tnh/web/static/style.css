@@ -171,7 +171,7 @@ b.down { color: var(--down); font-size: 10px; margin-left: 2px; }
 #engine { font-size: 12px; border: 1px solid var(--line); border-radius: 3px; background: var(--panel); padding: 3px 6px; }
 #enghead { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: center; }
 #enghead input { width: 4.6em; }
-#enghead input.short { width: 4em; }
+#enghead input.short { width: 5.2em; }
 #engstat { margin-left: auto; }
 #engstat .err, #engine .err { color: var(--err); }
 .eline { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.55; }
@@ -188,3 +188,9 @@ a.lnk:hover { text-decoration: underline; }
 .eprog { color: var(--dim); margin-right: 8px; font-size: 11px; font-variant-numeric: tabular-nums; }
 .eprog:empty { display: none; }
 #engset label.off { opacity: 0.45; }
+#engset { display: flex; flex-wrap: wrap; align-items: center; gap: 3px 12px; flex-basis: 100%; }
+#engset:empty { display: none; }
+#engset .egroup { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 3px 8px; }
+#engset .egroup.sub { border-left: 2px solid var(--line); padding-left: 8px; color: var(--dim); }
+#engset .egroup.sub.off { opacity: 0.5; }
+#engset label { white-space: nowrap; }

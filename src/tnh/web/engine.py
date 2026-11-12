@@ -95,7 +95,7 @@ def default_specs(*, threads: int = 4, hash_mb: int = 256, lc0_minibatch: int = 
                                                              "default": "1", "vars": []}}),
         "preppy": EngineSpec("preppy", "preppy", [sys.executable, "-m", "tnh.engine.uci"], {},
                              ("MyElo", "OppElo", "Side", "Tempo", "Price", "Cap", "Obvious", "Prepared", "DrawScore",
-                              "Mode", "Alpha"),
+                              "Mode", "Alpha", "Blunder", "PriorMin", "MistakeFix"),
                              gpu_mb=2500, short="preppy"),
     }
 
@@ -629,5 +629,6 @@ def _preppy_root(kv: dict, flip: bool) -> dict:
             "mode": kv.get("mode", "repertoire"), "depth": _int(kv.get("depth")),
             "complete": _flag(kv.get("complete")) if "complete" in kv else None,
             "provisional": _flag(kv.get("provisional")), "depth_in_progress": _int(kv.get("depth_in_progress")),
+            "fix": kv.get("fix"),                  # MistakeFix in force, when preppy says
             **{k: (kv.get(k) if k == "cap" else _num(kv.get(k)))
                for k in ("net", "price", "cost", "cap", "stand_in", "frontier", "finished", "expanded")}}

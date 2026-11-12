@@ -393,12 +393,19 @@ def test_bestmove_strings_are_parsed():
     r = _preppy_root(_kv("preppy root value=0.55 mode=bestmove depth=11 complete=1 provisional=0 "
                          "depth_in_progress=12 expanded=3000"), flip=False)
     assert (r["mode"], r["depth"], r["complete"], r["depth_in_progress"], r["expanded"]) == ("bestmove", 11, True, 12, 3000)
+    assert r["fix"] is None
+    assert _preppy_root(_kv("preppy root value=0.5 mode=repertoire fix=fitted expanded=10"), flip=False)["fix"] == "fitted"
+
+
+def test_preppy_whitelist():
+    from tnh.web.engine import default_specs
+    assert {"Blunder", "PriorMin", "MistakeFix", "Mode", "Alpha"} <= set(default_specs()["preppy"].settings)
 
 
 def test_preppy_fake_bestmove_mode():
     spec = EngineSpec("preppy", "preppy", [sys.executable, "-m", "tnh.engine.uci", "--fake"], {},
-                      ("MyElo", "OppElo", "Side", "Price", "Cap", "Obvious", "Prepared", "DrawScore", "Mode", "Alpha"),
-                      short="preppy")
+                      ("MyElo", "OppElo", "Side", "Price", "Cap", "Obvious", "Prepared", "DrawScore", "Mode", "Alpha",
+                       "Blunder", "PriorMin", "MistakeFix"), short="preppy")
     m = EngineManager({"preppy": spec}, start_timeout=120, gpu_free=lambda: None)
     try:
         m.go("preppy", *after(), multipv=2, settings={"Side": "white", "Mode": "bestmove", "Alpha": "0.5"})
@@ -407,7 +414,7 @@ def test_preppy_fake_bestmove_mode():
         while time.monotonic() < end and not (s["lines"] and all("preppy" in x for x in s["lines"]) and s.get("root")):
             time.sleep(0.2)
             s = m.snapshot()
-        assert {o["name"] for o in s["options"]} >= {"Mode", "Alpha"}
+        assert {o["name"] for o in s["options"]} >= {"Mode", "Alpha", "Blunder", "PriorMin"}
         mode = next(o for o in s["options"] if o["name"] == "Mode")
         assert mode["type"] == "combo" and set(mode["vars"]) == {"repertoire", "bestmove"}
         x = s["lines"][0]["preppy"]
