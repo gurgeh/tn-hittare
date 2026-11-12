@@ -355,7 +355,6 @@ function cols() {
         {k: "n", h: "Games", w: 62, t: "Games that played the move from this position, under the filters"},
         {k: "p_mix", h: "Prob", w: 46, t: `Probability of the move: (games + κ·model) / (all games + κ), κ = ${sh.kappa}. The database share alone in the cell's tooltip`},
         {k: "p_model", h: "Model", w: 50, t: "Model 1's probability for the side to move at the header's ratings"},
-        {k: "delta", h: "Δ", w: 44, t: "Prob − Model, percentage points: where the games depart from the model, weighted by how many there are"},
         {k: "score", h: "Score", w: 50, t: `White's expected score, %: (games·database + κv·model 2) / (games + κv), κv = ${sh.kappa_v}, model 2 for the position after the move at the header's ratings`},
         {k: "draw", h: "Draw", w: 46, t: `Draw probability, %, mixed the same way (κv = ${sh.kappa_v})`},
         ...eloCols().map(c => ({...c, w: 58, t: c.t + ` (k = ${sh.k_elo})`})),
@@ -403,7 +402,6 @@ function rows() {
         }
         r.p_mix = m ? m.p_mix : null
         r.p_model = m ? m.p_model : null
-        r.delta = m ? m.delta : null
         r.score = m ? m.score_mix : r.dbScore
         r.draw = m ? m.draw_mix : r.dbDraw
         if (flip && r.score != null) r.score = 1 - r.score
@@ -456,15 +454,6 @@ function trendCell(r, s) {
         t += ": too few games to test"
     }
     return `<span title="${esc(t)}">${svg}${mark}</span>`
-}
-
-function deltaCell(r) {
-    if (r.delta == null) return ""
-    const v = 100 * r.delta
-    const a = Math.min(1, Math.abs(v) / 20)
-    const bg = v > 0 ? `rgba(40,120,220,${a * 0.45})` : `rgba(220,90,40,${a * 0.45})`
-    const txt = Math.round(v) === 0 ? "0" : (v > 0 ? "+" : "−") + Math.abs(v).toFixed(0)
-    return `<span class="pill" style="background:${bg}">${txt}</span>`
 }
 
 function pending() {
@@ -555,7 +544,6 @@ function render() {
             `<td class="num${r.db ? "" : " dim"}">${r.n ?? ""}</td>` +
             probCell(r) +
             `<td class="num model">${r.p_model == null ? "" : pctShare(r.p_model)}</td>` +
-            `<td class="num">${deltaCell(r)}</td>` +
             mixCell(r, "score") + mixCell(r, "draw") +
             eloCell(r, 1) + eloCell(r, 2) +
             `<td class="num">${r.last_year ?? ""}</td>` +
