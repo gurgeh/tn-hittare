@@ -281,6 +281,12 @@ learn, and which move in each, to maximise my expected score.
   that fails is banned and the search reruns.
 - **Budget:** N positions, or a price `mu` per position (`budget_for_price`);
   the curve gives both.
+- **What a position costs** (decided by the user 2026-11-12, not built): 0
+  when the move learned there is obvious and 1 when it is not. Obvious means
+  that the move model at my own rating gives the move at least a threshold,
+  somewhere in 0.8-0.9. The threshold is a parameter and the output reports
+  how the chosen set changes across that range. Until this is built every
+  learned position costs 1.
 - **Output:** the learned positions with their move, reach probability, the
   loss if that position alone were forgotten and the rise of the curve where
   it entered; the curve of expected score against N; each line played out
