@@ -3,7 +3,8 @@
 - **Model 1**, the move model: any object with the `MoveModel` interface
   (`.predict(queries) -> list[Prediction]`), by default `tnh.models.default_move_model()`.
 - **Model 2**, the result model: any object with `.wdl(queries)` (an array of win, draw,
-  loss for the mover per query), e.g. `tnh.models.combo.FrontierValue()`.
+  loss for the mover per query), by default `tnh.eval.result.ResultModel("cheap")` (network
+  calls only); `result-full` adds Lc0 at 50 nodes, `frontier` is step 1's value head.
 - Stockfish on demand, as before.
 
 Models are named by a spec string (`load_move_model`, `load_value_model`): a preset, or
@@ -30,7 +31,7 @@ import numpy as np
 from tnh.models.base import Query, position_key
 
 HISTORY = 8          # positions of history a model may look at; part of the cache key
-VALUE_BATCH = 12     # queries per model-2 call; Lc0's batch size in tnh.models
+VALUE_BATCH = 12     # queries per model-2 call unless the model sets `queries_per_call`
 
 
 class ModelHub(Protocol):
@@ -58,6 +59,8 @@ MOVE_MODELS: dict[str, Callable[[], object]] = {
     "fake": lambda: _fakes().FakeMoveModel(),
 }
 VALUE_MODELS: dict[str, Callable[[], object]] = {
+    "result-cheap": lambda: importlib.import_module("tnh.eval.result").ResultModel("cheap"),
+    "result-full": lambda: importlib.import_module("tnh.eval.result").ResultModel("full"),
     "frontier": lambda: _combo().FrontierValue(),
     "fake": lambda: _fakes().FakeValue(),
 }
@@ -159,7 +162,7 @@ def terminal_wdl(board: chess.Board) -> tuple[float, float, float] | None:
 class Hub:
     """Model 1, model 2 and Stockfish, created lazily from their specs (or given as objects)."""
 
-    def __init__(self, move_model: str | object = "policy-trees", value_model: str | object = "frontier",
+    def __init__(self, move_model: str | object = "policy-trees", value_model: str | object = "result-cheap",
                  *, stockfish_processes: int = 1, cache_size: int = 20000) -> None:
         self._move_spec, self._value_spec = move_model, value_model
         self._move = None if isinstance(move_model, str) else move_model
@@ -212,7 +215,8 @@ class Hub:
     def values(self, queries: list[Query], cancelled: Callable[[], bool] = lambda: False) -> list[tuple]:
         """Model 2: (win, draw, loss) for the mover of each query. Cached ones are not asked
         again; finished games are scored by their result; the rest go in batches of
-        `VALUE_BATCH`, checking `cancelled` between batches (then `Superseded`)."""
+        the model's `queries_per_call` (default `VALUE_BATCH`), checking `cancelled` between
+        batches (then `Superseded`)."""
         out: list[tuple | None] = [None] * len(queries)
         todo = []
         for i, q in enumerate(queries):
@@ -230,10 +234,11 @@ class Hub:
         if todo:
             with self._value_lock:
                 model = self._get_value()
-                for start in range(0, len(todo), VALUE_BATCH):
+                batch = getattr(model, "queries_per_call", VALUE_BATCH)
+                for start in range(0, len(todo), batch):
                     if cancelled():
                         raise Superseded(f"{len(todo) - start} of {len(todo)} values not computed")
-                    idx = todo[start:start + VALUE_BATCH]
+                    idx = todo[start:start + batch]
                     # Another request may have filled some while this one waited for the lock.
                     need = [i for i in idx if self._value_cache.get(_key(queries[i])) is None]
                     if need:
