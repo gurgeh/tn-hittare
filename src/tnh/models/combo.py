@@ -261,6 +261,11 @@ class PolicyTrees:
         self.seconds: Counter = Counter()
 
     def predict(self, queries: list[Query]) -> list[Prediction]:
+        return self.predict_with_calls(queries)[0]
+
+    def predict_with_calls(self, queries: list[Query]) -> tuple[list[Prediction], tuple]:
+        """`predict`, plus the network calls' own predictions `(maia +0, maia +600, lc0 policy)`
+        (lists of `Prediction`, value heads in `.wdl`) for `tnh.eval.result.PolicyTreesValued`."""
         t = time.perf_counter()
         m0, mb = self.maia.predict_many(queries, self.elos)
         self.seconds["maia"] += time.perf_counter() - t
@@ -271,7 +276,7 @@ class PolicyTrees:
         feats = self.front.features(queries, (m0, mb), pol, None, None)
         lps = self.front.logp(feats, "trees")
         self.seconds["trees"] += time.perf_counter() - t
-        return [Prediction(ms, lp, p.wdl) for ms, lp, p in zip(feats[0], lps, pol)]
+        return [Prediction(ms, lp, p.wdl) for ms, lp, p in zip(feats[0], lps, pol)], (m0, mb, pol)
 
 
 # -- the frontier value -----------------------------------------------------------------------

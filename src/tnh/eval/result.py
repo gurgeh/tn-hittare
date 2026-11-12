@@ -3,6 +3,7 @@
     uv run python -m tnh.eval.result fit [--test S] [--fit S] [--results R] [--boot 1000]
     uv run python -m tnh.eval.result refit            # writes the stored parameters (result_params.json)
     uv run python -m tnh.eval.result check-live --n 200   # the live model against the feature files (GPU)
+    uv run python -m tnh.eval.result check-default --n 300   # the default move model's value against ResultModel("cheap") (GPU)
 
 **Sources**, each a position's win/draw/loss for the side to move from a feature directory's
 ``wdl`` column (one row per position, keyed on game_id and ply):
@@ -306,6 +307,40 @@ def cmd_fit(a) -> None:
         "best": best, "variants": results, "adds": adds, "offsets": offsets, "calibration": calib, "boot": a.boot})
 
 
+def cmd_cheap(a) -> None:
+    """The cheap model in detail: calibration by ply and rating band, the priority subset, and the
+    cheap model with a source left out (paired against the cheap model). Writes `<results>/result_cheap.json`."""
+    test, fit = read_sample(a.test), read_sample(a.fit)
+    srcs_all = ["maia0", "maia600", "lc0raw"]
+    wt, ct, yt = table(test, {k: SOURCES[k] for k in srcs_all})
+    wf, cf, yf = table(fit, {k: SOURCES[k] for k in srcs_all})
+    gt = cluster_codes(test)
+    counts = boot_counts(gt.max() + 1, a.boot, a.seed)
+    prio = priority_mask(test)
+    sets = {"cheap": srcs_all, "without maia600": ["maia0", "lc0raw"], "without maia0": ["maia600", "lc0raw"],
+            "without lc0raw": ["maia0", "maia600"]}
+    P = {k: mlogit_probs(fit_mlogit(design(wf, cf, s), yf), design(wt, ct, s)) for k, s in sets.items()}
+    base = losses(P["cheap"], yt)[0]
+    w = np.ones(len(yt))
+    out = {}
+    for k, p in P.items():
+        ll = losses(p, yt)[0]
+        X = np.column_stack([ll, ll - base])
+        bm, bp = boot_means(X, w, gt, counts), boot_means(X[prio], w[prio], gt[prio], counts)
+        out[k] = {"sources": sets[k], "logloss": est(ll.mean(), bm[:, 0]), "minus_cheap": est((ll - base).mean(), bm[:, 1]),
+                  "priority_logloss": est(ll[prio].mean(), bp[:, 0]),
+                  "priority_minus_cheap": est((ll - base)[prio].mean(), bp[:, 1])}
+        print(f"{k:>16}: {ll.mean():.4f} ({(ll - base).mean():+.4f}), priority {ll[prio].mean():.4f} "
+              f"({(ll - base)[prio].mean():+.4f})", flush=True)
+    calib = {by: calibration(test, P["cheap"], yt, by) for by in ("rating", "ply")}
+    prio_calib = {by: calibration(test.filter(pl.Series(prio)), P["cheap"][prio], yt[prio], by) for by in ("rating", "ply")}
+    write_result(a.results, "result_cheap", {
+        "what": "cheap result model (Maia-3 value heads at +0 and +600, Lc0 raw value, logit with context): "
+                "calibration and sources left out; fitted on the fit games, scored on the test games",
+        "test": str(a.test), "fit": str(a.fit), "games": {"test": len(yt), "fit": len(yf), "priority": int(prio.sum())},
+        "variants": out, "calibration": calib, "priority_calibration": prio_calib, "boot": a.boot})
+
+
 # --- the stored model and its live features ------------------------------------------------------------
 
 def cmd_refit(a) -> None:
@@ -337,6 +372,9 @@ class ResultModel:
         self.name = f"result-{variant}"
         self._maia = self._policy = self._search = None
         self.lc0_processes = lc0_processes
+        # queries per call a caller may batch (the web page's value batches): the search is slow, so
+        # small batches let a caller cancel between them; network calls batch internally
+        self.queries_per_call = 12 if "lc0w" in self.sources else 64
 
     def source_wdl(self, queries) -> dict[str, np.ndarray]:
         from tnh.models.maia3 import Elo
@@ -345,20 +383,20 @@ class ResultModel:
             if self._policy is None:
                 from tnh.models.lc0 import Lc0Policy
                 self._policy = Lc0Policy()
-            out["lc0raw"] = np.array([p.wdl for p in self._policy.predict(queries)], dtype=np.float64)
+            out["lc0raw"] = [p.wdl for p in self._policy.predict(queries)]
         if "maia0" in self.sources or "maia600" in self.sources:
             if self._maia is None:
                 from tnh.models.maia3 import Maia3
                 self._maia = Maia3("79m", batch_size=128)
             m0, m6 = self._maia.predict_many(queries, [Elo.offset(0.0), Elo.offset(600.0)])
-            out["maia0"] = np.array([p.wdl for p in m0], dtype=np.float64)
-            out["maia600"] = np.array([p.wdl for p in m6], dtype=np.float64)
+            out["maia0"] = [p.wdl for p in m0]
+            out["maia600"] = [p.wdl for p in m6]
         if "lc0w" in self.sources:
             if self._search is None:
                 from tnh.models.lc0 import Lc0Search
                 self._search = Lc0Search(50, wdl_elo=Elo.parse("offset+400"), processes=self.lc0_processes)
-            out["lc0w"] = np.array([v.wdl for v in self._search.evaluate(queries)], dtype=np.float64)
-        return {k: v / v.sum(1, keepdims=True) for k, v in out.items()}
+            out["lc0w"] = [v.wdl for v in self._search.evaluate(queries)]
+        return normalised(out)
 
     def from_sources(self, w: dict[str, np.ndarray], queries) -> np.ndarray:
         ctx = context(np.array([q.mover_elo for q in queries], float), np.array([q.opp_elo for q in queries], float),
@@ -379,6 +417,63 @@ class ResultModel:
             self._search.close()
 
 
+def normalised(w: dict[str, list]) -> dict[str, np.ndarray]:
+    """Per source a rows x 3 array, each row scaled to sum 1."""
+    out = {}
+    for k, rows in w.items():
+        v = np.array(rows, dtype=np.float64)
+        out[k] = v / v.sum(1, keepdims=True)
+    return out
+
+
+class PolicyTreesValued:
+    """The default move model (`tnh.models.default_move_model()`): `tnh.models.combo.PolicyTrees`'
+    move probabilities, and as `Prediction.wdl` the cheap result model computed from the value heads
+    of the same three network calls (Maia-3 79M at +0 and +600, Lc0 BT4's policy call), so the value
+    costs no extra call. A position without legal moves keeps `PolicyTrees`' own `wdl` (the game is
+    over; callers score it by its result).
+
+    Also a value model: `.wdl(queries)` and `.expected_score(queries)` as `ResultModel("cheap")`.
+    """
+
+    NAME = "maia3-79m-lc0pol-trees+result-cheap"
+
+    def __init__(self, *, maia_batch: int = 512, params: Path = PARAMS) -> None:
+        from tnh.models.combo import PolicyTrees
+
+        self.result = ResultModel("cheap", params)
+        extra = set(self.result.sources) - {"maia0", "maia600", "lc0raw"}
+        if extra:
+            raise ValueError(f"the stored cheap result model needs {sorted(extra)}, which PolicyTrees does not call")
+        self.moves = PolicyTrees(maia_batch=maia_batch)
+        self.name = self.NAME
+        self.seconds = self.moves.seconds
+        self.queries_per_call = 64
+
+    def predict(self, queries) -> list:
+        from tnh.models.base import Prediction
+
+        preds, (m0, m6, pol) = self.moves.predict_with_calls(queries)
+        live = [i for i, p in enumerate(preds) if p.moves]
+        if live:
+            t = time.perf_counter()
+            w = normalised({"maia0": [m0[i].wdl for i in live], "maia600": [m6[i].wdl for i in live],
+                            "lc0raw": [pol[i].wdl for i in live]})
+            r = self.result.from_sources(w, [queries[i] for i in live])
+            for i, row in zip(live, r):
+                preds[i] = Prediction(preds[i].moves, preds[i].logp, tuple(float(x) for x in row))
+            self.seconds["result model"] += time.perf_counter() - t
+        return preds
+
+    def wdl(self, queries) -> np.ndarray:
+        """queries x (win, draw, loss) for the side to move."""
+        return np.array([p.wdl for p in self.predict(queries)], dtype=np.float64)
+
+    def expected_score(self, queries) -> np.ndarray:
+        w = self.wdl(queries)
+        return w[:, 0] + 0.5 * w[:, 1]
+
+
 def cmd_check_live(a) -> None:
     """The live sources against the feature files on n test positions, and the stored model's output computed
     live against the same model on the files' values. ``--sources`` loads only those networks (an Lc0 engine is
@@ -396,6 +491,58 @@ def cmd_check_live(a) -> None:
         print(f"{k}: max |live - file| = {np.nanmax(d):.5f}, mean {np.nanmean(d):.5f}")
     print(f"{'+'.join(a.sources)}: {len(qs) / dt:.1f} positions/s live")
     m.close()
+
+
+def cmd_check_default(a) -> None:
+    """`PolicyTreesValued` live: its moves against a fresh `PolicyTrees`, its `wdl` against a fresh
+    `ResultModel("cheap")`, and its positions per second (one model on the GPU at a time)."""
+    import gc
+    import subprocess
+
+    import torch
+
+    from tnh.eval.sample import drop_cache, peak_gb
+    from tnh.models.combo import PolicyTrees, _queries
+
+    _, qs = _queries(a.test, a.n, 5)
+    drop_cache(CORPUS / "games.parquet")
+
+    def free():
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def gpu():
+        r = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader"],
+                           capture_output=True, text=True)
+        return r.stdout.strip().replace("\n", "; ")
+
+    m = PolicyTreesValued()
+    m.predict(qs[:24])                                     # warm-up
+    rates = {}
+    for bs in a.batches:
+        t = time.perf_counter()
+        for k in range(0, len(qs), bs):
+            joint = m.predict(qs[k:k + bs]) if k == 0 else joint + m.predict(qs[k:k + bs])
+        rates[bs] = len(qs) / (time.perf_counter() - t)
+        print(f"joint call, batches of {bs}: {rates[bs]:.1f} positions/s", flush=True)
+    print(f"GPU processes while timing: {gpu()}", flush=True)
+    del m
+    free()
+    pt = PolicyTrees()
+    ref = pt.predict(qs)
+    del pt
+    free()
+    same = all(a_.moves == b_.moves and np.array_equal(a_.logp, b_.logp) for a_, b_ in zip(joint, ref))
+    dmax = max(float(np.max(np.abs(np.exp(a_.logp.astype(np.float64)) - np.exp(b_.logp.astype(np.float64)))))
+               for a_, b_ in zip(joint, ref) if a_.moves)
+    print(f"moves and log probabilities identical to PolicyTrees: {same} (max |p - p'| {dmax:.2e})", flush=True)
+    rm = ResultModel("cheap")
+    w = rm.wdl(qs)
+    j = np.array([p.wdl for p in joint])
+    d = np.abs(j - w)
+    e = np.abs((j[:, 0] + 0.5 * j[:, 1]) - (w[:, 0] + 0.5 * w[:, 1]))
+    print(f"{len(qs)} positions: max |wdl - ResultModel('cheap')| {d.max():.5f} (mean {d.mean():.6f}); "
+          f"expected score max {e.max():.5f}; peak RSS {peak_gb():.2f} GB", flush=True)
 
 
 def cmd_bench(a) -> None:
@@ -467,6 +614,18 @@ def main(argv=None) -> None:
     sp.add_argument("--n", type=int, default=200)
     sp.add_argument("--sources", nargs="+", default=["maia0", "maia600", "lc0raw"])
     sp.set_defaults(fn=cmd_check_live)
+    sp = sub.add_parser("cheap")
+    sp.add_argument("--test", type=Path, default=CORPUS / "samples" / "test_value_all.parquet")
+    sp.add_argument("--fit", type=Path, default=CORPUS / "samples" / "fit_value20k.parquet")
+    sp.add_argument("--results", type=Path, default=RESULTS)
+    sp.add_argument("--boot", type=int, default=1000)
+    sp.add_argument("--seed", type=int, default=7)
+    sp.set_defaults(fn=cmd_cheap)
+    sp = sub.add_parser("check-default")
+    sp.add_argument("--test", type=Path, default=CORPUS / "samples" / "test_value_all.parquet")
+    sp.add_argument("--n", type=int, default=300)
+    sp.add_argument("--batches", type=int, nargs="+", default=[30, 300])
+    sp.set_defaults(fn=cmd_check_default)
     a = p.parse_args(argv)
     a.fn(a)
 

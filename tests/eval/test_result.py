@@ -77,3 +77,36 @@ def test_terminal_results():
     assert np.allclose(terminal(chess.Board("7k/6Q1/6K1/8/8/8/8/8 b - - 0 1")), [0, 0, 1])
     assert np.allclose(terminal(chess.Board("7k/8/6QK/8/8/8/8/8 b - - 0 1")), [0, 1, 0])
     assert terminal(chess.Board()) is None
+
+
+def test_policy_trees_valued_takes_the_moves_and_puts_the_cheap_result_model_on_the_same_calls():
+    from tnh.eval.result import PolicyTreesValued, ResultModel, normalised
+    from tnh.models.base import Prediction, Query
+
+    qs = [Query(chess.Board().fen(), [], 2200, 2100),
+          Query("7k/6Q1/6K1/8/8/8/8/8 b - - 0 1", [], 2000, 2300)]     # mated: no legal moves
+    rng = np.random.default_rng(0)
+
+    def calls(q, i):
+        ms = [m.uci() for m in chess.Board(q.fen).legal_moves]
+        w = rng.dirichlet([2, 2, 2])
+        return Prediction(ms, np.full(len(ms), -np.log(max(len(ms), 1)), np.float32), tuple(w))
+
+    class FakeTrees:
+        seconds = {}
+
+        def predict_with_calls(self, queries):
+            m0, m6, pol = ([calls(q, i) for i, q in enumerate(queries)] for _ in range(3))
+            preds = [Prediction(p.moves, p.logp + 0.0, (0.1, 0.2, 0.7)) for p in pol]
+            return preds, (m0, m6, pol)
+
+    model = PolicyTreesValued.__new__(PolicyTreesValued)
+    model.result, model.moves, model.seconds = ResultModel("cheap"), FakeTrees(), {"result model": 0.0}
+    rng = np.random.default_rng(0)
+    got = model.predict(qs)
+    rng = np.random.default_rng(0)
+    _, (m0, m6, pol) = FakeTrees().predict_with_calls(qs)
+    want = ResultModel("cheap").from_sources(normalised({"maia0": [m0[0].wdl], "maia600": [m6[0].wdl],
+                                                         "lc0raw": [pol[0].wdl]}), qs[:1])
+    assert np.allclose(got[0].wdl, want[0]) and got[0].moves == pol[0].moves
+    assert got[1].moves == [] and got[1].wdl == (0.1, 0.2, 0.7)
