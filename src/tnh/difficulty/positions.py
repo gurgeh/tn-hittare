@@ -205,8 +205,8 @@ def set_paths(tag: str) -> tuple[Path, Path, Path]:
     return OUT / f"positions_{tag}.parquet", OUT / f"moves_{tag}.parquet", OUT / f"positions_{tag}.json"
 
 
-def tag_of(name: str, min_games: int) -> str:
-    return f"{name}_n{min_games}"
+def tag_of(name: str, min_games: int, max_games: int | None = None) -> str:
+    return f"{name}_n{min_games}" + (f"to{max_games - 1}" if max_games else "")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -215,10 +215,20 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--min-games", type=int, default=100)
     ap.add_argument("--bands", type=int, nargs=2, default=(1800, 2400))
     ap.add_argument("--tempo", default="classical")
+    ap.add_argument("--max-games", type=int, default=None,
+                    help="keep only positions with fewer games than this (after the thinning flags are set "
+                         "relative to the whole set >= min-games)")
     args = ap.parse_args(argv)
     db = EdgeDB(args.name)
     s, out, info = build(db, edges_scan(args.name), min_games=args.min_games, bands=tuple(args.bands), tempo=args.tempo)
     info["name"] = args.name
+    if args.max_games is not None:
+        s = s.filter(pl.col("n") < args.max_games)
+        out = out.join(s.select("pos_hash"), on="pos_hash", how="semi")
+        info["max_games"] = args.max_games
+        info["positions"] = s.height
+        info["games_in_filter_reaching_set"] = int(s["n"].sum())
+        info["leaves"] = int(s["leaf"].sum())
     for k in (2, 4, 6, 8):
         fam = s.select(family(pl.col("moves_uci"), k).alias("f"), "n")
         g = fam.drop_nulls("f").group_by("f").agg(pl.len(), pl.col("n").sum()).sort("len", descending=True)
@@ -226,7 +236,7 @@ def main(argv: list[str] | None = None) -> None:
                                     "largest_share": round(float(g["len"].max() / g["len"].sum()), 3) if g.height else None,
                                     "largest": g.head(5).to_dicts()}
     OUT.mkdir(parents=True, exist_ok=True)
-    p_pos, p_mov, p_info = set_paths(tag_of(args.name, args.min_games))
+    p_pos, p_mov, p_info = set_paths(tag_of(args.name, args.min_games, args.max_games))
     s.write_parquet(p_pos)
     out.write_parquet(p_mov)
     p_info.write_text(json.dumps(info, indent=1) + "\n")

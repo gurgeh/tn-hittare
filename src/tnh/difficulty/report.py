@@ -16,6 +16,7 @@ NAMES = {
     "hard_next": "narrow path, other side next ply",
     "net2": "two-ply net",
     "maia_value": "Maia value head (= its difference from the engine)",
+    "maia_value_eq": "Maia value head at equal ratings (H4)",
     "el_db": "REFERENCE: expected loss with the games' own moves",
     "hard_db": "REFERENCE: narrow path with the games' own moves",
 }
@@ -69,7 +70,7 @@ def measure_table(res: dict) -> list[str]:
                    f"{f(v['share'], 2, 100)} | {f(t['top'], 3)} | {f(t['bottom'], 3)} | {f(t['diff'], 3)} |")
     if "all_measures" in res:
         a = res["all_measures"]
-        out.append(f"| all six together | | | {f(a['dmse'], 2, 1e5)} | {f(a['share'], 2, 100)} | | | |")
+        out.append(f"| all {len([m for m, v in res['measures'].items() if not v['reference']])} together | | | {f(a['dmse'], 2, 1e5)} | {f(a['share'], 2, 100)} | | | |")
     return out
 
 

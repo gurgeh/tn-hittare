@@ -11,6 +11,9 @@ mover after each move (MultiPV, every legal move), ``loss = max(v) - v``.
   (renormalised; ``child_cover`` is the probability they cover).
 - ``net2``: ``el_stm - el_next``, S's loss now minus O's loss one ply later.
 - ``maia_es_stm``: Maia's value head, expected score for S at the mapped ratings.
+- ``maia_es_stm_eq``: the value head with both ratings set to the mapped mean of
+  the two sides' means (H4), so the rating gap cannot enter through Maia. NaN
+  where that call was not made.
 - ``engine_es_stm``, ``engine_cp_stm``: Stockfish's root search (MultiPV 1, the
   larger budget), for S.
 - ``el_db``, ``hold_db``: the same loss and hold with the games' own move shares
@@ -26,7 +29,7 @@ from __future__ import annotations
 import numpy as np
 import polars as pl
 
-from tnh.difficulty.compute import Budget, children_of, maia_elo, open_caches
+from tnh.difficulty.compute import Budget, children_of, equal_elo, maia_elo, open_caches
 from tnh.data.edges import pos_hash
 
 import chess
@@ -62,7 +65,8 @@ def build(positions: pl.DataFrame, b: Budget, *, eps: float = 0.03, db_moves: pl
         for (h,), g in db_moves.group_by(["pos_hash"]):
             dbm[int(h)] = (g["move"].to_list(), g["n"].to_numpy().astype(np.float64))
     out, counts = [], {"missing_maia": 0, "missing_multipv": 0, "missing_root": 0, "children_missing": 0,
-                       "moves_without_value": 0, "db_moves_not_legal": 0}
+                       "moves_without_value": 0, "db_moves_not_legal": 0,
+                       "missing_equal_value": 0}
     for r in positions.select("pos_hash", "fen", "white_elo", "black_elo", "stm_white").iter_rows(named=True):
         h = r["pos_hash"]
         w, bl = maia_elo(r["white_elo"]), maia_elo(r["black_elo"])
@@ -107,9 +111,16 @@ def build(positions: pl.DataFrame, b: Budget, *, eps: float = 0.03, db_moves: pl
         rw, rd, _rl = rt["wdl"]
         cp = rt["cp"] if rt["mate"] == 0 else float(np.sign(rt["mate"]) * 1000)
         ent = float(-np.sum(p * np.log(np.maximum(p, 1e-12))))
+        e = equal_elo(r["white_elo"], r["black_elo"])
+        if maia_c.has((h, e, e)):
+            ew, ed, _ = maia_c.get((h, e, e))["wdl"]
+            es_eq = ew + 0.5 * ed
+        else:
+            counts["missing_equal_value"] += 1
+            es_eq = float("nan")
         row = {"pos_hash": h, "el_stm": el, "hold_stm": hold, "el_next": el_next, "hold_next": hold_next,
                "net2": el - el_next, "child_cover": float(ps_a.sum()) if ps else 0.0, "n_children": len(ps),
-               "maia_es_stm": mw + 0.5 * md, "engine_es_stm": rw + 0.5 * rd, "engine_cp_stm": cp,
+               "maia_es_stm": mw + 0.5 * md, "maia_es_stm_eq": es_eq, "engine_es_stm": rw + 0.5 * rd, "engine_cp_stm": cp,
                "engine_depth": rt["depth"], "multipv_best_es_stm": float(np.nanmax(v)),
                "maia_top_p": float(p.max()), "maia_entropy": ent, "n_legal": len(p),
                "maia_self_elo": se, "maia_oppo_elo": oe, "el_db": float("nan"), "hold_db": float("nan"),

@@ -44,14 +44,19 @@ MEASURES = {
     "net2": "two-ply net: loss now minus the other side's loss next",
     "maia_value": "Maia value head, expected score for White",
 }
+EXTRA = {
+    "maia_value_eq": "Maia value head at equal ratings (mapped mean of both sides), expected score for White",
+}
 REFERENCE = {
     "el_db": "expected loss with the games' own move shares (not a predictor)",
     "hard_db": "1 - share of the games' moves that hold (not a predictor)",
 }
 
 
-def white_frame(positions: pl.DataFrame, measures: pl.DataFrame, family_ply: int) -> tuple[pl.DataFrame, dict]:
-    """Positions joined to their measures, every column from White's point of view."""
+def white_frame(positions: pl.DataFrame, measures: pl.DataFrame, family_ply: int,
+                extra: tuple[str, ...] = ()) -> tuple[pl.DataFrame, dict]:
+    """Positions joined to their measures, every column from White's point of view.
+    ``extra``: columns of EXTRA that must be finite too."""
     df = positions.join(measures, on="pos_hash", how="inner")
     info = {"positions": positions.height, "with_measures": df.height}
     sgn = pl.when(pl.col("stm_white")).then(-1.0).otherwise(1.0)   # a loss of the side to move, for White
@@ -74,6 +79,8 @@ def white_frame(positions: pl.DataFrame, measures: pl.DataFrame, family_ply: int
         hard_next=-sgn * (1 - pl.col("hold_next")),
         net2=sgn * pl.col("net2"),
         maia_value=pl.when(pl.col("stm_white")).then(pl.col("maia_es_stm")).otherwise(1 - pl.col("maia_es_stm")),
+        maia_value_eq=(pl.when(pl.col("stm_white")).then(pl.col("maia_es_stm_eq")).otherwise(1 - pl.col("maia_es_stm_eq"))
+                       if "maia_es_stm_eq" in measures.columns else pl.lit(float("nan"))),
         el_db=sgn * pl.col("el_db"),
         hard_db=sgn * (1 - pl.col("hold_db")),
         log_total=pl.col("total_n").log10(),
@@ -81,7 +88,7 @@ def white_frame(positions: pl.DataFrame, measures: pl.DataFrame, family_ply: int
     )
     info["above_family_ply"] = int(df["family"].null_count())
     df = df.filter(pl.col("family").is_not_null())
-    cols = [*BASE, *MEASURES, *REFERENCE]
+    cols = [*BASE, *MEASURES, *REFERENCE, *extra]
     finite = pl.all_horizontal([pl.col(c).is_not_null() & pl.col(c).is_finite() for c in cols])
     info["dropped_not_finite"] = int(df.height - df.filter(finite).height)
     df = df.filter(finite)

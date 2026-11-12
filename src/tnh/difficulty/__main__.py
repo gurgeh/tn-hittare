@@ -1,4 +1,4 @@
-"""python -m tnh.difficulty <positions|compute|analyse|synth|report> [options]"""
+"""python -m tnh.difficulty <positions|compute|analyse|ceiling|synth|report> [options]"""
 
 from __future__ import annotations
 
@@ -79,7 +79,7 @@ def analyse(a) -> None:
     meas, counts = M.build(positions, b, eps=a.eps, db_moves=moves)
     print(f"measures for {meas.height} of {positions.height} positions; {counts}", flush=True)
     meas.write_parquet(OUT / f"measures_{a.tag}.parquet")
-    df, finfo = A.white_frame(positions, meas, a.family_ply)
+    df, finfo = A.white_frame(positions, meas, a.family_ply, extra=tuple(a.extra))
     setup = A.Setup(folds=a.folds, boot=a.boot, seed=a.seed, base=a.base)
     out_all = {"tag": a.tag, "budget": b.__dict__, "eps": a.eps, "family_ply": a.family_ply,
                "set_info": json.loads(info_p.read_text()), "measure_counts": counts, "frame": finfo,
@@ -97,9 +97,9 @@ def analyse(a) -> None:
         "corr_hard": float(np.corrcoef(np.abs(raw[:, 2]), np.abs(raw[:, 3]))[0, 1]),
         "corr_signed_el": float(np.corrcoef(raw[:, 0], raw[:, 1])[0, 1]),
     }
-    cols = [*A.MEASURES, *A.REFERENCE]
+    cols = [*A.MEASURES, *a.extra, *A.REFERENCE]
     out_all["measure_corr"] = {"names": cols, "matrix": np.corrcoef(df.select(cols).to_numpy().T).tolist()}
-    measures = list(A.MEASURES)
+    measures = list(A.MEASURES) + list(a.extra)
     reference = list(A.REFERENCE)
     for variant in a.variants:
         d = df if variant == "all" else df.filter(pl.col("leaf")) if variant == "leaves" else None
@@ -132,6 +132,42 @@ def lists(frame: pl.DataFrame, res: dict, a) -> dict:
     conv = lambda df: [{**r, "san": san_line(r["moves_uci"])} for r in df.iter_rows(named=True)]
     return {"measure": best, "beta": beta, "near_cp": a.near_cp, "near_positions": near.height,
             "edges": conv(top), "misses": conv(miss)}
+
+
+def ceiling_cmd(a) -> None:
+    from tnh.difficulty import ceiling as Ce
+    from tnh.difficulty.compute import open_caches
+    t0 = time.time()
+    pos = pl.read_parquet(set_paths(a.tag)[0])
+    df, above = Ce.prepare(pos, a.family_ply)
+    strata, allpos = Ce.strata_table(df, a.boot, a.seed)
+    out = {"tag": a.tag, "family_ply": a.family_ply, "above_family_ply": above, "rating_base": Ce.RATING_BASE,
+           "strata": strata}
+    # the n >= 100 set: rating-only baseline beside the engine baseline, same positions
+    fr = pl.read_parquet(OUT / f"frame_{a.engine_tag}_all.parquet")
+    cmp = {}
+    for name, base in (("ratings only", Ce.RATING_BASE), ("engine + ratings", list(A.BASE))):
+        f = Ce.tau_fit(fr, base, a.boot, a.seed)
+        cmp[name] = {k: v for k, v in f.items() if not k.startswith("_")}
+    out["engine_vs_ratings"] = {"frame": a.engine_tag, **cmp}
+    # the list, with the engine value where the root search exists
+    lst, info = Ce.deepest_list(allpos, a.top)
+    _, _, root = open_caches(Budget())
+    rows = []
+    for r in lst.iter_rows(named=True):
+        cp = None
+        if root.has((r["pos_hash"],)):
+            rt = root.get((r["pos_hash"],))
+            c = rt["cp"] if rt["mate"] == 0 else float(np.sign(rt["mate"]) * 1000)
+            cp = c if r["stm_white"] > 0.5 else -c
+        rows.append({"san": san_line(r["moves_uci"]), "epd": r["epd"], "n": r["n"], "y": r["y"],
+                     "white_elo": r["white_elo"], "black_elo": r["black_elo"], "stratum": r["stratum"],
+                     "edge": r["shrunk"], "lo": r["shrunk"] - 1.96 * r["post_sd"], "hi": r["shrunk"] + 1.96 * r["post_sd"],
+                     "raw": r["resid"], "cp_white": cp, "total_n": r["total_n"]})
+    out["list"] = {**info, "rows": rows}
+    out["seconds"] = round(time.time() - t0, 1)
+    write(f"ceiling_{a.tag}", out)
+    allpos.select("pos_hash", "stratum", "n", "y", "resid", "shrunk", "post_sd").write_parquet(OUT / f"ceiling_{a.tag}.parquet")
 
 
 def synth_cmd(a) -> None:
@@ -184,7 +220,16 @@ def main(argv: list[str] | None = None) -> None:
         ap.add_argument("--variants", nargs="+", default=["all", "leaves"])
         ap.add_argument("--base", nargs="+", default=list(A.BASE), help="baseline columns")
         ap.add_argument("--label", default="", help="suffix of the result file, e.g. _elo2")
+        ap.add_argument("--extra", nargs="*", default=[], choices=list(A.EXTRA), help="measures beyond the first six")
         analyse(ap.parse_args(rest))
+    elif cmd == "ceiling":
+        ap.add_argument("--tag", default="dev_n20")
+        ap.add_argument("--engine-tag", default="dev_n100", help="frame with engine values for the comparison")
+        ap.add_argument("--family-ply", type=int, default=4)
+        ap.add_argument("--boot", type=int, default=1000)
+        ap.add_argument("--seed", type=int, default=0)
+        ap.add_argument("--top", type=int, default=30)
+        ceiling_cmd(ap.parse_args(rest))
     elif cmd == "synth":
         ap.add_argument("--games", type=int, default=30_000)
         ap.add_argument("--min-games", type=int, default=30)

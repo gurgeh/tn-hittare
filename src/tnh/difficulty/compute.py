@@ -185,8 +185,14 @@ def children_of(moves: list[str], p: np.ndarray, b: Budget) -> list[tuple[str, f
     return out
 
 
+def equal_elo(white_fide: float, black_fide: float) -> float:
+    """H4: one network rating for both sides, the mapped mean of the two sides' mean ratings."""
+    return maia_elo((white_fide + black_fide) / 2)
+
+
 def run(positions: pl.DataFrame, b: Budget, *, chunk: int = 32, flush_every: int = 512,
-        max_seconds: float | None = None) -> dict:
+        max_seconds: float | None = None, equal_value: bool = True) -> dict:
+    """``equal_value``: also call Maia at the position with both ratings ``equal_elo`` (for its value head)."""
     import torch
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
@@ -256,6 +262,10 @@ def run(positions: pl.DataFrame, b: Budget, *, chunk: int = 32, flush_every: int
                 r["_elo"] = (se, oe)
                 items.append((r["pos_hash"], r["fen"], r["moves_uci"].split(), se, oe))
             maia_calls(items)
+            if equal_value:
+                eq = [(r["pos_hash"], r["fen"], r["moves_uci"].split(), equal_elo(r["white_elo"], r["black_elo"]),
+                       equal_elo(r["white_elo"], r["black_elo"])) for r in part]
+                maia_calls(eq)
             # 2. the children the side to move is likely to play
             child_items, sf_items = [], []
             for r in part:
@@ -326,6 +336,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--child-mass", type=float, default=d.child_mass)
     ap.add_argument("--max-children", type=int, default=d.max_children)
     ap.add_argument("--min-child-p", type=float, default=d.min_child_p)
+    ap.add_argument("--no-equal-value", action="store_true", help="skip the Maia call at equal ratings (H4)")
     a = ap.parse_args(argv)
     b = Budget(a.root_nodes, a.multipv_nodes, a.maia_size, a.child_mass, a.max_children, a.min_child_p)
     pos = pl.read_parquet(set_paths(a.tag)[0])
@@ -333,7 +344,7 @@ def main(argv: list[str] | None = None) -> None:
     if a.fraction is not None:
         pos = pos.filter((pl.col("pos_hash") % 1000) < a.fraction * 1000)
     print(f"{pos.height} positions from {a.tag}; budget {b}", flush=True)
-    res = run(pos, b, max_seconds=a.max_seconds)
+    res = run(pos, b, max_seconds=a.max_seconds, equal_value=not a.no_equal_value)
     (OUT / "runs").mkdir(parents=True, exist_ok=True)
     (OUT / "runs" / f"compute_{a.tag}_{int(time.time())}.json").write_text(json.dumps(res, indent=1) + "\n")
 

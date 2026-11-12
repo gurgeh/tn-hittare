@@ -199,6 +199,10 @@ def test_measures_from_hand_made_caches(tmp_path, monkeypatch):
               "wdl": [0.5, 0.3, 0.2]})
     sf.add({"pos_hash": h, "moves": legal, "value": v.tolist(), "cp": [0.0] * len(legal), "mate": [0] * len(legal),
             "wdl": [0.1, 0.9, 0.0]})
+    eq = C.equal_elo(w_elo, b_elo)                   # H4: both sides at the mapped mean
+    assert eq == 2750.0
+    maia.add({"pos_hash": h, "self_elo": eq, "oppo_elo": eq, "moves": legal, "logp": np.log(p).tolist(),
+              "wdl": [0.4, 0.4, 0.2]})
     root.add({"pos_hash": h, "best": "g1f3", "cp": 35.0, "mate": 0, "wdl": [0.12, 0.86, 0.02], "depth": 20,
               "used_bound": False})
     # the children: Black to move, Black's ratings first
@@ -232,5 +236,6 @@ def test_measures_from_hand_made_caches(tmp_path, monkeypatch):
     assert r["el_next"] == pytest.approx(exp_next, rel=1e-4)
     assert r["net2"] == pytest.approx(r["el_stm"] - r["el_next"])
     assert r["maia_es_stm"] == pytest.approx(0.65) and r["engine_es_stm"] == pytest.approx(0.55)
+    assert r["maia_es_stm_eq"] == pytest.approx(0.6) and counts["missing_equal_value"] == 0
     assert r["el_db"] == pytest.approx(0.25 * 0.10) and r["hold_db"] == pytest.approx(0.75)
     assert counts["missing_maia"] == 0 and counts["children_missing"] == 0
