@@ -54,9 +54,10 @@ class SynthEvaluator:
             self.calls[(self.key(pos), mover_elo, opp_elo, tempo)] += 1
             n = self.full.nodes[pos]
             mine = n.info.get("static", float(self.static[pos]))
+            wdl = n.info.get("wdl")                   # the mover's (W, D, L) when a world plants one
             out.append(Eval(list(n.moves), np.asarray(n.p_model, dtype=np.float64),
                             None if n.info.get("policy") is None else np.asarray(n.info["policy"], dtype=np.float64),
-                            mine if n.me_to_move else 1.0 - mine))
+                            mine if n.me_to_move else 1.0 - mine, None if wdl is None else tuple(wdl)))
         return out
 
     def counts(self, pos, moves, mover_elo, db_filter):

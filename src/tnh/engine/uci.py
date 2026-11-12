@@ -32,6 +32,7 @@ This docstring is the contract for a GUI (the web page's engine section).
 | Cap | spin | 0 | 0-1000 | at most this many non-obvious learned moves (0 = off; then Price decides). A cap can return fewer: the price reaches only the concave hull of value against cost |
 | Obvious | string (float) | 0.85 | 0-1 | a move is obvious (costs 0) when my move model alone gives it at least this |
 | Prepared | string (float) | 0 | 0-1 | share of the opponent's probability on his best reply, at every position |
+| DrawScore | string (float) | 0.5 | 0-1 | what a draw is worth to me: a position's value for me is W + DrawScore x D from the result model (the opponent gets 1 minus it), a drawn finished game is worth DrawScore; the opponent's move probabilities do not change. 0.5 is the plain expected score. The real contempt is the rating difference (MyElo against OppElo), which the models play out; this only re-weights draws |
 | Mix | combo | fitted | fitted, kappa | the opponent's database mix: the fitted rule (tnh.movemix) or (count + kappa p) / (n + kappa) |
 | Kappa | string (float) | 100 | > 0 | with Mix = kappa |
 | DbFilter | combo | auto | auto, classical, blitz, all, off | the database games counted; auto = the tempo's own |
@@ -110,6 +111,7 @@ OPTIONS = {
     "Cap": ("cap", int, "type spin default 0 min 0 max 1000"),
     "Obvious": ("obvious", float, "type string default 0.85"),
     "Prepared": ("prepared", float, "type string default 0"),
+    "DrawScore": ("draw_score", float, "type string default 0.5"),
     "Mix": ("mix", str, "type combo default fitted var fitted var kappa"),
     "Kappa": ("kappa", float, "type string default 100"),
     "DbFilter": ("db_filter", str, "type combo default auto var auto var classical var blitz var all var off"),

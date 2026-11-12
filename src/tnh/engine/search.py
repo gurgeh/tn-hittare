@@ -87,6 +87,7 @@ class Settings:
     cap: int = 0                      # at most this many non-obvious learned moves (0 = off)
     obvious: float = 0.85             # a move is obvious when my move model gives it at least this
     prepared: float = 0.0             # share of the opponent's probability on his best reply, per position
+    draw_score: float = 0.5           # what a draw is worth to me (0.5 = expected score; the opponent gets 1 minus it)
     mix: str = "fitted"               # the opponent's database mix: "fitted" (tnh.movemix) or "kappa"
     kappa: float = 100.0              # with mix="kappa": the model's weight in games
     db_filter: Hashable = "auto"      # passed to the evaluator's counts; "auto" = the tempo's own
@@ -103,7 +104,7 @@ class Settings:
     expand_root: bool = True          # every legal move at the root is expanded once
 
     EVAL_KEYS = ("my_elo", "opp_elo", "my_side", "tempo")
-    FIELD_KEYS = ("db_filter",)               # change node fields (counts) without new evaluations
+    FIELD_KEYS = ("db_filter", "draw_score")  # change node fields (counts, values) without new evaluations
     TEMPI = ("classical", "blitz", "fake")
 
 
@@ -112,7 +113,8 @@ class Eval:
     moves: list[str]
     p: np.ndarray                 # the move model at the mover's rating, over `moves`
     policy: np.ndarray | None     # Lc0's raw policy, or None
-    value: float                  # the mover's expected score (the result model)
+    value: float                  # the mover's expected score (the result model): W + D / 2
+    wdl: tuple[float, float, float] | None = None   # the mover's win, draw, loss, where the model gives them
 
 
 class Evaluator(Protocol):
@@ -284,8 +286,7 @@ class Engine:
             n.engine, n.counts = None, None
             n.info.pop("stand_in", None)
             if "result_mover" in n.info:
-                t = n.info["result_mover"]
-                n.value = t if n.me_to_move else 1.0 - t
+                n.value = self._result_value(n)
                 n.children, n.p_model = None, None
                 continue
             e = None if n.moves is PENDING else self._evals.get(self._ekey(n.id))
@@ -323,6 +324,22 @@ class Engine:
             return self.s.db_filter
         return "blitz" if self.s.tempo == "blitz" else "classical"
 
+    def _my_value(self, n: Node, e: Eval) -> float:
+        """My value of a position from its evaluation: my W + draw_score * D. At 0.5 it is the
+        expected score computed exactly as before (bit for bit)."""
+        ds = self.s.draw_score
+        if ds == 0.5 or e.wdl is None:
+            return e.value if n.me_to_move else 1.0 - e.value
+        w, d, l = e.wdl
+        mine_w = w if n.me_to_move else l
+        return float(mine_w + ds * d)
+
+    def _result_value(self, n: Node) -> float:
+        t = n.info["result_mover"]
+        if t == 0.5:
+            return 0.5 if self.s.draw_score == 0.5 else self.s.draw_score
+        return t if n.me_to_move else 1.0 - t
+
     def _ckey(self, n: Node) -> tuple:
         return (n.key, self._elos(self.pos[n.id])[0], self._filter())
 
@@ -353,7 +370,7 @@ class Engine:
         n.info["p_first"] = p / p.sum()
         n.p_model = n.info["p_first"]
         n.info["policy"] = None if e.policy is None else np.asarray(e.policy, dtype=np.float64)[order]
-        n.value = e.value if n.me_to_move else 1.0 - e.value
+        n.value = self._my_value(n, e)
         if not n.me_to_move:
             n.counts = self._counts.get(self._ckey(n))
 
@@ -371,7 +388,7 @@ class Engine:
                 if t is not None:
                     n.info["result_mover"] = t
                     n.moves = []
-                    n.value = t if n.me_to_move else 1.0 - t
+                    n.value = self._result_value(n)
                     n.children = None
                     n.info.pop("stand_in", None)
                     self.stats["finished games"] += 1

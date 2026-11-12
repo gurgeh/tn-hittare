@@ -278,3 +278,10 @@ def test_stepping_back_shows_the_last_result_of_that_root_provisionally():
     seen = []
     eng.search(nodes=10, on_info=seen.append)
     assert seen[0].provisional and seen[0].lines and not seen[-1].provisional
+
+
+def test_uci_draw_score_option(uci):
+    assert "DrawScore" in uci.options and uci.options["DrawScore"].default == "0.5"
+    uci.configure({"DrawScore": "0.3", "Side": "white"})
+    infos = uci.analyse(chess.Board(_fen(C4)), chess.engine.Limit(nodes=60), multipv=2)
+    assert infos and infos[0]["pv"]

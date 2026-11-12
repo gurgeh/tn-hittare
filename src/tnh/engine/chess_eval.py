@@ -169,13 +169,16 @@ class ClassicalBundle:
                             "lc0raw": [pol[i].wdl for i in live]})
             r = self.model.result.from_sources(w, [queries[i] for i in live])
             vals = {i: float(row[0] + 0.5 * row[1]) for i, row in zip(live, r)}
+            wdls = {i: (float(row[0]), float(row[1]), float(row[2])) for i, row in zip(live, r)}
+        else:
+            wdls = {}
         out = []
         for i, pr in enumerate(preds):
             p = np.exp(pr.logp.astype(np.float64))
             idx = {m: j for j, m in enumerate(pol[i].moves)}
             lp = np.exp(pol[i].logp.astype(np.float64))
             policy = np.array([lp[idx[m]] for m in pr.moves]) if set(idx) == set(pr.moves) else None
-            out.append(Eval(list(pr.moves), p / p.sum(), policy, vals.get(i, 0.5)))
+            out.append(Eval(list(pr.moves), p / p.sum(), policy, vals.get(i, 0.5), wdls.get(i)))
         return out
 
 
@@ -193,8 +196,8 @@ class BlitzBundle:
         out = []
         for pr in self.model.predict(queries):
             p = np.exp(pr.logp.astype(np.float64))
-            w, d, _ = pr.wdl
-            out.append(Eval(list(pr.moves), p / p.sum(), None, float(w + 0.5 * d)))
+            w, d, l = pr.wdl
+            out.append(Eval(list(pr.moves), p / p.sum(), None, float(w + 0.5 * d), (float(w), float(d), float(l))))
         return out
 
 
@@ -225,7 +228,9 @@ class FakeBundle:
             mat = sum(len(b.pieces(pt, b.turn)) * v - len(b.pieces(pt, not b.turn)) * v
                       for pt, v in [(1, 1), (2, 3), (3, 3), (4, 5), (5, 9)])
             val = 1 / (1 + np.exp(-mat / 3)) * 0.9 + 0.05 + 0.02 * (_h("v" + q.fen) - 0.5)
-            out.append(Eval(moves, p / p.sum(), pol / pol.sum(), float(val)))
+            d = 0.6 * (1 - abs(2 * val - 1)) * (0.3 + 0.7 * _h("d" + q.fen))   # some quiet, some sharp
+            w = val - d / 2
+            out.append(Eval(moves, p / p.sum(), pol / pol.sum(), float(val), (float(w), float(d), float(1 - w - d))))
         return out
 
 
