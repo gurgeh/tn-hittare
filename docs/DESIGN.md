@@ -35,8 +35,10 @@ raw/lichess_blitz_ref/            the start of one Lichess monthly dump, rated b
 weights/                          downloaded model weights
 scratch/<module>/                 a developer's own experiments; nothing downstream reads it
 features/<model>/<variant>/*.parquet
+features/positions/<model>/<variant>/*.parquet   keyed on the position, not on a game row; see Feature files
 reports/*.md
 reports/step1/                    the json and figures behind step1.md
+reports/step2/                    the json behind step2.md
 ```
 
 ## `corpus/games.parquet`
@@ -370,6 +372,17 @@ on disk.
 Variant names say what was varied: `offset+300`, `fixed2200-2200`,
 `nodes10000`, with suffixes for anything else that is not the default.
 
+**Position-keyed feature files.** `features/positions/<model>/<variant>/part-*.parquet`
+hold one row per `pos_hash` (for Maia, per `pos_hash` and pair of network
+ratings), with the same `meta.json` rule. They are for work whose unit is a
+position in the edge tables and not a row of a game: step 2 and the builder.
+The same columns as above with `pos_hash` in place of `(game_id, ply)`.
+Maia sees a move history, and a position has many: the history is the path
+that first reached the position in the run that filled the cache (the most
+played path for a position in a set, the parent's path plus the move for a
+child). A position reached another way reuses that row. Whether this matters
+has not been measured.
+
 ## Evaluation (step 1)
 
 `tnh.eval`. Everything is fitted on `train` and reported on `test`. The split
@@ -398,12 +411,18 @@ is a bootstrap over tournaments.
   strength, so within one ply band and one rating group the best offset
   should rise with `pos_count`; theory ends at the count where it has come
   down to its value in rare positions. This is what `book_count` should be
-  set from.
+  set from. **Measured 2026-11-12: it does not rise.** The best offset is flat
+  from `pos_count` 1 to 1,000-9,999 and lower above 10,000. `book_count`
+  therefore has no measured basis and stays at 5 by convention.
 - **The Elo sweep.** Maia-3 with both ratings offset by the same amount, from
   -200 to +800. The first measurement on elite games had its minimum at +300
   and broke down above about 2800 on Maia's scale. The result wanted is the
   best offset as a function of the player's FIDE rating. The mover's and the
-  opponent's offset are also varied separately.
+  opponent's offset are also varied separately. **Measured 2026-11-12** on
+  Maia-3 79m, classical 1800-2500: `maia_elo = 1580 + 0.558 * fide` for both
+  players (best single offset +600; +724 at 1800 falling to +479 at 2400;
+  the mover's and the opponent's offset are the same). Everything that calls
+  Maia for a FIDE-rated player uses this map until a better one is measured.
 - **Breakdowns** of the log loss: by the mover's rating, by ply, and by the
   time left on the clock. The last one shows where play degrades, which is
   what `min_clock_s` should be set from.
@@ -421,3 +440,63 @@ is a bootstrap over tournaments.
   the players' own ratings, from a month after its training data ends
   (July 2025). The gap between that and the classical figure is what a model
   made for classical play could gain.
+
+
+**What step 1 settled for the layers above** (`reports/step1.md`, 2026-11-12):
+
+- The move model to build on is Maia-3 at offset 0 and at the mapped rating,
+  Lc0's policy and Lc0's raw value of every child, combined by a conditional
+  logit or boosted trees: 1.14-1.15 nats per move against 1.29 for Maia at its
+  best offset. All of it runs on the GPU. Stockfish at 100,000 nodes adds
+  0.01-0.02 at about ten times the cost; Stockfish at 10,000 nodes adds
+  nothing beside it.
+- The best value head measured is Lc0 with `WDLCalibrationElo` at +400 and 50
+  nodes (0.848 raw, 0.835 recalibrated, on its own 10,000 games). Maia-3's
+  value head needs the five-parameter recalibration (1.221 raw, 0.888 after).
+
+## Difficulty against results (step 2): `tnh.difficulty`
+
+Question: does a difficulty measure from the move model explain White's real
+score in a position beyond the engine value and the ratings? Commands:
+`positions`, `compute`, `analyse`, `ceiling`, `synth`, `report`
+(`python -m tnh.difficulty <command>`). Report: `reports/step2.md`.
+
+- **Unit**: a position of the edge tables with at least `min_games` games in a
+  rating band and tempo (default classical, 1800-2400), optionally below
+  `max_games`. A set is named `<table>_n<min>` or `<table>_n<min>to<max-1>`.
+  Per position: its games, White's score, mean ratings, the most played path
+  (checked by replay), and its opening family, the first 4 plies of that path.
+- **Model calls**, cached on `pos_hash`: Maia-3 on CPU at the mapped ratings,
+  Stockfish MultiPV over every legal move (50,000 nodes), Stockfish at the
+  root (200,000 nodes). Children are the side to move's moves by Maia
+  probability until 0.9 is covered, at most 8, none below 0.02.
+- **Measures**, from the side to move's view, signed for White in the
+  analysis: expected loss (`el_stm`), narrow path (`hold_stm`), the same for
+  the other side one ply on, the two-ply net, Maia's value head, and the value
+  head with equal ratings. `el_db` and `hold_db` use the games' own move
+  shares and are a reference, not a predictor.
+- **Baseline**: weighted least squares of White's score on the engine's
+  expected score and centipawns for White, the rating difference, the mean
+  rating and the side to move. Weights `1 / (sigma2 / n + tau2)`.
+- **The test**: families are split into 10 folds, every prediction comes from
+  a fit that did not see the position's family, and every interval is a
+  bootstrap over families (1,000 draws). Reported per measure: the share of
+  what the baseline leaves above the binomial noise, and the real score minus
+  the held-out baseline in the top tenth of the measure minus the bottom tenth.
+- **The ceiling** (`ceiling`): the between-position SD of White's score after
+  the rating terms only, per stratum of games, with empirical-Bayes shrunken
+  edges and a list where each line appears once.
+- **A planted world** (`synth`) with a known answer is run before the real one.
+- **Rules for a confirmation run**: hypotheses and the statistic are written
+  down before the set is computed, the pipeline and budgets are the earlier
+  run's, and the report says confirmed, not confirmed or contradicted per
+  hypothesis. Positions that are new can still share games with an earlier
+  set through their ancestors; the report must say so.
+
+Measured 2026-11-12 on the 2024+ table: between-position SD 0.010 (at least
+100 games) and 0.014 (50-99 games) after engine and ratings; expected loss of
+the side to move is the only measure that held on new positions, 0.008 between
+the extreme tenths.
+
+Still private: step 2 reads `EdgeDB._parents.rows` and `EdgeDB._pos.rows`. A
+public batched `parents_many` is to replace that.
