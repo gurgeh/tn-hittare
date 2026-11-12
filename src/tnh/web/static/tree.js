@@ -7,8 +7,10 @@ export const START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0
 
 let nextId = 1
 
+// `comment`: the text after the move (on the root: before the first move); `pre`: a comment
+// that opens a variation before its first move, kept from a pasted PGN.
 function node(parent, uci, san, fen) {
-    return {id: nextId++, parent, uci, san, fen, children: []}
+    return {id: nextId++, parent, uci, san, fen, children: [], comment: "", pre: ""}
 }
 
 export class MoveTree {
@@ -16,6 +18,7 @@ export class MoveTree {
         new Chess(rootFen)   // throws on a bad FEN
         this.root = node(null, null, null, rootFen)
         this.current = this.root
+        this.headers = {}      // a pasted PGN's tags, written back into the PGN
     }
 
     get fromStart() {
@@ -107,20 +110,36 @@ export class MoveTree {
         return out.reverse()
     }
 
-    // Adds a tree from the server's PGN parse ({uci, san, children}) under the root.
-    static fromPgn(rootFen, tree) {
-        const t = new MoveTree(rootFen)
+    // A tree from the server's PGN parse, or from toJson: {root_fen, comment, headers, tree},
+    // nodes {uci, san, comment, pre, children}.
+    static fromPgn(d) {
+        const t = new MoveTree(d.root_fen)
+        t.root.comment = d.comment || ""
+        t.headers = d.headers || {}
         const add = (parent, items) => {
             for (const it of items) {
                 t.current = parent
                 const c = t.play(it.uci)
-                if (!c) throw new Error("illegal move in PGN: " + it.san)
-                add(c, it.children)
+                if (!c) throw new Error("illegal move in PGN: " + (it.san || it.uci))
+                if (it.comment) c.comment = it.comment
+                if (it.pre) c.pre = it.pre
+                add(c, it.children || [])
             }
         }
-        add(t.root, tree)
+        add(t.root, d.tree || [])
         t.current = t.root
         return t
+    }
+
+    // The tree as plain data, for the server's PGN export and for storage; fromPgn reads it back.
+    toJson() {
+        const out = n => {
+            const o = {uci: n.uci, san: n.san, children: n.children.map(out)}
+            if (n.comment) o.comment = n.comment
+            if (n.pre) o.pre = n.pre
+            return o
+        }
+        return {root_fen: this.root.fen, comment: this.root.comment, headers: this.headers, tree: this.root.children.map(out)}
     }
 
     // Fullmove number and side of the move that leads to `n`.

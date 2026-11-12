@@ -53,7 +53,8 @@ function readUrl() {
     }
     if (p.get("o") === "b") state.orientation = COLOR.black
     try {
-        state.tree = new MoveTree(p.get("fen") || START_FEN)
+        const rootFen = p.get("fen") || START_FEN
+        state.tree = restoreTree(rootFen) || new MoveTree(rootFen)
     } catch (e) {
         status("bad FEN in URL: " + e.message, true)
         state.tree = new MoveTree()
@@ -78,6 +79,49 @@ function writeUrl() {
     p.set("b", state.black)
     if (state.orientation === COLOR.black) p.set("o", "b")
     history.replaceState(null, "", "#" + p.toString().replace(/%2C/g, ","))
+}
+
+// ---------------------------------------------------------------- the stored tree
+// The move tree with its comments is kept per browser (localStorage) across reloads. The URL
+// stays the authority for the position: the stored tree is restored when its root is the URL's
+// root, and the URL's moves are then played into it (followed where the tree has them, a new
+// variation where it does not). Loading another PGN or FEN replaces it.
+
+const TREE_STORE = "tnh.tree"
+let treeStoreFailed = false
+
+function restoreTree(rootFen) {
+    let raw = null
+    try {
+        raw = localStorage.getItem(TREE_STORE)
+    } catch (e) {
+        console.error("the stored move tree cannot be read: " + e.message)
+        return null
+    }
+    if (!raw) return null
+    let d
+    try {
+        d = JSON.parse(raw)
+    } catch (e) {
+        status("the stored move tree is not valid JSON; it is replaced: " + e.message, true)
+        return null
+    }
+    if (!d || d.root_fen !== rootFen) return null
+    try {
+        return MoveTree.fromPgn(d)
+    } catch (e) {
+        status("the stored move tree could not be rebuilt; it is replaced: " + e.message, true)
+        return null
+    }
+}
+
+function saveTree() {
+    try {
+        localStorage.setItem(TREE_STORE, JSON.stringify(state.tree.toJson()))
+    } catch (e) {     // private window, blocked storage or a full quota: say so once
+        if (!treeStoreFailed) status("the move tree is not kept across a reload: " + e.message, true)
+        treeStoreFailed = true
+    }
 }
 
 // ---------------------------------------------------------------- formatting
@@ -135,6 +179,7 @@ function initBoard() {
         ],
     })
     board.enableMoveInput(onBoardInput)
+    $("board").tabIndex = -1      // Enter and Escape in the comment field give the focus back here
 }
 
 function onBoardInput(event) {
@@ -184,6 +229,13 @@ function showArrow(uci) {
 
 // ---------------------------------------------------------------- move list
 
+function moveLabel(n, num = true) {
+    const {number, white} = MoveTree.moveNumber(n)
+    return (white ? number + ". " : num ? number + "... " : "") + n.san
+}
+
+// The move list, with each comment after its move as PGN shows it, {...}. A comment is its own
+// element (a click on it goes to its move); a move after a comment gets its number, as in PGN.
 function renderMoves() {
     const root = $("moves")
     root.innerHTML = ""
@@ -192,29 +244,43 @@ function renderMoves() {
         const s = document.createElement("span")
         s.className = "mv" + (n === cur ? " cur" : "")
         s.dataset.id = n.id
-        const {number, white} = MoveTree.moveNumber(n)
-        s.textContent = (white ? number + ". " : num ? number + "... " : "") + n.san
+        s.textContent = moveLabel(n, num)
         return s
+    }
+    const cmt = (n, text, cls = "cmt") => {
+        const s = document.createElement("span")
+        s.className = cls
+        s.dataset.id = n.id
+        s.textContent = "{" + text + "}"
+        return s
+    }
+    // One move with the comments around it; returns whether the next move needs its number.
+    const move = (el, n, num) => {
+        if (n.pre) el.appendChild(cmt(n, n.pre, "cmt pre"))
+        el.appendChild(span(n, num || !!n.pre))
+        if (n.comment) el.appendChild(cmt(n, n.comment))
+        return !!n.comment
     }
     const walk = (parent, el, forceNum) => {
         let p = parent, num = forceNum
         while (p.children.length) {
             const main = p.children[0]
-            el.appendChild(span(main, num))
-            num = false
+            num = move(el, main, num)
             for (const v of p.children.slice(1)) {
                 const box = document.createElement("span")
                 box.className = "var"
-                box.appendChild(span(v, true))
-                walk(v, box, false)
+                const after = move(box, v, true)
+                walk(v, box, after)
                 el.appendChild(box)
                 num = true
             }
             p = main
         }
     }
-    walk(state.tree.root, root, true)
-    if (!state.tree.root.children.length) root.innerHTML = '<span class="dim">no moves</span>'
+    const top = state.tree.root
+    if (top.comment) root.appendChild(cmt(top, top.comment))
+    walk(top, root, true)
+    if (!top.children.length) root.insertAdjacentHTML("beforeend", '<span class="dim">no moves</span>')
     const c = root.querySelector(".cur")
     if (c) c.scrollIntoView({block: "nearest"})
 }
@@ -635,7 +701,9 @@ function update() {
     showPosition()
     renderMoves()
     $("fen").textContent = state.tree.current.fen
+    showComment()
     writeUrl()
+    saveTree()
     fetchStats()
     fetchModel()
     engineGo()
@@ -723,6 +791,7 @@ const FEN_RE = /^\s*([rnbqkpRNBQKP1-8]+\/){7}[rnbqkpRNBQKP1-8]+\s+[wb]\b/
 async function loadText(text) {
     text = text.trim()
     if (!text) return
+    let commentsLost = false
     try {
         if (FEN_RE.test(text)) {
             let fen = text.split(/\s+/).slice(0, 6)
@@ -733,8 +802,9 @@ async function loadText(text) {
             const r = await fetch("/api/pgn", {method: "POST", headers: {"Content-Type": "text/plain"}, body: text})
             const d = await r.json()
             if (!r.ok) throw new Error(d.detail || r.status)
-            state.tree = MoveTree.fromPgn(d.root_fen, d.tree)
+            state.tree = MoveTree.fromPgn(d)
             state.tree.end()
+            commentsLost = !("comment" in d)
         }
     } catch (e) {
         status("could not load: " + e.message, true)
@@ -743,6 +813,7 @@ async function loadText(text) {
     $("paste").value = ""
     $("paste").blur()
     update()
+    if (commentsLost) status("the server is older than this page: the PGN's comments were not loaded; restart it", true)
 }
 
 function isTyping(el) {
@@ -757,7 +828,7 @@ function command(k) {
         case "start": t.start(); break
         case "end": t.end(); break
         case "delete": t.deleteCurrent(); break
-        case "promote": t.promote(); renderMoves(); return
+        case "promote": t.promote(); renderMoves(); saveTree(); return
         case "flip":
             state.orientation = state.orientation === COLOR.white ? COLOR.black : COLOR.white
             board.setOrientation(state.orientation)
@@ -793,6 +864,73 @@ function onKey(e) {
     else if (e.key === "ArrowUp" || e.key === "k") { e.preventDefault(); moveCursor(-1) }
     else if (e.key === "Enter" && state.cursor) { e.preventDefault(); const u = state.cursor; state.cursor = null; play(u) }
     else if (e.key === "/") { e.preventDefault(); $("paste").focus() }
+    else if (e.key === "c") {
+        e.preventDefault()
+        const el = $("comment")
+        el.focus()
+        el.setSelectionRange(el.value.length, el.value.length)
+    }
+}
+
+// ---------------------------------------------------------------- comments
+// One comment per move (on the root: before the first move), edited in the field under the
+// move list: c focuses it, Enter saves and gives the focus back to the board, Escape cancels.
+// Leaving the field any other way (a click elsewhere) saves too, so typed text is not lost.
+// An empty comment removes it. The page's shortcuts do not fire while the field has focus
+// (onKey skips inputs).
+
+const oneLine = s => s.replace(/\s+/g, " ").trim()
+let editing = null          // {node, shown, cancel} while the field has focus
+let pointerDown = false
+
+function showComment() {
+    if (editing) return     // the user is typing in it
+    const el = $("comment"), n = state.tree.current
+    el.value = oneLine(n.comment)
+    el.placeholder = n.parent ? `comment on ${moveLabel(n)} (c)` : "comment before the first move (c)"
+}
+
+function initComments() {
+    const el = $("comment")
+    document.addEventListener("pointerdown", () => { pointerDown = true }, true)
+    document.addEventListener("pointerup", () => { pointerDown = false }, true)
+    el.addEventListener("focus", () => { editing = {node: state.tree.current, shown: el.value, cancel: false} })
+    el.addEventListener("keydown", e => {
+        if (e.key === "Enter") { e.preventDefault(); $("board").focus({preventScroll: true}) }
+        else if (e.key === "Escape") { e.preventDefault(); if (editing) editing.cancel = true; $("board").focus({preventScroll: true}) }
+    })
+    el.addEventListener("blur", () => {
+        const ed = editing
+        editing = null
+        if (ed && !ed.cancel && el.value !== ed.shown) {
+            ed.node.comment = el.value.trim()
+            saveTree()
+            // A click elsewhere took the focus: rebuilding the move list now would remove the
+            // element under the pointer, and a click on a move would be lost. Rebuild after it.
+            if (pointerDown) document.addEventListener("pointerup", () => setTimeout(renderMoves), {once: true, capture: true})
+            else renderMoves()
+        }
+        showComment()
+    })
+    $("copypgn").addEventListener("click", async () => {
+        try {
+            const text = await treePgn()
+            await navigator.clipboard.writeText(text)
+            status(`PGN copied (${text.length} characters)`)
+        } catch (e) {
+            status("copy PGN: " + e.message, true)
+        }
+    })
+}
+
+// The whole tree as PGN, variations and comments included, written by the server.
+async function treePgn() {
+    const r = await fetch("/api/pgn/export", {method: "POST", headers: {"Content-Type": "application/json"},
+                                              body: JSON.stringify(state.tree.toJson())})
+    if (r.status === 404) throw new Error("the server is older than this page: restart it")
+    const d = await r.json()
+    if (!r.ok) throw new Error(d.detail || r.status)
+    return d.pgn
 }
 
 // ---------------------------------------------------------------- start
@@ -810,9 +948,10 @@ async function main() {
         status("info: " + e.message, true)
     }
     initControls()
+    initComments()
     initBoard()
     initEngine()
-    window.tnh = {state, play, command, render, CHOICES, engineGo, tableBuilds: () => tableBuilds}   // for the end-to-end test and the console
+    window.tnh = {state, play, command, render, CHOICES, engineGo, tableBuilds: () => tableBuilds, pgn: treePgn}   // for the end-to-end test and the console
     update()
 }
 

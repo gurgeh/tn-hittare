@@ -31,6 +31,10 @@
       <button data-k="start" title="Home">|&lt;</button><button data-k="back" title="←">&lt;</button><button data-k="forward" title="→">&gt;</button><button data-k="end" title="End">&gt;|</button><button data-k="flip" title="f">flip</button><button data-k="engine" title="e: the engine on or off">engine</button><button data-k="delete" title="Del: delete this move and what follows">del</button><button data-k="promote" title="p: make this line the main line">promote</button>
     </div>
     <div id="moves" tabindex="-1"></div>
+    <div id="mvbar">
+      <input id="comment" type="text" spellcheck="false" autocomplete="off" title="The comment on the move shown (c to edit, Enter saves, Escape cancels; empty removes it). It goes into the PGN as {...}">
+      <button id="copypgn" title="Copy the whole tree as PGN: variations and comments">copy PGN</button>
+    </div>
     <textarea id="paste" rows="2" spellcheck="false" placeholder="Paste FEN or PGN, Enter to load (/ to focus, Ctrl+V anywhere)"></textarea>
     <div id="fen" class="dim mono" title="FEN of the position shown (click to copy)"></div>
   </section>
@@ -53,7 +57,7 @@
       <thead><tr></tr></thead>
       <tbody></tbody>
     </table>
-    <div id="keys" class="dim">←/→ move · Home/End · ↑/↓ row · Enter play row · f flip · e engine on/off · a all legal · Del delete · p promote · / paste</div>
+    <div id="keys" class="dim">←/→ move · Home/End · ↑/↓ row · Enter play row · f flip · e engine on/off · a all legal · Del delete · p promote · c comment · / paste</div>
     <div id="status" class="mono"></div>
   </section>
 </main>

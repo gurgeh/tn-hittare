@@ -34,7 +34,9 @@ def test_page_in_headless_browser(server):  # noqa: F811
         pytest.skip("no Playwright in the system Python")
     base, _ = server
     env = {k: v for k, v in os.environ.items() if k not in ("DISPLAY", "WAYLAND_DISPLAY")}
-    r = subprocess.run([py, str(DRIVER), base + "/"], capture_output=True, text=True, timeout=180, env=env,
+    # $TNH_E2E_SHOTS: a directory for the driver's screenshots (never the repository)
+    shots = [os.environ["TNH_E2E_SHOTS"]] if os.environ.get("TNH_E2E_SHOTS") else []
+    r = subprocess.run([py, str(DRIVER), base + "/", *shots], capture_output=True, text=True, timeout=180, env=env,
                        cwd=DRIVER.parent)
     assert r.returncode == 0, r.stdout + r.stderr
     assert "e2e ok" in r.stdout

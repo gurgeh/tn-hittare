@@ -188,6 +188,62 @@ def test_pgn_illegal(client):
     assert r.status_code == 400
 
 
+COMMENTED = ('{before the first move} 1. e4 {main $1 [%clk 0:01:00] [%cal Ge2e4]} e5 '
+             '( { opens the line } 1... c5 {Sicilian} 2. Nf3 {in the variation} ) 2. Nf3 *')
+
+
+def _strip(nodes):
+    """The tree without san, as the page sends it back."""
+    return [{"uci": n["uci"], "comment": n["comment"], "pre": n["pre"], "children": _strip(n["children"])}
+            for n in nodes]
+
+
+def test_pgn_comments_parsed_as_text(client):
+    d = client.post("/api/pgn", content=COMMENTED).json()
+    assert d["comment"] == "before the first move"
+    e4 = d["tree"][0]
+    # NAGs and [%...] commands inside a comment stay text
+    assert e4["comment"] == "main $1 [%clk 0:01:00] [%cal Ge2e4]"
+    e5, c5 = e4["children"]
+    assert (e5["comment"], e5["pre"]) == ("", "")
+    assert (c5["san"], c5["comment"], c5["pre"]) == ("c5", "Sicilian", "opens the line")
+    assert c5["children"][0]["comment"] == "in the variation"
+
+
+def test_pgn_export_round_trip(client):
+    d = client.post("/api/pgn", content=COMMENTED).json()
+    r = client.post("/api/pgn/export", json=d)
+    assert r.status_code == 200, r.text
+    pgn = r.json()["pgn"]
+    assert "{ main $1 [%clk 0:01:00] [%cal Ge2e4] }" in pgn
+    assert "( { opens the line } 1... c5 { Sicilian } 2. Nf3 { in the variation } )" in pgn
+    assert pgn.index("{ before the first move }") < pgn.index("1. e4")
+    back = client.post("/api/pgn", content=pgn).json()
+    assert back["comment"] == d["comment"]
+    assert _strip(back["tree"]) == _strip(d["tree"])
+
+
+def test_pgn_export_closing_brace_and_fen(client):
+    fen = "8/8/8/4k3/8/8/4K3/7R w - - 0 1"
+    body = {"root_fen": fen, "headers": {"White": "Me", "FEN": "stale", "SetUp": "1"},
+            "tree": [{"uci": "h1h5", "comment": "check } {really}", "children": []}]}
+    pgn = client.post("/api/pgn/export", json=body).json()["pgn"]
+    assert f'[FEN "{fen}"]' in pgn and '[White "Me"]' in pgn and "stale" not in pgn
+    assert "{ check ) {really) }" in pgn
+    back = client.post("/api/pgn", content=pgn).json()
+    assert back["root_fen"] == fen
+    assert back["tree"][0]["comment"] == "check ) {really)"
+
+
+def test_pgn_export_refuses_bad_trees(client):
+    assert client.post("/api/pgn/export", json={"tree": [{"uci": "e2e5", "children": []}]}).status_code == 400
+    assert client.post("/api/pgn/export", json={"tree": [{"san": "e4"}]}).status_code == 400
+    assert client.post("/api/pgn/export", json={"root_fen": "nonsense"}).status_code == 400
+    assert client.post("/api/pgn/export", content="not json").status_code == 400
+    # an empty tree is a valid game
+    assert client.post("/api/pgn/export", json={}).json()["pgn"].rstrip().endswith("*")
+
+
 def test_models_off():
     from tnh.web.models import NoModels
     c = TestClient(create_app(stats(), NoModels()))
