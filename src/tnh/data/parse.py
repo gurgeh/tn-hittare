@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import chess
+import numpy as np
 import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -498,6 +499,13 @@ def with_ids(df: pl.DataFrame, part: int = 0) -> pl.DataFrame:
     )
 
 
+def _mem(step: str) -> None:
+    """Print this process's resident memory, for the plan's steps."""
+    with open("/proc/self/statm") as f:
+        rss = int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1e9
+    print(f"  {step}: {rss:.2f} GB resident", flush=True)
+
+
 def plan(narrow: pl.DataFrame, fetch_moves, merge_near_copies: bool = True) -> tuple[pl.DataFrame, int, dict]:
     """The de-duplication plan, from the narrow columns of every parsed game.
 
@@ -517,8 +525,9 @@ def plan(narrow: pl.DataFrame, fetch_moves, merge_near_copies: bool = True) -> t
       copies, named by its smallest node; the split is a hash of it.
     """
     narrow = apply_round_tempo(narrow)
+    _mem("plan: round tempo")
     keys = narrow.select(
-        "_id", "_dedup_key", "_clock_share", "_n_tags", "_priority", "_game_url", "_file", "_nodes", "source",
+        "_id", "_dedup_key", "_clock_share", "_n_tags", "_priority", "_game_url", "_file", "source",
     ).sort(
         ["_dedup_key", "_clock_share", "_n_tags", "_priority", "_game_url", "_file"],
         descending=[False, True, True, False, False, False],
@@ -526,33 +535,60 @@ def plan(narrow: pl.DataFrame, fetch_moves, merge_near_copies: bool = True) -> t
     )
     copies = keys.group_by("_dedup_key", maintain_order=True).agg(
         pl.col("_id").first().alias("_id"),
-        pl.col("_nodes").list.explode(keep_nulls=False, empty_as_null=False).alias("_all_nodes"),
         pl.len().alias("_n_copies"),
         pl.col("source").unique().sort().alias("_copy_sources"),
-    )
+    ).with_row_index("_g")
     del keys
     n_dup = len(narrow) - len(copies)
+    _mem("plan: exact duplicates")
 
-    uf = UnionFind()
-    no_nodes = 0
-    all_nodes = copies["_all_nodes"].to_list()
-    for nodes in all_nodes:
-        if not nodes:
-            no_nodes += 1
-            continue
-        for other in nodes[1:]:
-            uf.union(nodes[0], other)
-    if no_nodes:
-        raise RuntimeError(f"{no_nodes} games have no tournament node; the source's tournament_nodes is incomplete")
+    # Tournaments: the tournament nodes as integer codes (in string order, so the smallest code
+    # of a component is its smallest node), and a union-find over those codes.
+    nodes = (
+        narrow.select("_dedup_key", "_nodes")
+        .join(copies.select("_dedup_key", "_g"), on="_dedup_key")
+        .drop("_dedup_key")
+        .explode("_nodes")
+        .rename({"_nodes": "node"})
+    )
+    if nodes["node"].null_count():
+        raise RuntimeError(f"{nodes['node'].null_count()} games have no tournament node; the source's tournament_nodes is incomplete")
+    names = nodes["node"].unique().sort()
+    nodes = nodes.with_columns(code=pl.col("node").cast(pl.Enum(names)).to_physical().cast(pl.Int64)).drop("node")
+    first = nodes.group_by("_g").agg(pl.col("code").min().alias("first")).sort("_g")["first"].to_numpy()
+    parent = np.arange(len(names), dtype=np.int64)
+
+    def find(x: int) -> int:
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    g_arr = nodes["_g"].to_numpy()
+    c_arr = nodes["code"].to_numpy()
+    for g, c in zip(g_arr.tolist(), c_arr.tolist(), strict=True):
+        union(int(first[g]), c)
+    del nodes, g_arr, c_arr
+    _mem("plan: tournament nodes")
 
     kept = copies.select("_id", "_n_copies", "_copy_sources").join(
         narrow.drop("_nodes"), on="_id", how="left", maintain_order="left")
+    del copies
     links = near_copy_links(kept, fetch_moves)
     for a, b in links.select("i", "j").iter_rows():
-        uf.union(all_nodes[a][0], all_nodes[b][0])
+        union(int(first[a]), int(first[b]))
     info = {"near_copy_links": dict(links.group_by("kind").len().iter_rows())}
-    tid = pl.Series("tournament_id", [uf.find(nodes[0]) for nodes in all_nodes], dtype=pl.String)
-    del all_nodes, uf, copies
+    roots = np.fromiter((find(int(x)) for x in first), np.int64, len(first))
+    tid = names.gather(pl.Series(roots)).alias("tournament_id")
+    del first, roots
+    _mem("plan: near copies and tournaments")
 
     kept = kept.with_columns(
         tid,
@@ -562,6 +598,7 @@ def plan(narrow: pl.DataFrame, fetch_moves, merge_near_copies: bool = True) -> t
     if merge_near_copies and links.height:
         kept, removed = merge_near_copy_groups(kept, links)
         info["near_copies_removed"] = removed
+    _mem("plan: done")
     return kept.select(PLAN_COLUMNS), n_dup, info
 
 
@@ -710,7 +747,7 @@ def king_signal_counts(games: pl.DataFrame, extra: pl.DataFrame) -> dict:
 
 
 def build(sources: list[str], workers: int, limit_files: int | None, merge_near_copies: bool = True,
-          out_dir: Path | None = None) -> None:
+          out_dir: Path | None = None, reuse_parts: bool = False) -> None:
     """Parse every file into a part on disk, plan the de-duplication on the narrow
     columns, then write the kept games part by part. The wide rows (moves,
     clocks) are never all in memory."""
@@ -725,9 +762,12 @@ def build(sources: list[str], workers: int, limit_files: int | None, merge_near_
         tasks += [(name, str(f)) for f in files]
     tasks.sort(key=lambda t: -Path(t[1]).stat().st_size)  # largest first, for load balance
     work = DATA_ROOT / "scratch" / "parse" / "parts"
-    if work.exists():
-        shutil.rmtree(work)
-    work.mkdir(parents=True)
+    manifest = work / "manifest.json"
+    reuse = reuse_parts and manifest.exists()
+    if not reuse:
+        if work.exists():
+            shutil.rmtree(work)
+        work.mkdir(parents=True)
     print(f"parsing {len(tasks)} files with {workers} workers into {work}", flush=True)
     os.environ["POLARS_MAX_THREADS"] = "1"  # read by the spawned workers; the worker count is the CPU budget
 
@@ -737,18 +777,28 @@ def build(sources: list[str], workers: int, limit_files: int | None, merge_near_
     encodings: dict[str, Counter] = {name: Counter() for name in sources}
     examples: dict[str, list[str]] = {}
     n_parsed = 0
-    args = [(name, path, part, str(work / f"part-{part:05d}.parquet")) for part, (name, path) in enumerate(tasks)]
-    # spawn, not fork: forking after polars has started its thread pool can deadlock
-    with multiprocessing.get_context("spawn").Pool(workers, maxtasksperchild=20) as pool:
-        for k, (path, n, file_drops, file_ex, encoding) in enumerate(pool.imap_unordered(parse_file, args), 1):
-            n_parsed += n
-            drops += file_drops
-            drops_by_source[source_of[path]] += file_drops
-            encodings[source_of[path]][encoding] += 1
-            for r, ex in file_ex.items():
-                examples.setdefault(r, []).extend(ex[: 3 - len(examples.get(r, []))])
-            if k % 50 == 0 or k == len(tasks):
-                print(f"  {k}/{len(tasks)} files, {n_parsed} games kept, {sum(drops.values())} dropped, {time.time() - t0:.0f} s", flush=True)
+    if reuse:
+        m = json.loads(manifest.read_text())
+        n_parsed, drops = m["n_parsed"], Counter(m["drops"])
+        drops_by_source = {k: Counter(v) for k, v in m["drops_by_source"].items()}
+        encodings = {k: Counter(v) for k, v in m["encodings"].items()}
+        examples = m["examples"]
+        print(f"reusing {len(list(work.glob('part-*.parquet')))} parts from {work}", flush=True)
+    else:
+        args = [(name, path, part, str(work / f"part-{part:05d}.parquet")) for part, (name, path) in enumerate(tasks)]
+        # spawn, not fork: forking after polars has started its thread pool can deadlock
+        with multiprocessing.get_context("spawn").Pool(workers, maxtasksperchild=20) as pool:
+            for k, (path, n, file_drops, file_ex, encoding) in enumerate(pool.imap_unordered(parse_file, args), 1):
+                n_parsed += n
+                drops += file_drops
+                drops_by_source[source_of[path]] += file_drops
+                encodings[source_of[path]][encoding] += 1
+                for r, ex in file_ex.items():
+                    examples.setdefault(r, []).extend(ex[: 3 - len(examples.get(r, []))])
+                if k % 50 == 0 or k == len(tasks):
+                    print(f"  {k}/{len(tasks)} files, {n_parsed} games kept, {sum(drops.values())} dropped, {time.time() - t0:.0f} s", flush=True)
+        manifest.write_text(json.dumps({"n_parsed": n_parsed, "drops": drops, "drops_by_source": drops_by_source,
+                                        "encodings": encodings, "examples": examples}))
     n_read = n_parsed + sum(drops.values())
     parts = sorted(work.glob("part-*.parquet"))
 
@@ -784,6 +834,7 @@ def build(sources: list[str], workers: int, limit_files: int | None, merge_near_
     if bdir.exists():
         shutil.rmtree(bdir)
     bdir.mkdir()
+    manifest.unlink()  # the parts are deleted as they are written out, so they cannot be reused after this
     streams: dict[tuple[str, str], tuple] = {}
 
     def flush_streams() -> None:
@@ -874,10 +925,12 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--workers", type=int, default=2, help="parser processes (default 2; see AGENTS.md on the CPU budget)")
     ap.add_argument("--no-merge-near-copies", action="store_true", help="keep near copies as separate games (measurement)")
     ap.add_argument("--out", type=Path, default=None, help="output directory (default: corpus/)")
+    ap.add_argument("--reuse-parts", action="store_true",
+                    help="skip parsing when a complete set of parts from an earlier run is on disk (after a stop in the plan)")
     ap.add_argument("--limit-files", type=int, default=None, help="only the first K files per source (testing)")
     args = ap.parse_args(argv)
 
-    build(args.sources.split(","), args.workers, args.limit_files, not args.no_merge_near_copies, args.out)
+    build(args.sources.split(","), args.workers, args.limit_files, not args.no_merge_near_copies, args.out, args.reuse_parts)
 
 
 if __name__ == "__main__":
