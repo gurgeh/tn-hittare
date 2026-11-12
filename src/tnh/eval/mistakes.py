@@ -105,7 +105,12 @@ def analyse(offs, P, y_cls, cls, r, w, cl, counts, g, nb, n_cls, names):
                 prb = np.array([bm[rep, n_cls + v * n_cls + c] for v in range(V)])
                 bcross.append(crossing(offs, prb - ob)[0])
             bcross = np.array(bcross)
+            # interval of the ratio mass / observed at each offset, from the same replicates
+            rb = np.array([[bm[rep, n_cls + v * n_cls + c] / bm[rep, c] for v in range(V)]
+                           for rep in range(bm.shape[0])])
             res[names[c]] = {"observed": float(o), "predicted": pr.tolist(), "ratio": (pr / o).tolist() if o else None,
+                             "ratio_lo": np.nanquantile(rb, 0.025, axis=0).tolist(),
+                             "ratio_hi": np.nanquantile(rb, 0.975, axis=0).tolist(),
                              "calibrated_offset": None if np.isnan(point) else point, "side": side,
                              "lo": float(np.nanquantile(bcross, 0.025)) if np.isfinite(bcross).any() else None,
                              "hi": float(np.nanquantile(bcross, 0.975)) if np.isfinite(bcross).any() else None,
