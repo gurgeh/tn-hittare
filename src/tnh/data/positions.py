@@ -36,6 +36,7 @@ from pathlib import Path
 import chess
 import numpy as np
 import polars as pl
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from tnh.data.timecontrol import parse_time_control
@@ -193,6 +194,10 @@ def process_chunk(args: tuple) -> tuple[int, int, int, int]:
     return idx, len(part), n_null_move_time, _peak_mb(), keys[order], counts, src
 
 
+N_BUCKETS = 64
+BUCKET_SHIFT = 58
+
+
 class BucketCounts:
     """Counts of 64-bit keys per source, in 64 buckets on the top bits, merged in memory as they come.
 
@@ -235,18 +240,28 @@ class BucketCounts:
         self.keys[b], self.counts[b] = uk, out
         self.pending[b], self.n_pending[b] = [], 0
 
-    def finish(self) -> tuple[np.ndarray, np.ndarray]:
-        """(sorted unique keys, counts per source as columns)."""
+    def finish(self) -> tuple[np.ndarray, np.ndarray, list[np.ndarray]]:
+        """(sorted unique keys, total counts, one count array per source).
+
+        Built into preallocated arrays bucket by bucket, each bucket freed once
+        copied, so the merged counts are never held twice.
+        """
         for b in range(N_BUCKETS):
             self._merge(b)
-        keys = np.concatenate(self.keys)
-        counts = np.concatenate(self.counts)
-        self.keys = self.counts = None
-        return keys, counts
-
-
-N_BUCKETS = 64
-BUCKET_SHIFT = 58
+        n = sum(len(k) for k in self.keys)
+        keys = np.empty(n, np.uint64)
+        total = np.empty(n, np.uint32)
+        per = [np.empty(n, np.uint32) for _ in range(self.n_sources)]
+        at = 0
+        for b in range(N_BUCKETS):
+            k, c = self.keys[b], self.counts[b]
+            keys[at:at + len(k)] = k
+            total[at:at + len(k)] = c.sum(axis=1, dtype=np.uint64)
+            for si in range(self.n_sources):
+                per[si][at:at + len(k)] = c[:, si]
+            at += len(k)
+            self.keys[b] = self.counts[b] = None
+        return keys, total, per
 
 
 def _drop_cache(path: Path) -> None:
@@ -341,6 +356,7 @@ def build(max_ply: int, workers: int, chunk: int, out_dir: Path | None = None, f
         n_in += t.num_rows
     writer.close()
     _drop_cache(input_path)
+    pa.default_memory_pool().release_unused()  # the input stream's buffers
     n_groups = pq.ParquetFile(input_path).num_row_groups
     sources_l = sorted(sources)
     log(f"{n_in:,} games in {n_groups} chunks; {n_emit:,} classical games with both ratings -> {est_rows:,} rows")
@@ -359,11 +375,10 @@ def build(max_ply: int, workers: int, chunk: int, out_dir: Path | None = None, f
                 log(f"  {k}/{len(tasks)} chunks, {n_rows:,} rows; worker peak {peak} MB, main {_rss_mb()} MB")
 
     # 3. the merged counts
-    keys, by_source = counter.finish()
+    keys, counts, per = counter.finish()
     del counter
-    counts = by_source.sum(axis=1, dtype=np.uint64).astype(np.uint32)
-    per_source = {src: np.ascontiguousarray(by_source[:, si]) for si, src in enumerate(sources_l)}
-    del by_source
+    per_source = dict(zip(sources_l, per, strict=True))
+    del per
     n_keys = len(keys)
     log(f"{n_keys:,} distinct positions reached by games with both ratings >= {COUNT_MIN_ELO}; main {_rss_mb()} MB")
 
