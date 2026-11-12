@@ -477,6 +477,21 @@ is a bootstrap over tournaments.
   size, 88-91 % of it in Lc0's child values (one network call per legal
   move); `FrontierValue` 13.6 positions per second with one Lc0 process.
   Maia-3 23M in place of 79M does not change the total.
+- **Pruned children**, `Combo(prune="p0.5")`: a child is evaluated only where
+  the largest of Maia +0, Maia +600 and Lc0's policy gives the move at least
+  0.5 %; the most probable move is always kept. The child columns are then
+  relative to the best evaluated child, and an unevaluated move gets zero
+  losses and the indicator `lc0ch_unev` with its own coefficient. 10.7
+  children per position in place of 36, 82 positions per second in place of
+  32, and the same log loss (1.1476 against 1.1475, difference +0.0000
+  [-0.0003, +0.0004] on `test_sub100k`). `p1` and `p2` cost 0.0008 and 0.0020.
+  Coefficients per rule in `combo_coef_<rule>.json`. The default is still all
+  children.
+- **Batch size stays at 12.** Lc0 0.32.1's own benchmark on BT4 peaks at
+  1,720 evaluations per second at batch 48 against 1,461 at 12, and above 12
+  a few positions per thousand come out wrong (up to 6 in a policy logit) and
+  differ between runs. The GPU is 93 % busy in the child calls, so it is the
+  network that limits, not the batching.
 
 ## Difficulty against results (step 2): `tnh.difficulty`
 
