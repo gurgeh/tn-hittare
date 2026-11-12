@@ -25,6 +25,7 @@ import numpy as np
 import polars as pl
 
 from tnh.data.edges import EdgeDB, pos_hash
+from tnh import movemix as mm
 from tnh.web.shrinkrule import Rule, load_rules
 
 TEMPI = ("classical", "rapid", "blitz", "unknown")
@@ -153,6 +154,8 @@ class Shrink:
     # shrink_rules.json, written by `python -m tnh.web.shrinkfit fit --write-rules`. A
     # quantity without one falls back to n / (n + k_elo) or n / (n + kappa_v).
     rules: dict = field(default_factory=load_rules)
+    # Prob's rule (tnh.movemix.json), shared with the repertoire builder.
+    prob: mm.Rule = field(default_factory=mm.load)
 
     def rule(self, q: str) -> Rule:
         r = self.rules.get(q)
@@ -162,7 +165,10 @@ class Shrink:
         return Rule("nk", [math.log(k)], 1.0, {"fallback": True})
 
     def describe(self) -> dict:
-        out = {"kappa": self.kappa, "kappa_v": self.kappa_v, "k_elo": self.k_elo}
+        out = {"kappa": self.prob.kappa, "kappa_v": self.kappa_v, "k_elo": self.k_elo,
+               "prob": {"form": self.prob.form, "text": self.prob.describe(),
+                        "fallback": bool(self.prob.provenance.get("fallback")),
+                        "fitted": self.prob.provenance.get("fitted")}}
         for q in ("w_elo", "b_elo", "chooser", "gap", "score", "draw"):
             r = self.rule(q)
             out[q] = {"form": r.form, "text": r.describe(), "fallback": bool(r.provenance.get("fallback")),
@@ -422,7 +428,8 @@ def model_table(rep: dict, probs: dict[str, float], position_wdl: tuple | None,
     side to move, and model 2's (win, draw, loss) for the mover of the position and of each
     child. Everything is from White's side; the page chooses how to show it.
 
-    - `p_mix = (count + kappa * p_model) / (n + kappa)`, n the moves' games under the filters;
+    - `p_mix`: `tnh.movemix`'s rule, `w * count / n + (1 - w) * p_model`, n the moves' games
+      under the filters;
     - `score_mix`, `draw_mix`: the fitted rule for Score and Draw (`Shrink.rule`) with model 2
       as the prior; the position's own line uses the same rule with its share at 1.
     """
@@ -438,6 +445,11 @@ def model_table(rep: dict, probs: dict[str, float], position_wdl: tuple | None,
     n = (rep["total"]["played"] or 0) if rep["status"] == "ok" else 0
     t = rep["total"]
     out = {}
+    # Prob: the database's counts mixed with model 1 by the fitted rule (tnh.movemix), over
+    # model 1's legal moves.
+    legal = list(probs)
+    prob_mix = dict(zip(legal, shrink.prob.mix([db[u]["n"] if u in db and n else 0 for u in legal],
+                                            [probs[u] for u in legal]))) if legal else {}
     for uci in set(probs) | set(db) | set(child_wdl):
         p = probs.get(uci)
         m = db.get(uci)
@@ -445,7 +457,7 @@ def model_table(rep: dict, probs: dict[str, float], position_wdl: tuple | None,
         model = _white_view(child_wdl.get(uci), child_white_to_move)
         db_score = (m["white_wins"] + 0.5 * m["draws"]) / m["n"] if m and m["n"] else None
         db_draw = m["draws"] / m["n"] if m and m["n"] else None
-        p_mix = (count + shrink.kappa * p) / (n + shrink.kappa) if p is not None else None
+        p_mix = float(prob_mix[uci]) if uci in prob_mix else None
         out[uci] = {
             "p_model": p, "p_mix": p_mix, "p_db": count / n if n else None,
             "delta": p_mix - p if p is not None else None,

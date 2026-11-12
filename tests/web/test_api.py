@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from _webfix import fake_hub, stats
 from tnh.web.app import create_app
+from tnh import movemix as mm
 from tnh.web.stats import Shrink
 from tnh.web.stats import Filters, two_proportion
 
@@ -24,7 +25,7 @@ def fen_after(*uci: str) -> str:
 @pytest.fixture(scope="module")
 def client():
     hub = fake_hub()
-    c = TestClient(create_app(stats(), hub, shrink=Shrink(rules={})))   # the fixed fallback rules
+    c = TestClient(create_app(stats(), hub, shrink=Shrink(rules={}, prob=mm.Rule())))   # the fixed fallback rules
     c.hub = hub
     return c
 

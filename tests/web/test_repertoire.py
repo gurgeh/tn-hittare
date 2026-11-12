@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from _webfix import fake_hub, stats, write_run
 from tnh.web.app import create_app
 from tnh.web.repertoire import Store
+from tnh import movemix as mm
 from tnh.web.stats import Shrink
 
 
@@ -22,7 +23,7 @@ def run_dir(tmp_path_factory):
 
 @pytest.fixture(scope="module")
 def client(run_dir):
-    return TestClient(create_app(stats(), fake_hub(), shrink=Shrink(rules={}), runs=Store(run_dir[0])))
+    return TestClient(create_app(stats(), fake_hub(), shrink=Shrink(rules={}, prob=mm.Rule()), runs=Store(run_dir[0])))
 
 
 def root_fen():

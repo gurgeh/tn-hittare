@@ -11,6 +11,7 @@ from tnh.models.base import Query
 from tnh.web.app import create_app
 from tnh.web.fakes import FakeMoveModel, FakeValue
 from tnh.web.models import Hub, Superseded, load_move_model, load_value_model, query
+from tnh import movemix as mm
 from tnh.web.stats import Shrink
 
 START = chess.STARTING_FEN
@@ -26,7 +27,7 @@ def fen_after(*uci: str) -> str:
 @pytest.fixture()
 def client():
     hub = fake_hub()
-    c = TestClient(create_app(stats(), hub, shrink=Shrink(rules={})))   # the fixed fallback rules
+    c = TestClient(create_app(stats(), hub, shrink=Shrink(rules={}, prob=mm.Rule())))   # the fixed fallback rules
     c.hub = hub
     return c
 

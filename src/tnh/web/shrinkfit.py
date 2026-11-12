@@ -57,7 +57,10 @@ REPORT_BINS = [(1, 1), (2, 5), (6, 20), (21, 10**12)]
 
 
 def collect(db, walks: int, seed: int, tempi: list[str] | None, split_year: int, max_ply: int = 60,
-            log=print) -> pl.DataFrame:
+            log=print, paths: dict | None = None) -> pl.DataFrame:
+    """The per-(position, move, part) statistics. With `paths`, also fills it with the UCI
+    moves from the start by which each recorded position was first reached (the models need
+    the game so far)."""
     from tnh.data.edges import pos_hash
     rng = np.random.default_rng(seed)
     start = pos_hash(chess.Board())
@@ -66,6 +69,7 @@ def collect(db, walks: int, seed: int, tempi: list[str] | None, split_year: int,
     t0 = time.perf_counter()
     for w in range(walks):
         h, ply = start, 0
+        line: list[str] = []
         while ply < max_ply:
             if h not in nodes:
                 p = db.panel(h, tempi=tempi)
@@ -86,12 +90,16 @@ def collect(db, walks: int, seed: int, tempi: list[str] | None, split_year: int,
                 ).select("pos", "white_to_move", "part", "move", "n", "white_wins", "draws", "black_wins",
                          "n_rated", "sum_white", "sum_black"))
                 m = p["moves"]
-                nodes[h] = (m["child_hash"].to_numpy(), m["n"].to_numpy().astype(float))
+                nodes[h] = (m["child_hash"].to_numpy(), m["n"].to_numpy().astype(float), m["move"].to_list())
+                if paths is not None:
+                    paths[h] = " ".join(line)
             node = nodes[h]
             if node is None:
                 break
-            kids, n = node
-            h = int(kids[rng.choice(len(kids), p=n / n.sum())])
+            kids, n, mvs = node
+            j = rng.choice(len(kids), p=n / n.sum())
+            h = int(kids[j])
+            line.append(mvs[j])
             ply += 1
         if (w + 1) % 500 == 0:
             log(f"{w + 1} walks, {len(rows)} positions, {time.perf_counter() - t0:.0f} s")
@@ -335,8 +343,11 @@ def main(argv: list[str] | None = None) -> None:
     if a.cmd == "collect":
         from tnh.data.edges import EdgeDB
         tempi = None if a.tempi == "all" else a.tempi.split(",")
-        raw = collect(EdgeDB(name=a.table), a.walks, a.seed, tempi, a.split_year)
+        paths: dict[int, str] = {}
+        raw = collect(EdgeDB(name=a.table), a.walks, a.seed, tempi, a.split_year, paths=paths)
         a.out.parent.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame({"pos": pl.Series(list(paths), dtype=pl.UInt64), "path": list(paths.values())}).write_parquet(
+            a.out.with_suffix(".paths.parquet"))
         meta = {"table": a.table, "walks": a.walks, "seed": a.seed, "tempi": tempi, "split_year": a.split_year,
                 "positions": raw["pos"].n_unique(), "rows": raw.height, "date": date.today().isoformat(),
                 "commit": _commit()}
