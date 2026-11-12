@@ -378,3 +378,41 @@ def test_preppy_line_parsing_is_lenient():
     assert d["provisional"] is True and d["white"] == pytest.approx(0.4) and d["net"] is None
     assert d["flags"] == ["L", "0.4"] and d["other"] == {"newkey": "x"}
     assert _preppy_line(_kv("preppy multipv=1 value=0.5"), [], flip=False)["provisional"] is False
+
+
+def test_bestmove_strings_are_parsed():
+    from tnh.web.engine import _kv, _preppy_line, _preppy_root
+    kv = _kv("preppy multipv=2 value=0.545 net=- nonobvious=0 reach=0.2 provisional=0 moves=e2e4:L,e7e5:0.6 "
+             "mode=bestmove depth=11 complete=1 inside=812 value_in_progress=0.549")
+    d = _preppy_line(kv, ["e2e4", "e7e5"], flip=False)
+    assert (d["mode"], d["depth"], d["complete"], d["inside"]) == ("bestmove", 11, True, 812)
+    assert d["white"] == pytest.approx(0.545) and d["white_in_progress"] == pytest.approx(0.549) and d["other"] == {}
+    d = _preppy_line(_kv("preppy multipv=1 value=0.4 mode=bestmove depth=3 complete=0 inside=5 value_in_progress=-"),
+                     [], flip=True)
+    assert d["white"] == pytest.approx(0.6) and d["in_progress"] is None and d["complete"] is False
+    r = _preppy_root(_kv("preppy root value=0.55 mode=bestmove depth=11 complete=1 provisional=0 "
+                         "depth_in_progress=12 expanded=3000"), flip=False)
+    assert (r["mode"], r["depth"], r["complete"], r["depth_in_progress"], r["expanded"]) == ("bestmove", 11, True, 12, 3000)
+
+
+def test_preppy_fake_bestmove_mode():
+    spec = EngineSpec("preppy", "preppy", [sys.executable, "-m", "tnh.engine.uci", "--fake"], {},
+                      ("MyElo", "OppElo", "Side", "Price", "Cap", "Obvious", "Prepared", "DrawScore", "Mode", "Alpha"),
+                      short="preppy")
+    m = EngineManager({"preppy": spec}, start_timeout=120, gpu_free=lambda: None)
+    try:
+        m.go("preppy", *after(), multipv=2, settings={"Side": "white", "Mode": "bestmove", "Alpha": "0.5"})
+        end = time.monotonic() + 60
+        s = m.snapshot()
+        while time.monotonic() < end and not (s["lines"] and all("preppy" in x for x in s["lines"]) and s.get("root")):
+            time.sleep(0.2)
+            s = m.snapshot()
+        assert {o["name"] for o in s["options"]} >= {"Mode", "Alpha"}
+        mode = next(o for o in s["options"] if o["name"] == "Mode")
+        assert mode["type"] == "combo" and set(mode["vars"]) == {"repertoire", "bestmove"}
+        x = s["lines"][0]["preppy"]
+        assert x["mode"] == "bestmove" and x["depth"] is not None and x["inside"] is not None
+        assert s["root"]["mode"] == "bestmove" and s["root"]["depth_in_progress"] is not None
+        assert m._applied["Mode"] == "bestmove" and m._applied["Alpha"] == "0.5"
+    finally:
+        m.close()

@@ -136,6 +136,28 @@ def main() -> None:
         assert page.evaluate("window.tnh.tableBuilds()") == page.evaluate("window.__builds")
         assert page.evaluate("window.__row.matches(':hover')")
         assert page.locator("#tbl tbody td.engcell").count() >= 1
+
+        # preppy's bestmove mode: Mode is a select of its declared values; Price, Cap and Obvious
+        # are greyed out; lines show the depth and what is inside the horizon; still no rebuild
+        mode = page.locator("#engset select[data-opt='Mode']")
+        assert sorted(mode.locator("option").all_inner_texts()) == ["bestmove", "repertoire"]
+        expect(page.locator("#engset input[data-opt='Price']")).to_be_enabled()
+        mode.select_option("bestmove")
+        for k in ("Price", "Cap", "Obvious"):
+            expect(page.locator(f"#engset input[data-opt='{k}']")).to_be_disabled()
+        expect(page.locator("#engset input[data-opt='Alpha']")).to_be_enabled()
+        page.wait_for_function("window.tnh.state.eng.snap && window.tnh.state.eng.snap.root && "
+                               "window.tnh.state.eng.snap.root.mode === 'bestmove' && window.tnh.state.eng.snap.lines.length >= 2",
+                               timeout=60000)
+        expect(page.locator("#engstat")).to_contain_text("expanded")
+        expect(page.locator("#englines .eprog").first).to_contain_text("inside")
+        expect(page.locator("#engstrings")).not_to_contain_text("non-obvious")
+        page.evaluate("() => { window.__builds = window.tnh.tableBuilds(); window.__row = document.querySelector('#tbl tbody tr[data-uci]'); window.__polls = 0 }")
+        page.wait_for_function("window.__polls >= 4", timeout=20000)
+        assert page.evaluate("document.contains(window.__row) && window.tnh.tableBuilds() === window.__builds")
+        mode.select_option("repertoire")
+        expect(page.locator("#engset input[data-opt='Price']")).to_be_enabled()
+
         page.locator("#eng").select_option("off")
         page.wait_for_function("document.querySelector('#tbl thead th[data-k=eng]') === null")
 

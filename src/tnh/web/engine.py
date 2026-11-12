@@ -94,7 +94,8 @@ def default_specs(*, threads: int = 4, hash_mb: int = 256, lc0_minibatch: int = 
                           hidden={"WDLContemptAttenuation": {"name": "WDLContemptAttenuation", "type": "string",
                                                              "default": "1", "vars": []}}),
         "preppy": EngineSpec("preppy", "preppy", [sys.executable, "-m", "tnh.engine.uci"], {},
-                             ("MyElo", "OppElo", "Side", "Tempo", "Price", "Cap", "Obvious", "Prepared", "DrawScore"),
+                             ("MyElo", "OppElo", "Side", "Tempo", "Price", "Cap", "Obvious", "Prepared", "DrawScore",
+                              "Mode", "Alpha"),
                              gpu_mb=2500, short="preppy"),
     }
 
@@ -586,7 +587,17 @@ def _num(x: str | None) -> float | None:
         return None
 
 
-_KNOWN_LINE_KEYS = {"multipv", "value", "net", "nonobvious", "reach", "moves", "provisional", "gen"}
+_KNOWN_LINE_KEYS = {"multipv", "value", "net", "nonobvious", "reach", "moves", "provisional", "gen",
+                    "mode", "depth", "complete", "inside", "value_in_progress"}
+
+
+def _int(x: str | None) -> int | None:
+    v = _num(x)
+    return None if v is None else int(v)
+
+
+def _flag(x) -> bool:
+    return str(x if x is not None else "0").lower() in ("1", "true", "yes")
 
 
 def _preppy_line(kv: dict, pv: list[str], flip: bool) -> dict:
@@ -599,7 +610,15 @@ def _preppy_line(kv: dict, pv: list[str], flip: bool) -> dict:
             "nonobvious": _num(kv.get("nonobvious")), "reach": _num(kv.get("reach")),
             "flags": [f for _m, f in order][:len(pv)],
             # an early line, before preppy's solve for the position is done (shown dimmed)
-            "provisional": str(kv.get("provisional", "0")).lower() in ("1", "true", "yes"),
+            "provisional": _flag(kv.get("provisional")),
+            # bestmove mode: `value` is final at the last completed `depth` (with complete=0 no
+            # depth is complete yet); `value_in_progress` is at the depth being searched
+            "mode": kv.get("mode", "repertoire"), "depth": _int(kv.get("depth")),
+            "complete": _flag(kv.get("complete")) if "complete" in kv else None,
+            "inside": _int(kv.get("inside")),
+            "in_progress": _num(kv.get("value_in_progress")),
+            "white_in_progress": None if _num(kv.get("value_in_progress")) is None
+            else (1 - _num(kv.get("value_in_progress")) if flip else _num(kv.get("value_in_progress"))),
             # keys this page does not know yet, passed on as they came
             "other": {k: v for k, v in kv.items() if k not in _KNOWN_LINE_KEYS}}
 
@@ -607,5 +626,8 @@ def _preppy_line(kv: dict, pv: list[str], flip: bool) -> dict:
 def _preppy_root(kv: dict, flip: bool) -> dict:
     v = _num(kv.get("value"))
     return {"value": v, "white": None if v is None else (1 - v if flip else v),
+            "mode": kv.get("mode", "repertoire"), "depth": _int(kv.get("depth")),
+            "complete": _flag(kv.get("complete")) if "complete" in kv else None,
+            "provisional": _flag(kv.get("provisional")), "depth_in_progress": _int(kv.get("depth_in_progress")),
             **{k: (kv.get(k) if k == "cap" else _num(kv.get(k)))
                for k in ("net", "price", "cost", "cap", "stand_in", "frontier", "finished", "expanded")}}

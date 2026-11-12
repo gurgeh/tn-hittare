@@ -825,6 +825,8 @@ main()
 const ENG_STORE = "tnh.engine"
 // Options the page feeds from its own controls rather than a settings box: preppy's sides,
 // ratings and tempo; Lc0's ContemptMode (the server derives it from Contempt and "me").
+const REPERTOIRE_ONLY = ["Price", "Cap", "Obvious"]     // preppy ignores these in bestmove mode
+const NUMERIC = ["Alpha"]                                 // string options that are numbers
 const FED = ["MyElo", "OppElo", "Side", "Tempo", "ContemptMode", "MovesLeftThreshold"]
 // Lc0's tooltips follow the Lc0 team's guide (reference/lc0-sadler-wdl-contempt.md).
 const OPTION_TIPS = {
@@ -832,6 +834,11 @@ const OPTION_TIPS = {
     WDLCalibrationElo: "Lc0: the rating level its W/D/L is simulated at (0 = off): my rating, plus about 50 per doubling of thinking time from 3'+2\". It does not weaken the search. The same Contempt has less effect at a higher calibration Elo",
     WDLEvalObjectivity: "Lc0, 0-1 (default 1). Objectivity 0 with attenuation 1: the realistic W/D/L of this matchup and suitable lines. Objectivity 1 with attenuation between 0 and 1: different levels of aggression, with the objective evaluation of the chosen lines (which is why the shown score can drop for the favoured side: contempt picks lines that are objectively a little worse)",
     WDLContemptAttenuation: "Lc0, 0-1 (default 1): how much of the contempt acts. With objectivity 1, values between 0 and 1 give different levels of aggression with the objective evaluation of the chosen lines",
+    Mode: "repertoire: which moves are worth learning at a price per non-obvious move. bestmove: my best move everywhere against the opponent's distribution, to a horizon set by how likely the position is; values of different root moves compare at the same depth",
+    Alpha: "how much shallower my unlikely candidates are searched than my top one; 0 = all equally deep",
+    Price: "preppy, repertoire mode: the price per non-obvious learned move, in expected score (ignored in bestmove mode)",
+    Cap: "preppy, repertoire mode: at most this many non-obvious learned moves, 0 = off (ignored in bestmove mode)",
+    Obvious: "preppy, repertoire mode: a move is obvious (costs nothing) when my move model alone gives it at least this (ignored in bestmove mode)",
     DrawScore: "preppy: what a draw is worth to me (0-1, 0.5 = half a point). The rating difference in the White and Black boxes is preppy's real contempt; DrawScore only changes what a draw is worth",
 }
 
@@ -905,6 +912,15 @@ async function initEngine() {
         const el = e.target.closest("[data-opt]")
         if (!el) return
         state.eng.settings[el.dataset.opt] = el.value
+        if (el.dataset.opt === "Mode") {      // grey out what bestmove ignores at once, not at the next redraw
+            for (const k of REPERTOIRE_ONLY) {
+                const inp = $("engset").querySelector(`[data-opt="${k}"]`)
+                if (inp) {
+                    inp.disabled = el.value === "bestmove"
+                    inp.closest("label").classList.toggle("off", el.value === "bestmove")
+                }
+            }
+        }
         storePut()
         engineGo()
     })
@@ -1048,9 +1064,16 @@ function renderEngine() {
     // the engine's settings: those it declared that the page lets the user set
     let set = ""
     if (on && s && s.options && e) {
+        const modeOpt = s.options.find(o => o.name === "Mode")
+        const bestmove = !!modeOpt && (state.eng.settings.Mode ?? modeOpt.default) === "bestmove"
         set = s.options.filter(o => !FED.includes(o.name)).map(o => {
             const v = state.eng.settings[o.name] ?? o.default ?? ""
             const tip = OPTION_TIPS[o.name] ? ` title="${esc(OPTION_TIPS[o.name])}"` : ""
+            // preppy ignores Price, Cap and Obvious in bestmove mode: shown greyed and disabled
+            if (bestmove && REPERTOIRE_ONLY.includes(o.name)) {
+                return `<label${tip} class="off">${esc(o.name)} <input data-opt="${esc(o.name)}" class="short" value="${esc(v)}" disabled></label>`
+            }
+            if (NUMERIC.includes(o.name)) return `<label${tip}>${esc(o.name)} <input data-opt="${esc(o.name)}" class="short" type="number" step="0.1" min="0" value="${esc(v)}"></label>`
             if (o.type === "combo") return `<label${tip}>${esc(o.name)} <select data-opt="${esc(o.name)}">${o.vars.map(x => `<option ${x === v ? "selected" : ""}>${esc(x)}</option>`).join("")}</select></label>`
             if (o.type === "spin") return `<label${tip}>${esc(o.name)} <input data-opt="${esc(o.name)}" type="number" min="${o.min ?? ""}" max="${o.max ?? ""}" value="${esc(v)}"></label>`
             if (o.type === "check") return `<label${tip}>${esc(o.name)} <select data-opt="${esc(o.name)}"><option ${v === "true" ? "selected" : ""}>true</option><option ${v !== "true" ? "selected" : ""}>false</option></select></label>`
@@ -1076,7 +1099,12 @@ function renderEngine() {
     let stat = ""
     if (state.eng.err) stat = `<span class="err">${esc(state.eng.err)}</span>`
     else if (s && s.error) stat = `<span class="err">${esc(s.error)}</span>`
-    else if (on && s && s.lines && s.lines.length) {
+    else if (on && s && s.root && s.root.mode === "bestmove") {
+        const r = s.root
+        stat = (r.complete ? `depth ${r.depth} complete, ${r.depth_in_progress ?? r.depth + 1} in progress`
+                           : `depth ${r.depth_in_progress ?? r.depth} in progress, none complete yet`) +
+            `, ${r.expanded} expanded` + (r.provisional ? " (provisional)" : "")
+    } else if (on && s && s.lines && s.lines.length) {
         const l = s.lines[0]
         stat = [l.depth != null ? `depth ${l.depth}` : "", l.nodes != null ? `${fmtNodes(l.nodes)} nodes` : "",
                 l.nps ? `${fmtNodes(l.nps)}/s` : ""].filter(Boolean).join(" · ")
@@ -1086,12 +1114,15 @@ function renderEngine() {
     if (!on) { setHtml("englines", ""); setHtml("engstrings", ""); return }
     renderLines((s && s.lines) || [])
     const lines = (s && s.lines) || []
-    const extra = lines.some(l => l.preppy) ? lines.map(l => l.preppy ? `<div>line ${l.multipv}: value White ${(100 * l.preppy.white).toFixed(1)}%` +
+    const extra = lines.some(l => l.preppy) ? lines.map(l => !l.preppy ? "" : l.preppy.mode === "bestmove" ? `<div>line ${l.multipv}: ${bestmoveValue(l.preppy)} · ${l.preppy.inside} inside its horizon</div>` : `<div>line ${l.multipv}: value White ${(100 * l.preppy.white).toFixed(1)}%` +
         (l.preppy.net != null ? ` · net (me) ${(100 * l.preppy.net).toFixed(1)}%` : "") +
         ` · non-obvious ${l.preppy.nonobvious} · reach ${(100 * l.preppy.reach).toFixed(1)}%` +
-        (l.preppy.provisional ? " · provisional" : "") + `</div>` : "").join("") : ""
+        (l.preppy.provisional ? " · provisional" : "") + `</div>`).join("") : ""
     const r = s && s.root
-    const rootLine = r ? `<div title="the search's root: value from White's side; net, price and cost for me; how much of the reach ends in stand-ins, frontier and finished positions">root: value White ${(100 * r.white).toFixed(1)}% · net ${(100 * r.net).toFixed(1)}% · price ${r.price} · cost ${r.cost}` +
+    const rootLine = r && r.mode === "bestmove" ? `<div title="bestmove: expectimax to a reach horizon, deepened step by step; all root moves share one horizon, so their values compare">root: value White ${(100 * r.white).toFixed(1)}% · ` +
+        (r.complete ? `depth ${r.depth} complete, ${r.depth_in_progress} in progress` : `depth ${r.depth_in_progress ?? r.depth} in progress`) +
+        ` · ${r.expanded} expanded` + (r.provisional ? " · provisional" : "") + `</div>`
+        : r ? `<div title="the search's root: value from White's side; net, price and cost for me; how much of the reach ends in stand-ins, frontier and finished positions">root: value White ${(100 * r.white).toFixed(1)}% · net ${(100 * r.net).toFixed(1)}% · price ${r.price} · cost ${r.cost}` +
         (r.cap && r.cap !== "-" ? ` (cap ${r.cap})` : "") +
         ` · stand-in ${(100 * r.stand_in).toFixed(1)}% · frontier ${(100 * r.frontier).toFixed(1)}% · finished ${(100 * r.finished).toFixed(1)}% · ${r.expanded} expanded</div>` : ""
     const other = ((s && s.strings) || []).filter(x => !x.startsWith("preppy root")).map(x => `<div>${esc(x)}</div>`).join("")
@@ -1122,16 +1153,21 @@ function renderLines(lines) {
             el = document.createElement("div")
             el.className = "eline"
             el.dataset.k = String(l.multipv)
-            el.innerHTML = `<span class="escore"></span><span class="edepth"></span><span class="epv"></span>`
+            el.innerHTML = `<span class="escore"></span><span class="edepth"></span><span class="eprog"></span><span class="epv"></span>`
         }
         if (box.children[i] !== el) box.insertBefore(el, box.children[i] || null)
-        const [sc, dp, pv] = el.children
+        const [sc, dp, pg, pv] = el.children
         const score = scoreText(l)
         if (sc.textContent !== score) sc.textContent = score
         const wdl = l.wdl ? `W ${(l.wdl[0] / 10).toFixed(1)} D ${(l.wdl[1] / 10).toFixed(1)} L ${(l.wdl[2] / 10).toFixed(1)} % (White)` : ""
         if (sc.title !== wdl) sc.title = wdl
-        const dn = l.depth != null ? `d${l.depth}` : l.nodes != null ? fmtNodes(l.nodes) : ""
+        const bm = l.preppy && l.preppy.mode === "bestmove" ? l.preppy : null
+        const dn = bm ? (bm.complete ? `d${bm.depth}` : `d${bm.depth}…`) : l.depth != null ? `d${l.depth}` : l.nodes != null ? fmtNodes(l.nodes) : ""
         if (dp.textContent !== dn) dp.textContent = dn
+        // bestmove: the value at the depth in progress beside the final one, and the horizon's size
+        const prog = bm ? [bm.white_in_progress != null ? `${(100 * bm.white_in_progress).toFixed(1)}% (d${(state.eng.snap.root && state.eng.snap.root.depth_in_progress) || bm.depth + 1}…)` : "",
+                           bm.inside != null ? `${bm.inside} inside` : ""].filter(Boolean).join(" · ") : ""
+        if (pg.textContent !== prog) pg.textContent = prog
         const sig = JSON.stringify([l.pv, l.preppy ? l.preppy.flags : null, state.tree.current.fen])
         if (el.dataset.sig !== sig) {
             pv.innerHTML = sanLine(l)
@@ -1145,4 +1181,12 @@ function renderLines(lines) {
 
 function fmtNodes(n) {
     return n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(0) + "k" : String(n)
+}
+
+// bestmove: "54.5% (d11) · 54.9% (d12…)", White's view, the final value first
+function bestmoveValue(p) {
+    const fin = `${(100 * p.white).toFixed(1)}% (d${p.depth}${p.complete ? "" : "…"})`
+    const r = state.eng.snap && state.eng.snap.root
+    const next = r && r.depth_in_progress != null ? r.depth_in_progress : p.depth + 1
+    return p.white_in_progress != null ? `${fin} · <span class="dim">${(100 * p.white_in_progress).toFixed(1)}% (d${next}…)</span>` : fin
 }
