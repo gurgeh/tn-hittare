@@ -245,3 +245,28 @@ def test_performance_definition():
     assert out[1] == pytest.approx(2000 + 400 * 0.4771, abs=0.1)  # 400 * log10(3)
     assert out[2] == pytest.approx(2000 + 400 * 0.9542, abs=0.1)  # 400 * log10(9)
     assert out[3] == pytest.approx(2800) and out[4] == pytest.approx(1200)  # capped at +-800
+
+
+def test_parents_many_and_totals_many():
+    games = games_frame(
+        ["e2e4 e7e5 g1f3 b8c6", "e2e4 e7e5 g1f3 b8c6", "g1f3 b8c6 e2e4 e7e5", "g1f3 b8c6 e2e4 e7e5",
+         "d2d4 d7d5", "d2d4 d7d5", "d2d4 g8f6"],
+        years=[2020, 2024, 2024, 2024, 2024, 2023, 2024])
+    db = EdgeDB.from_frames(*tables_from_games(games))
+    a = chess.Board()
+    for m in ["e4", "e5", "Nf3", "Nc6"]:
+        a.push_san(m)
+    b = chess.Board()
+    b.push_san("d4")
+    many = db.parents_many([a, b, chess.Board()])
+    for pos in (a, b):
+        one = db.parents(pos)
+        sub = many.filter(pl.col("child_hash") == pos_hash(pos)).drop("child_hash")
+        assert sub.sort("pos_hash", "move").equals(one.sort("pos_hash", "move"))
+    assert many.filter(pl.col("child_hash") == pos_hash(chess.Board())).height == 0
+    filt = db.parents_many([a, b], years=2024)
+    assert dict(filt.group_by("child_hash").agg(pl.col("n").sum()).iter_rows()) == {pos_hash(a): 3, pos_hash(b): 2}
+    t = db.totals_many([a, b, chess.Board(), "8/8/8/8/8/8/8/K6k w - -"])
+    assert t.height == 3 and t["pos_hash"].is_sorted()
+    assert t.filter(pl.col("pos_hash") == pos_hash(b))["n"].item() == 3
+    assert db.parents_many([], with_epd=False).columns == ["child_hash", "pos_hash", "move", "n"]

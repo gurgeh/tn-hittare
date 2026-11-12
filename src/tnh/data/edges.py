@@ -590,6 +590,46 @@ class EdgeDB:
             moves = moves.with_columns(child_n=pl.lit(None, pl.UInt32))
         return {"total": total, "moves": moves, "by_year": self._summarise(rows, white, ["year"])}
 
+    def totals_many(self, positions) -> pl.DataFrame:
+        """``total`` for many positions in one read: the pos_index rows of those reached by
+        two or more games (the others are absent), sorted by ``pos_hash``."""
+        keys = [_key(p) for p in positions]
+        return self._pos.rows(keys).sort("pos_hash") if keys else pl.DataFrame(schema=POS_INDEX_SCHEMA)
+
+    def parents_many(self, positions, *, years: Filter = None, elo_bands: Filter = None,
+                     tempi: Filter = None, with_epd: bool = True) -> pl.DataFrame:
+        """``parents`` for many positions in one batch of reads.
+
+        One row per (child, parent, move): ``child_hash``, ``pos_hash`` (the
+        parent), ``move``, ``n`` (games that played it, under the filters) and,
+        with ``with_epd``, the parent's ``epd``. Sorted by child, then games
+        (most first), then parent. Children with no listed parent have no rows.
+        Each underlying table is read once for the whole batch, so a batch of a
+        few thousand children costs about what one lookup per row group touched.
+        """
+        keys = np.unique(np.asarray([_key(p) for p in positions], np.uint64))
+        empty = {"child_hash": pl.UInt64, "pos_hash": pl.UInt64, "move": pl.String, "n": pl.UInt32}
+        if with_epd:
+            empty["epd"] = pl.String
+        if len(keys) == 0:
+            return pl.DataFrame(schema=empty)
+        par = self._parents.rows(keys)
+        if par.height and not (years is None and elo_bands is None and tempi is None):
+            wanted = pl.Series(keys, dtype=pl.UInt64)
+            par = (
+                self._edges.rows(par["pos_hash"].unique().to_numpy())
+                .filter(pl.col("child_hash").is_in(wanted.implode())
+                        & _match("year", years) & _match("elo_band", elo_bands) & _match("tempo", tempi))
+                .group_by("child_hash", "pos_hash", "move").agg(pl.col("n").sum())
+            )
+        if par.height == 0:
+            return pl.DataFrame(schema=empty)
+        par = par.select([pl.col(c).cast(t) for c, t in empty.items() if c != "epd"])
+        if with_epd:
+            epd = self._pos.rows(par["pos_hash"].unique().to_numpy(), ["pos_hash", "epd"])
+            par = par.join(epd, on="pos_hash", how="left")
+        return par.sort(["child_hash", "n", "pos_hash"], descending=[False, True, False])
+
     def parents(self, pos, *, years: Filter = None, elo_bands: Filter = None, tempi: Filter = None) -> pl.DataFrame:
         """The positions that lead into this one: parent ``pos_hash``, ``move``, ``n``
         (games that played it, under the filters) and the parent's ``epd``, most played first.
@@ -598,19 +638,8 @@ class EdgeDB:
         ``child_hash``); with filters the parents' edge rows are read too.
         Only parents reached by two or more games are listed, as in edges.
         """
-        h = _key(pos)
-        par = self._parents.rows([h])
-        if par.height and not (years is None and elo_bands is None and tempi is None):
-            par = (
-                self._edges.rows(par["pos_hash"].to_numpy())
-                .filter((pl.col("child_hash") == h) & _match("year", years) & _match("elo_band", elo_bands) & _match("tempo", tempi))
-                .group_by("pos_hash", "move").agg(pl.col("n").sum())
-            )
-        if par.height == 0:
-            return pl.DataFrame(schema={"pos_hash": pl.UInt64, "move": pl.String, "n": pl.UInt32, "epd": pl.String})
-        epd = self._pos.rows(par["pos_hash"].to_numpy()).select("pos_hash", "epd")
-        return par.select("pos_hash", "move", "n").join(epd, on="pos_hash", how="left").sort(
-            "n", "pos_hash", descending=[True, False])
+        out = self.parents_many([pos], years=years, elo_bands=elo_bands, tempi=tempi)
+        return out.drop("child_hash").sort("n", "pos_hash", descending=[True, False])
 
 
 # --- the full build ----------------------------------------------------------------
