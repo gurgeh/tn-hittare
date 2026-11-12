@@ -294,6 +294,30 @@ learn, and which move in each, to maximise my expected score.
   mass; the swing of the chosen set's value between rounds.
 - **CPU:** one BLAS/OpenMP thread. The builder is one process on one core.
 
+**Where the builder is going** (the user, 2026-11-12; not built):
+
+- **No hard limit on sound moves.** `eps` = 0.03 shut out moves he considers
+  playable (4.b3 and 4.cxd5 after 1.c4 Nf6 2.g3 e6 3.Bg2 d5). In its place:
+  the result model, which has the engine's value among its inputs; the share
+  of prepared opponents (`lam`); a wide safety net against plain blunders; and
+  the engine loss reported for every chosen move.
+- **A selective search in the manner of Lc0**, written here and not as a
+  change to Lc0's code: PUCT over my candidate moves with a prior from the
+  move model at my rating and Lc0's policy, descent by probability at the
+  opponent's moves, leaves valued by the result model in batches. It runs as
+  long as it is given and its answer only gets finer.
+- **A price per non-obvious learned move** in place of a fixed N as the
+  default: a move is learned where reach times gain exceeds the price, so the
+  depth sets itself.
+- **Used as an engine, not as a report.** In the interface it is chosen
+  beside Stockfish and Lc0, shows the best few lines from the current
+  position and updates them while it searches. That needs a search that keeps
+  its graph between positions (a cache keyed on position, ratings and
+  parameters, reused when the user steps into a child) and could be wrapped
+  in UCI, with ratings and parameters as options.
+- The first real run (round 3) and its export to the interface are a stopgap
+  for looking at results until then.
+
 Every model enters through the interfaces above, so the builder can be tested
 on synthetic models where the best repertoire is planted and known.
 
