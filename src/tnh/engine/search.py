@@ -287,6 +287,7 @@ class Engine:
         for n in g.nodes:
             n.engine, n.counts = None, None
             n.info.pop("stand_in", None)
+            n.info.pop("valued", None)
             if "result_mover" in n.info:
                 n.value = self._result_value(n)
                 n.children, n.p_model = None, None
@@ -297,6 +298,7 @@ class Engine:
                 n.value = math.nan
                 continue
             self._apply(n, e)
+            n.info["valued"] = True
             n.children = self.kids.get(n.id)
         # stand-ins: a position without its own value takes its parent's
         for i in g.order():
@@ -379,6 +381,14 @@ class Engine:
     # -- expansion ------------------------------------------------------------------------------
 
     def _expand(self, ids: list[int]) -> None:
+        """Evaluate the positions and create their children (the priced mode's expansion)."""
+        self._materialize(self._evaluate(ids))
+
+    def _evaluate(self, ids: list[int]) -> list[int]:
+        """The model calls: each position's moves, its move model and its own value, marked
+        `valued`. Its children are not created (see `_materialize`), so a position that is only
+        needed for its value costs one graph position, not one per legal move. Returns the
+        live (not finished) positions."""
         t0 = time.perf_counter()
         g = self.graph
         live = []
@@ -417,18 +427,30 @@ class Engine:
             self.stats["evaluations"] += len(todo)
             for (i, k), e in zip(todo, out):
                 self._evals[k] = e
-        self._fetch_counts([g.nodes[i] for i in live])
-        t0 = time.perf_counter()
         for i in live:
             n = g.nodes[i]
-            e = self._evals[self._ekey(i)]
-            n.info.pop("stand_in", None)
-            self._apply(n, e)
+            if n.children is None:
+                n.info.pop("stand_in", None)
+                self._apply(n, self._evals[self._ekey(i)])
+                n.info["valued"] = True
+        return live
+
+    def _materialize(self, ids: list[int]) -> None:
+        """Counts and children for evaluated positions; no model calls."""
+        g = self.graph
+        todo = [i for i in ids if g.nodes[i].children is None and g.nodes[i].moves and g.nodes[i].moves is not PENDING]
+        self._fetch_counts([g.nodes[i] for i in todo])
+        t0 = time.perf_counter()
+        for i in todo:
+            n = g.nodes[i]
+            if not n.me_to_move:
+                n.counts = self._counts.get(self._ckey(n))
             if i not in self.kids:
                 self.kids[i] = [self._node(self.ev.child(self.pos[i], m), n.value).id for m in n.moves]
             for c in self.kids[i]:
                 cn = g.nodes[c]
-                if cn.children is None and "result_mover" not in cn.info and (math.isnan(cn.value) or cn.info.get("stand_in")):
+                if cn.children is None and "result_mover" not in cn.info and not cn.info.get("valued") \
+                        and (math.isnan(cn.value) or cn.info.get("stand_in")):
                     cn.me_to_move = self.ev.white_to_move(self.pos[c]) == g.me_white
                     cn.value = n.value
                     cn.info["stand_in"] = True

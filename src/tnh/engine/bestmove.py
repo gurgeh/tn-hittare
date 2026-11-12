@@ -69,7 +69,7 @@ class BestMove:
     # -- the models' quantities ---------------------------------------------------------------
 
     def _evaluated(self, n: Node) -> bool:
-        return n.children is not None or "result_mover" in n.info
+        return n.children is not None or "result_mover" in n.info or bool(n.info.get("valued"))
 
     def _finished(self, n: Node) -> bool:
         return "result_mover" in n.info
@@ -111,29 +111,32 @@ class BestMove:
 
     # -- the horizon ---------------------------------------------------------------------------
 
-    def rho(self, th: float) -> tuple[dict[int, float], list[int]]:
-        """rho over the evaluated part of the graph, propagated only from inside positions,
-        and the positions that still need an evaluation for depth th (largest rho first)."""
+    def rho(self, th: float) -> tuple[dict[int, float], list[int], list[int]]:
+        """rho over the evaluated part of the graph, propagated only from inside positions;
+        the positions that still need an evaluation for depth th (largest rho first); and the
+        inside positions that are evaluated but have no children yet (created without model
+        calls)."""
         g = self.e.graph
         root = g.root
         rho = {root: 1.0}
         heap = [(g.nodes[root].ply, root)]
         need: dict[int, float] = {}
+        kids: list[int] = []
         done = set()
-        # process in ply order: a node's rho is final once every parent at the ply above is done
-        order = []
         while heap:
             _, i = heapq.heappop(heap)
             if i in done:
                 continue
             done.add(i)
-            order.append(i)
             n = g.nodes[i]
             if not self._evaluated(n):
                 if rho[i] >= th:
                     need[i] = rho[i]
                 continue
             if self._finished(n) or rho[i] < th:
+                continue
+            if n.children is None:                       # inside, valued only: its children come now
+                kids.append(i)
                 continue
             for c, f in self._factors(i, i == root):
                 r = rho[i] * f
@@ -143,7 +146,7 @@ class BestMove:
                     need[c] = max(need.get(c, 0.0), r)       # children of inside positions are valued
                 if c not in done:
                     heapq.heappush(heap, (g.nodes[c].ply, c))
-        return rho, [i for i, _ in sorted(need.items(), key=lambda t: -t[1])]
+        return rho, [i for i, _ in sorted(need.items(), key=lambda t: -t[1])], kids
 
     # -- values ----------------------------------------------------------------------------------
 
@@ -227,33 +230,37 @@ class BestMove:
         e = self.e
         t0 = time.perf_counter()
         start_exp = e.stats["expanded"]
+        start_ev = e.stats["evaluations"]
         self._reset_if_moved()
         last_info = t0
         k = max(self.completed) + 1 if self.completed else 0
         if on_info is not None:                         # provisional lines from what is known
-            rho, _ = self.rho(theta(k))
+            rho, _, _ = self.rho(theta(k))
             on_info(self.result(t0, start_exp, self.depth_result(k, theta(k), rho, False, t0), provisional=True))
         while True:
             th = theta(k)
             while True:
-                rho, need = self.rho(th)
+                rho, need, kids = self.rho(th)
+                if kids:
+                    e._materialize(kids)                # no model calls; then the horizon grows from them
+                    continue
                 if not need:
                     break
                 if stop is not None and stop.is_set():
                     break
                 if seconds is not None and time.perf_counter() - t0 >= seconds:
                     break
-                if nodes is not None and e.stats["expanded"] - start_exp >= nodes:
+                if nodes is not None and e.stats["evaluations"] - start_ev >= nodes:
                     break
                 for s in range(0, len(need), e.s.batch):
-                    e._expand(need[s : s + e.s.batch])
+                    e._evaluate(need[s : s + e.s.batch])
                     if stop is not None and stop.is_set():
                         break
                     if on_info is not None and time.perf_counter() - last_info >= info_every:
-                        r_, _ = self.rho(th)
+                        r_, _, _ = self.rho(th)
                         on_info(self.result(t0, start_exp, self.depth_result(k, th, r_, False, t0)))
                         last_info = time.perf_counter()
-                    if nodes is not None and e.stats["expanded"] - start_exp >= nodes:
+                    if nodes is not None and e.stats["evaluations"] - start_ev >= nodes:
                         break
                     if seconds is not None and time.perf_counter() - t0 >= seconds:
                         break
@@ -267,7 +274,7 @@ class BestMove:
                 last_info = time.perf_counter()
             k += 1
             if (stop is not None and stop.is_set()) or (seconds is not None and time.perf_counter() - t0 >= seconds) \
-                    or (nodes is not None and e.stats["expanded"] - start_exp >= nodes) \
+                    or (nodes is not None and e.stats["evaluations"] - start_ev >= nodes) \
                     or (depth is not None and k > depth) or theta(k) < 1e-9:
                 return self.result(t0, start_exp, d)
 

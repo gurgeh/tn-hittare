@@ -150,3 +150,22 @@ def test_uci_bestmove_mode():
         assert res.move in b.legal_moves
     finally:
         eng.quit()
+
+
+def test_valued_positions_get_children_only_inside_and_values_do_not_care():
+    from tnh.engine.chess_eval import ChessEvaluator, FakeBundle
+    C4 = "c2c4 g8f6 g2g3 e7e6 f1g2 d7d5".split()
+    eng = Engine(ChessEvaluator({"fake": FakeBundle()}), Settings(tempo="fake", my_side="white", mode="bestmove"))
+    eng.set_position(C4)
+    eng.search(depth=5)
+    g = eng.graph
+    valued_only = [n.id for n in g.nodes if n.info.get("valued") and n.children is None]
+    assert valued_only                                    # evaluated for their value, no children made
+    assert len(g.nodes) < 30 * sum(1 for n in g.nodes if n.children is not None) + 100
+    before = {k: (d.value, dict(d.root_values)) for k, d in eng.bm.completed.items()}
+    eng._materialize(valued_only)                         # give them children anyway
+    eng.bm.completed = {}
+    eng.bm._key = None
+    eng.search(depth=5)
+    for k, (v, rv) in before.items():
+        assert eng.bm.completed[k].value == v and eng.bm.completed[k].root_values == rv
