@@ -95,8 +95,7 @@ def walk_paths(db: EdgeDB, targets: np.ndarray) -> tuple[dict[int, list[str]], d
         keys = [k for k in keys if k not in parents and k != START]
         if not keys:
             return
-        rows = db._parents.rows(np.array(keys, np.uint64), ["child_hash", "pos_hash", "move", "n"])
-        rows = rows.sort(["child_hash", "n", "pos_hash"], descending=[False, True, False])
+        rows = db.parents_many(keys, with_epd=False)   # sorted by child, then games, most first
         for (c,), g in rows.group_by(["child_hash"], maintain_order=True):
             parents[int(c)] = list(zip(g["pos_hash"].to_list(), g["move"].to_list()))
         for k in keys:
@@ -155,7 +154,7 @@ def build(db: EdgeDB, edges: pl.LazyFrame, *, min_games: int, bands: tuple[int, 
             "positions_with_at_least": {str(k): int((inc["n"] >= k).sum()) for k in counts_at}}
     s = inc.filter(pl.col("n") >= min_games)
     hashes = s["pos_hash"]
-    tot = db._pos.rows(hashes.to_numpy(), ["pos_hash", "epd", "n"]).rename({"n": "total_n"})
+    tot = db.totals_many(hashes.to_list()).select("pos_hash", "epd", pl.col("n").alias("total_n"))
     missing = s.height - tot.height
     if missing:
         raise RuntimeError(f"{missing} positions with edges into them are not in pos_index")

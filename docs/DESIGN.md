@@ -498,5 +498,5 @@ Measured 2026-11-12 on the 2024+ table: between-position SD 0.010 (at least
 the side to move is the only measure that held on new positions, 0.008 between
 the extreme tenths.
 
-Still private: step 2 reads `EdgeDB._parents.rows` and `EdgeDB._pos.rows`. A
-public batched `parents_many` is to replace that.
+Step 2 reads the tables through the public batched readers `parents_many` and
+`totals_many`.
