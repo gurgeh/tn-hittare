@@ -105,10 +105,127 @@ def position_list(rows: list[dict], measure: str) -> list[str]:
     return out
 
 
+REGISTERED = [("H1", "maia_value", "primary"), ("H2", "el_stm", ""), ("H3", "hard_stm", ""), ("H4", "maia_value_eq", "")]
+
+
+def call(c: dict) -> str:
+    if c["lo"] > 0:
+        return "confirmed"
+    if c["hi"] < 0:
+        return "contradicted"
+    return "not confirmed"
+
+
+def confirmation_verdict(cf: dict) -> list[str]:
+    r = cf["all"]["measures"]
+    parts = [f"{h} ({NAMES[m]}): **{call(r[m]['tenths']['diff'])}**, top - bottom tenth "
+             f"{f(r[m]['tenths']['diff'], 4)}" for h, m, _ in REGISTERED if m in r]
+    return [f"**Confirmation on {cf['all']['positions']} positions with 50-99 games, none in the first run, "
+            f"hypotheses registered before the run:** " + "; ".join(parts) + "."]
+
+
+def confirmation_section(cf: dict, h4_old: dict | None, first: dict, runs: list[dict], n_2049: int | None) -> list[str]:
+    r = cf["all"]
+    L = ["## Confirmation on positions with 50-99 games (registered)", "",
+         "Registered by the coordinator before any number from this set existed. Same pipeline, budgets, baseline, "
+         "folds, family clusters and seed as the first run; Maia-3 23m on CPU. The statistic for each hypothesis: "
+         "the top tenth minus the bottom tenth of the held-out baseline residual (real score minus prediction, "
+         "points per game, positive = favours White as the measure says), with its 95 % family-bootstrap interval. "
+         "Confirmed = interval above zero, contradicted = below zero.", "",
+         f"Set: {cf['set_info']['positions']} positions; analysed {r['positions']} in {r['families']} families "
+         f"({cf['frame']['above_family_ply']} above ply {cf['family_ply']}, {cf['frame']['dropped_not_finite']} "
+         f"lacking a value); model-call gaps {cf['measure_counts']}. tau2 = {r['tau2']:.2e}, baseline error "
+         f"{r['mse_base']:.3e}, noise {r['noise_mse']:.3e}.", "",
+         "| | measure | verdict | top - bottom tenth | held-out share of excess (%) | in-sample beta |",
+         "|---|---|---|---|---|---|"]
+    for h, m, note in REGISTERED:
+        if m not in r["measures"]:
+            L.append(f"| {h} | {NAMES[m]} | not computed | | | |")
+            continue
+        v = r["measures"][m]
+        L.append(f"| {h}{' (primary)' if note else ''} | {NAMES[m]} | {call(v['tenths']['diff'])} | "
+                 f"{f(v['tenths']['diff'], 4)} | {f(v['share'], 2, 100)} | {f(v['beta'], 3)} |")
+    L += ["", "Everything else from this set is exploratory. All measures, same columns as the first run:", ""]
+    L += measure_table(r)
+    if h4_old is not None:
+        o = h4_old["all"]["measures"]
+        L += ["", f"Exploratory, on the first run's n >= 100 set (already looked at): H4 beside the old value head "
+                  f"({h4_old['all']['positions']} positions).", "",
+              "| measure | top - bottom tenth | held-out share of excess (%) | in-sample beta |", "|---|---|---|---|"]
+        for m in ("maia_value", "maia_value_eq"):
+            if m in o:
+                L.append(f"| {NAMES[m]} | {f(o[m]['tenths']['diff'], 4)} | {f(o[m]['share'], 2, 100)} | {f(o[m]['beta'], 3)} |")
+    if r.get("splits"):
+        L += ["", "Exploratory splits on the confirmation set:", ""] + split_tables(r)
+    for run in runs:
+        L.append(f"- Compute run: {run['positions_done']} positions in {run['wall'] / 60:.0f} min, calls {run['stats']}, "
+                 f"seconds {run['seconds']}, peak RSS {run['peak_rss_mb']} MB.")
+    if runs and n_2049:
+        run = runs[-1]
+        per = run["wall"] / run["positions_done"]
+        L.append(f"- Estimate for the 20-49 stratum ({n_2049:,} positions) at this run's rate ({per:.2f} s per "
+                 f"position, one core, with this run's cache hit rate): about {per * n_2049 / 3600:.1f} h. Not run.")
+    return L
+
+
+def ceiling_section(ce: dict) -> list[str]:
+    L = ["## The ceiling: how much do positions differ at all?", "",
+         f"No model calls. All positions with at least 20 classical games in the band (`{ce['tag']}`), split by their "
+         f"number of games. Baseline: rating terms only ({', '.join(ce['rating_base'])}), fitted per stratum. tau = "
+         f"the between-position SD of White's score left after it (points per game), by moments, 95 % interval from a "
+         f"bootstrap over opening families (first {ce['family_ply']} plies; {ce['above_family_ply']} shallower positions "
+         f"left out). Positions in different strata are nested in each other; within a stratum they can be too.", "",
+         "| games | positions | families | tau | noise SD of one position | true edge > 1 / 2 / 3 points per 100 games "
+         "(normal prior) | tail check: share of |z| > 2 / > 3 (normal: 4.55 % / 0.27 %) |",
+         "|---|---|---|---|---|---|---|"]
+    for k, v in ce["strata"].items():
+        sh = v["share_true_edge_above"]
+        L.append(f"| {k} | {v['positions']} | {v['families']} | {v['tau']:.4f} [{v['tau_lo']:.4f}, {v['tau_hi']:.4f}] | "
+                 f"{v['mean_noise_sd']:.3f} | {sh['1'] * 100:.1f} % / {sh['2'] * 100:.1f} % / {sh['3'] * 100:.1f} % | "
+                 f"{v['z_above_2'] * 100:.2f} % / {v['z_above_3'] * 100:.2f} % |")
+    L += ["", "Quantiles of the shrunken edges (points per 100 games; shrinkage pulls them toward zero, most where the "
+              "noise is largest):", "", "| games | 1 % | 5 % | 25 % | 50 % | 75 % | 95 % | 99 % | share with |shrunken| > 1 / 2 / 3 |",
+          "|---|---|---|---|---|---|---|---|---|"]
+    for k, v in ce["strata"].items():
+        q = v["shrunk_quantiles"]
+        a = v["share_shrunk_above"]
+        L.append(f"| {k} | " + " | ".join(f"{q[x]:+.2f}" for x in ("0.01", "0.05", "0.25", "0.5", "0.75", "0.95", "0.99"))
+                 + f" | {a['1'] * 100:.1f} % / {a['2'] * 100:.1f} % / {a['3'] * 100:.1f} % |")
+    ev = ce["engine_vs_ratings"]
+    ro, en = ev["ratings only"], ev["engine + ratings"]
+    L += ["", f"On the first run's frame (n >= 100, {ro['positions']} positions), same positions:", "",
+          "| baseline | tau |", "|---|---|",
+          f"| ratings only | {ro['tau']:.4f} [{ro['tau_lo']:.4f}, {ro['tau_hi']:.4f}] |",
+          f"| engine + ratings | {en['tau']:.4f} [{en['tau_lo']:.4f}, {en['tau_hi']:.4f}] |", "",
+          f"The engine terms remove {(1 - en['tau'] ** 2 / ro['tau'] ** 2) * 100:.0f} % of the between-position variance "
+          f"that the rating terms leave.", ""]
+    li = ce["list"]
+    L += [f"### The {len(li['rows'])} largest shrunken edges, one per line", "",
+          f"Pool: positions whose 95 % posterior interval excludes zero ({li['pool']}). A position is dropped when a "
+          f"deeper position on its path is in the pool with the same sign ({li['after_dedupe']} left). Edge = real "
+          f"score minus the rating-only baseline, shrunk, in points per game for White; the engine value is White's, "
+          f"from the 200k-node root search where it was run (n >= 100 and the 50-99 set).", "",
+          "| # | line | games | stratum | White's score | ratings W/B | shrunken edge [95 %] | raw edge | engine cp |",
+          "|---|---|---|---|---|---|---|---|---|"]
+    for i, r in enumerate(li["rows"], 1):
+        cp = "" if r["cp_white"] is None else f"{r['cp_white']:+.0f}"
+        L.append(f"| {i} | {r['san']} | {r['n']} | {r['stratum']} | {r['y']:.3f} | {r['white_elo']:.0f}/{r['black_elo']:.0f} | "
+                 f"{r['edge']:+.3f} [{r['lo']:+.3f}, {r['hi']:+.3f}] | {r['raw']:+.3f} | {cp} |")
+    L += ["", "EPDs, in the same order:", "", "```"] + [f"{i:2d} {r['epd']}" for i, r in enumerate(li["rows"], 1)] + ["```", ""]
+    return L
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tag", default="dev_n100")
+    ap.add_argument("--confirm-tag", default="dev_n50to99")
+    ap.add_argument("--ceiling-tag", default="dev_n20")
+    ap.add_argument("--h4-label", default="_h4")
     a = ap.parse_args(argv)
+    load = lambda name: json.loads((RESULTS / name).read_text()) if (RESULTS / name).exists() else None
+    cf = load(f"analysis_{a.confirm_tag}.json")
+    ce = load(f"ceiling_{a.ceiling_tag}.json")
+    h4_old = load(f"analysis_{a.tag}{a.h4_label}.json")
     an = json.loads((RESULTS / f"analysis_{a.tag}.json").read_text())
     syn_p = RESULTS / "synth.json"
     syn = json.loads(syn_p.read_text()) if syn_p.exists() else None
@@ -118,12 +235,25 @@ def main(argv: list[str] | None = None) -> None:
     L = [f"# Step 2: do difficulty measures explain real results beyond the engine?", "",
          f"Generated by `uv run python -m tnh.difficulty report --tag {a.tag}` on "
          f"{dt.datetime.now():%Y-%m-%d %H:%M} from `{RESULTS}`.", "", "## Answer", ""]
+    L.append(f"First run, {res['positions']} positions with at least 100 games:")
     L += verdict(res) + [""]
     if "leaves" in an:
         L.append("Only the positions where the line ends in the set (no child with enough games; their games do not "
                  "overlap): " + " ".join(verdict(an["leaves"])[:2]))
         L.append("")
-    L += ["## What was measured", "",
+    if cf is not None:
+        L += confirmation_verdict(cf) + [""]
+    if ce is not None:
+        L += ceiling_section(ce)
+    if cf is not None:
+        cruns = [json.loads(p.read_text()) for p in sorted((OUT / "runs").glob(f"compute_{a.confirm_tag}_*.json"))]
+        si20 = OUT / f"positions_{a.ceiling_tag}.json"
+        n2049 = None
+        if si20.exists():
+            c20 = json.loads(si20.read_text())["positions_with_at_least"]
+            n2049 = c20["20"] - c20["50"]
+        L += confirmation_section(cf, h4_old, res, cruns, n2049) + [""]
+    L += ["## First run (n >= 100): what was measured", "",
           f"- Edge tables `{si['name']}` (games dated 2024 or later). Games: tempo `{si['tempo']}`, `elo_band` "
           f"{si['bands'][0]}-{si['bands'][1]} (mean of the two ratings floored to 200, so means 1800-2599).",
           f"- Positions reached by at least N such games: "
