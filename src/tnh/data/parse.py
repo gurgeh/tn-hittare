@@ -708,7 +708,8 @@ def king_signal_counts(games: pl.DataFrame, extra: pl.DataFrame) -> dict:
     }
 
 
-def build(sources: list[str], workers: int, limit_files: int | None, merge_near_copies: bool = True) -> None:
+def build(sources: list[str], workers: int, limit_files: int | None, merge_near_copies: bool = True,
+          out_dir: Path | None = None) -> None:
     """Parse every file into a part on disk, plan the de-duplication on the narrow
     columns, then write the kept games part by part. The wide rows (moves,
     clocks) are never all in memory."""
@@ -768,30 +769,48 @@ def build(sources: list[str], workers: int, limit_files: int | None, merge_near_
     drops["duplicate"] += n_dup + info.get("near_copies_removed", {}).get("games_removed", 0)
 
     # write the kept games part by part
-    CORPUS.mkdir(parents=True, exist_ok=True)
+    out_dir = out_dir or CORPUS
+    out_dir.mkdir(parents=True, exist_ok=True)
     writers: dict[str, pq.ParquetWriter] = {}
-    outs = {"games": CORPUS / "games.parquet", "extra": CORPUS / "games_extra.parquet"}
+    outs = {"games": out_dir / "games.parquet", "extra": out_dir / "games_extra.parquet"}
     planned = planned.with_columns((pl.col("_id") // (1 << 32)).alias("_part"))
     counts = {"source": Counter(), "tempo": Counter(), "split": Counter(), "cut": Counter(), "strip": Counter()}
+    # games.parquet is sorted by game_id (readers rely on it to skip row groups): the kept rows of
+    # each part go to 256 buckets on the first two hex digits of game_id, and each bucket is sorted
+    # and appended in turn, so one bucket at a time is in memory
+    bdir = work.parent / "buckets"
+    if bdir.exists():
+        shutil.rmtree(bdir)
     for part_path in parts:
         part = int(part_path.stem.split("-")[1])
         g, e = apply_plan(pl.read_parquet(part_path), planned.filter(pl.col("_part") == part).drop("_part"))
         _drop_cache(part_path)
+        b = g["game_id"].str.slice(0, 2)
         for key, df in (("games", g), ("extra", e)):
-            t = df.to_arrow()
-            if key not in writers:
-                writers[key] = pq.ParquetWriter(str(outs[key]) + ".tmp", t.schema, compression="zstd")
-            writers[key].write_table(t, row_group_size=100_000)
+            df = df.with_columns(_b=b)
+            for (bk,), sub in df.partition_by("_b", as_dict=True).items():
+                d = bdir / key / bk
+                d.mkdir(parents=True, exist_ok=True)
+                sub.drop("_b").write_parquet(d / f"p{part:05d}.parquet", compression="lz4")
+                _drop_cache(d / f"p{part:05d}.parquet")
         counts["source"].update(g["source"].to_list())
         counts["tempo"].update(g["tempo"].to_list())
         counts["split"].update(g["split"].to_list())
         counts["cut"].update(g.filter(e["cut_illegal_central_king"])["source"].to_list())
         counts["strip"].update(g.filter(e["stripped_central_king_moves"] > 0)["source"].to_list())
+    for key in ("games", "extra"):
+        for d in sorted((bdir / key).iterdir()) if (bdir / key).exists() else []:
+            df = pl.read_parquet(d / "*.parquet").sort("game_id")
+            t = df.to_arrow()
+            if key not in writers:
+                writers[key] = pq.ParquetWriter(str(outs[key]) + ".tmp", t.schema, compression="zstd")
+            writers[key].write_table(t, row_group_size=100_000)
     for key, w in writers.items():
         w.close()
         Path(str(outs[key]) + ".tmp").replace(outs[key])
         _drop_cache(outs[key])
     shutil.rmtree(work)
+    shutil.rmtree(bdir, ignore_errors=True)
     n_kept = planned.height
     for name, n in kept_before.iter_rows():
         # copies of this source's games that lost to a copy from this or another source
@@ -814,7 +833,7 @@ def build(sources: list[str], workers: int, limit_files: int | None, merge_near_
         **info,
         "seconds": round(time.time() - t0),
     }
-    (CORPUS / "parse_stats.json").write_text(json.dumps(stats, indent=1, ensure_ascii=False))
+    (out_dir / "parse_stats.json").write_text(json.dumps(stats, indent=1, ensure_ascii=False))
     print(f"read {n_read} games, kept {n_kept} in {stats['tournaments']} tournaments, {time.time() - t0:.0f} s")
     print("dropped:")
     for reason, n in drops.most_common():
@@ -828,10 +847,11 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--sources", default=",".join(SOURCES), help="comma-separated source names (default: all)")
     ap.add_argument("--workers", type=int, default=2, help="parser processes (default 2; see AGENTS.md on the CPU budget)")
     ap.add_argument("--no-merge-near-copies", action="store_true", help="keep near copies as separate games (measurement)")
+    ap.add_argument("--out", type=Path, default=None, help="output directory (default: corpus/)")
     ap.add_argument("--limit-files", type=int, default=None, help="only the first K files per source (testing)")
     args = ap.parse_args(argv)
 
-    build(args.sources.split(","), args.workers, args.limit_files, not args.no_merge_near_copies)
+    build(args.sources.split(","), args.workers, args.limit_files, not args.no_merge_near_copies, args.out)
 
 
 if __name__ == "__main__":

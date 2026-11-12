@@ -108,15 +108,20 @@ def move_times(clocks: list[int | None] | None, tc_raw: str | None, tempo_source
     return out
 
 
-def process_chunk(args: tuple[int, str, int, str, list[str]]) -> tuple[int, int, int, int]:
+def process_chunk(args: tuple) -> tuple[int, int, int, int]:
     """Worker: replay one row group of the input games.
 
     Writes the rows to a part file, and the positions reached by the chunk's
     counted games (each game once per position) as sorted unique hashes with
     their count and source: ``hashes/c<idx>_{keys,counts,src}.npy``.
     Returns (chunk, rows, rows with a clock but no move time, peak MB).
+
+    ``args`` is (chunk, input path, max_ply, parts dir[, sources]); without
+    ``sources`` (the four-element form ``tnh.eval.sample`` uses to rebuild
+    rows) the source codes are the sorted sources of the chunk.
     """
-    idx, input_path, max_ply, parts_dir, sources = args
+    idx, input_path, max_ply, parts_dir = args[:4]
+    sources = args[4] if len(args) > 4 else None
     table = pq.ParquetFile(input_path).read_row_group(idx)
     cols = {c: table.column(c).to_pylist() for c in table.column_names}
     hashes: dict[str, list[np.ndarray]] = {}
@@ -170,6 +175,8 @@ def process_chunk(args: tuple[int, str, int, str, list[str]]) -> tuple[int, int,
     part_path = Path(parts_dir) / f"part-{idx:05d}.parquet"
     part.write_parquet(part_path)
     _drop_cache(part_path)
+    if sources is None:
+        sources = sorted(hashes)
     keys_l, counts_l, src_l = [], [], []
     for si, src in enumerate(sources):
         if src in hashes:
@@ -180,6 +187,7 @@ def process_chunk(args: tuple[int, str, int, str, list[str]]) -> tuple[int, int,
     keys = np.concatenate(keys_l) if keys_l else np.empty(0, np.uint64)
     order = np.argsort(keys, kind="stable")
     hdir = Path(parts_dir) / "hashes"
+    hdir.mkdir(exist_ok=True)
     for name, arr in (("keys", keys[order]),
                       ("counts", (np.concatenate(counts_l) if counts_l else np.empty(0, np.uint32))[order]),
                       ("src", (np.concatenate(src_l) if src_l else np.empty(0, np.uint8))[order])):
