@@ -179,6 +179,7 @@ class Engine:
         self.since_solve = 0
         self.root_moves: list[str] = []
         self.history: list[tuple[int, float, float]] = []
+        self.transposed: list = []              # (first path's position, another path's) for the history check
         self.eval_since_solve = 0.0
         self.last_solve_seconds = 0.0
         self.cap_mu: float | None = None
@@ -191,6 +192,8 @@ class Engine:
         hit = self.graph.get(k, ply)
         if hit is not None:
             self.stats["transpositions merged"] += 1
+            if len(self.transposed) < 400 and self.pos[hit.id] is not pos:
+                self.transposed.append((self.pos[hit.id], pos))
             return hit
         n = self.graph.add(k, ply, True, [], value=math.nan)
         n.moves = PENDING

@@ -117,10 +117,12 @@ def _boards(graph: Graph, root_moves: list[str]) -> Callable[[Node], chess.Board
 
 def export(game: Game, sols: list[Solution], budgets: list[int], *, root_moves: list[str], meta: dict,
            forced: dict[str, list[Solution]] | None = None, games: Callable[[Node], int] = lambda n: 0,
-           obvious: float | None = None) -> dict:
-    """The `result.json` object for a solved game (see the module docstring)."""
+           obvious: float | None = None, board_of: Callable[[Node], chess.Board | None] | None = None,
+           ply_offset: int = 0) -> dict:
+    """The `result.json` object for a solved game (see the module docstring). `board_of` and
+    `ply_offset` are for graphs whose nodes carry absolute plies and no paths (the engine's)."""
     g = game.graph
-    board = _boards(g, root_moves)
+    board = board_of or _boards(g, root_moves)
     per = {N: (game.values(sols[N].learned), game.reach(sols[N].learned), sols[N].learned) for N in budgets}
     reach_any = np.zeros(len(g.nodes))
     for _, R, _ in per.values():
@@ -155,7 +157,7 @@ def export(game: Game, sols: list[Solution], budgets: list[int], *, root_moves: 
             state = "frontier"
         rec = {
             "epd": b.epd() if b is not None else None,
-            "ply": n.ply,
+            "ply": n.ply - ply_offset,
             "to_move": "me" if n.me_to_move else "opp",
             "games": int(games(n)),
             "state": state,
