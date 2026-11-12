@@ -57,7 +57,8 @@ def test_off_reproduces_the_values_before_the_correction():
         eng.search(nodes=300)
         assert eng.last.net == before[f"priced/{P}"]["net"]
         eng = Engine(ChessEvaluator({"fake": FakeBundle()}), Settings(tempo="fake", my_side="white", mode="bestmove",
-                                                                      prepared=P, mistake_fix="off"))
+                                                                      prepared=P, mistake_fix="off",
+                                                                      widen=0.0, reduce_margin=0.0))
         eng.set_position(C4)
         eng.search(depth=6)
         for k, d in eng.bm.completed.items():

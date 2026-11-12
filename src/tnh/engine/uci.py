@@ -40,6 +40,10 @@ This docstring is the contract for a GUI (the web page's engine section).
 | MultiPV | spin | 3 | 1-20 | lines shown |
 | Mode | combo | repertoire | repertoire, bestmove | repertoire: the priced repertoire search (PUCT, learning costs); bestmove: plain expectimax to a reach horizon, deepened step by step, values a function of the models only (`tnh.engine.bestmove`). In bestmove Price, Cap and Obvious are ignored |
 | Alpha | string (float) | 1 | >= 0 | bestmove: my candidates' horizon weight (P / max P) ** Alpha below the root; 0 = every candidate as deep as my top one |
+| Widen | string (float) | 4 | >= 0 | bestmove: below the root a candidate of mine is looked at only if its horizon weight rho * (P / max P) ** Alpha is at least theta / Widen, so a position just inside the horizon looks at its top one or two candidates and one far inside at many; the top candidate always. 0 = every candidate. On c4 (2026-11-12) 15 % fewer evaluations, values within 0.001 of 0 |
+| ReduceMargin | string (float) | 0.03 | >= 0 | bestmove: below the root a candidate of mine more than this below the position's best candidate at the previous completed depth gets its horizon weight times ReducePenalty for the next depth (a reduction, not a cut). 0 = off. With Widen 4 on c4: 28 % fewer evaluations than full width, values within 0.002 |
+| ReducePenalty | string (float) | 0.5 | 0-1 | bestmove: the factor of ReduceMargin |
+| HisAnchor | check | false | true, false | bestmove, experimental: at his positions only the replies inside the horizon are evaluated and the rest stay at the position's static value. 15-19 times fewer evaluations, but on c4 the values come out about 0.04 higher at depth 12 and drift upward twice as fast with depth, because the static value of his positions is on average 0.003 better for me than the expectation over his replies' static values |
 | CPuct | string (float) | 1.5 | > 0 | PUCT exploration at my moves |
 | PolicyWeight | string (float) | 0.5 | 0-1 | Lc0's raw policy in my prior (the rest is my move model) |
 | PriorMin | string (float) | 0.002 | 0-1 | safety net: a move with a smaller prior is not a candidate |
@@ -134,6 +138,10 @@ OPTIONS = {
     "MultiPV": ("lines", int, "type spin default 3 min 1 max 20"),
     "Mode": ("mode", str, "type combo default repertoire var repertoire var bestmove"),
     "Alpha": ("alpha", float, "type string default 1"),
+    "Widen": ("widen", float, "type string default 4"),
+    "ReduceMargin": ("reduce_margin", float, "type string default 0.03"),
+    "ReducePenalty": ("reduce_penalty", float, "type string default 0.5"),
+    "HisAnchor": ("his_anchor", "check", "type check default false"),
     "CPuct": ("c_puct", float, "type string default 1.5"),
     "PolicyWeight": ("policy_weight", float, "type string default 0.5"),
     "PriorMin": ("prior_min", float, "type string default 0.002"),
@@ -272,7 +280,12 @@ class UCI:
         field, typ, _ = OPTIONS[name]
         if field == "my_side" and value == "tomove":
             value = "to_move"
-        self.engine.set_settings(**{field: typ(value)})
+        if typ == "check":
+            if value.lower() not in ("true", "false"):
+                raise ValueError(f"{name} takes true or false, got {value!r}")
+            self.engine.set_settings(**{field: value.lower() == "true"})
+        else:
+            self.engine.set_settings(**{field: typ(value)})
         if field == "tempo":
             self.loaded = False
 

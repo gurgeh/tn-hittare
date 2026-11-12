@@ -29,17 +29,19 @@ settings only: neither extra positions in the graph nor the order of expansion c
 horizon and every relevant child of one (my candidates, all his moves) has been
 evaluated; its values are then final. Evaluations and the graph are the priced mode's.
 
-**Experiment switches** (Settings; off by default, not in UCI). Each keeps a value at a depth a
-function of the models, the settings and the earlier completed depths:
+**Selectivity** (Settings and UCI; B and C on by default since 2026-11-12, A off). Each keeps a
+value at a depth a function of the models, the settings and the earlier completed depths:
 
-- A, `his_anchor`: at an inside position of his only the replies inside the horizon (rho >= theta,
+- A, `his_anchor` (experimental, off): at an inside position of his only the replies inside the horizon (rho >= theta,
   "searched") are evaluated, and
   `V(n) = (1 - Prepared) * (s(n) + sum_searched q_a (V(child_a) - s(child_a))) + Prepared * min_searched V(child_a)`,
   s the static value, V(n) = s(n) with no searched reply. MistakeFix's best move is the searched
-  reply with the highest static value for him (the other replies have no value).
-- B, `widen` = beta > 0: at an inside position of mine with weight rho (not the root) candidate a
+  reply with the highest static value for him (the other replies have no value). Measured on
+  c4 (2026-11-12): values +0.04 at depth 12 against full width, since the static value of his
+  positions is on average 0.003 better for me than the expectation over his replies' static values.
+- B, `widen` = beta > 0 (default 4): at an inside position of mine with weight rho (not the root) candidate a
   only if rho * w_a >= theta / beta, w_a its horizon factor; the top candidate always.
-- C, `reduce_margin` > 0: at depth k, a candidate of mine (not at the root) whose value at depth
+- C, `reduce_margin` > 0 (default 0.03, `reduce_penalty` 0.5): at depth k, a candidate of mine (not at the root) whose value at depth
   k - 1 was more than the margin below the best candidate's there gets its horizon factor times
   `reduce_penalty`.
 """

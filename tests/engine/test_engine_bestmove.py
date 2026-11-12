@@ -17,8 +17,9 @@ INF = float("inf")
 
 
 def settings(**kw):
+    """Everything off (full width) unless a test turns it on."""
     return Settings(**{"my_side": "white", "kappa": INF, "mix": "kappa", "mode": "bestmove", "mistake_fix": "off",
-                       "prior_min": 0.02,
+                       "prior_min": 0.02, "widen": 0.0, "reduce_margin": 0.0, "his_anchor": False,
                        "blunder": 0.3, "alpha": 1.0, **kw})
 
 
@@ -249,7 +250,8 @@ def reference_switches(g, ev, s, th, prev_mine):
     return V(g.root), {m: V(c) for m, c in zip(root.moves, root.children)}, mine
 
 
-SWITCHES = [dict(his_anchor=True), dict(widen=2.0), dict(widen=4.0), dict(his_anchor=True, widen=4.0),
+SWITCHES = [dict(widen=4.0, reduce_margin=0.03, reduce_penalty=0.5),        # the defaults
+            dict(his_anchor=True), dict(widen=2.0), dict(widen=4.0), dict(his_anchor=True, widen=4.0),
             dict(his_anchor=True, widen=4.0, reduce_margin=0.03, reduce_penalty=0.5),
             dict(reduce_margin=0.02, reduce_penalty=0.3)]
 
@@ -313,10 +315,41 @@ def test_switches_cut_evaluations_on_the_fake_c4_position():
     from tnh.engine.chess_eval import ChessEvaluator, FakeBundle
     C4 = "c2c4 g8f6 g2g3 e7e6 f1g2 d7d5".split()
     ev = {}
-    for name, sw in (("today", {}), ("A", dict(his_anchor=True)), ("B", dict(widen=2.0))):
+    for name, sw in (("today", dict(widen=0.0, reduce_margin=0.0)), ("A", dict(his_anchor=True, widen=0.0, reduce_margin=0.0)),
+                     ("B", dict(widen=2.0, reduce_margin=0.0))):
         eng = Engine(ChessEvaluator({"fake": FakeBundle()}),
                      Settings(tempo="fake", my_side="white", mode="bestmove", **sw))
         eng.set_position(C4)
         eng.search(depth=5)
         ev[name] = eng.stats["evaluations"]
     assert ev["A"] < ev["today"] and ev["B"] <= ev["today"]
+
+
+def test_defaults_are_widen_4_and_reduce_and_match_the_reference():
+    s = Settings()
+    assert (s.widen, s.reduce_margin, s.reduce_penalty, s.his_anchor) == (4.0, 0.03, 0.5, False)
+    g = random_game(np.random.default_rng(11), depth=7, branching=(2, 3))
+    ev = SynthEvaluator(g)
+    d = Settings()
+    st = settings(widen=d.widen, reduce_margin=d.reduce_margin, reduce_penalty=d.reduce_penalty)
+    eng = Engine(ev, st)
+    eng.search(depth=8)
+    prev = {}
+    for k in sorted(eng.bm.completed):
+        v, _, mine = reference_switches(g, ev, st, theta(k), prev)
+        assert eng.bm.completed[k].value == pytest.approx(v, abs=1e-12)
+        prev = mine
+
+
+def test_uci_declares_the_selectivity_options():
+    eng = chess.engine.SimpleEngine.popen_uci([sys.executable, "-m", "tnh.engine.uci", "--fake"])
+    try:
+        o = eng.options
+        assert o["Widen"].default == "4" and o["ReduceMargin"].default == "0.03" and o["ReducePenalty"].default == "0.5"
+        assert o["HisAnchor"].type == "check" and o["HisAnchor"].default is False
+        eng.configure({"Mode": "bestmove", "HisAnchor": True, "Widen": "0", "ReduceMargin": "0", "Side": "white"})
+        b = chess.Board()
+        res = eng.play(b, chess.engine.Limit(nodes=50))
+        assert res.move in b.legal_moves
+    finally:
+        eng.quit()
