@@ -873,20 +873,28 @@ def cmd_check_live(a) -> None:
     t = time.perf_counter()
     preds = model.predict(qs)
     dt_ = time.perf_counter() - t
-    worst, ll_live, ll_off = 0.0, [], []
+    worst, worst_p, worst_big, ll_live, ll_off = 0.0, 0.0, 0.0, [], []
+    worst_at = None
     moves_all = D.moves.to_list()
     played = s.get_column("played_uci").to_list()
-    for p, i, pl_ in zip(preds, idx, played):
+    for q, p, i, pl_ in zip(qs, preds, idx, played):
         ms_off = moves_all[i]
         off = lp_off[D.offsets[i]:D.offsets[i + 1]]
         o = {m: x for m, x in zip(ms_off, off)}
-        worst = max(worst, max(abs(float(x) - o[m]) for m, x in zip(p.moves, p.logp)))
+        for m, x in zip(p.moves, p.logp):
+            d = abs(float(x) - o[m])
+            if d > worst:
+                worst, worst_at = d, (q.fen, m, float(np.exp(o[m])), float(np.exp(x)))
+            worst_p = max(worst_p, abs(float(np.exp(x)) - float(np.exp(o[m]))))
+            if max(float(np.exp(x)), float(np.exp(o[m]))) >= 0.01:
+                worst_big = max(worst_big, d)
         ll_live.append(-float(p.logp[p.moves.index(pl_)]))
         ll_off.append(-float(o[pl_]))
     w = s.get_column("weight").to_numpy()
     print(f"{len(qs)} test positions in {dt_:.1f} s ({len(qs) / dt_:.1f} positions/s; {dict((k, round(v, 1)) for k, v in model.seconds.items())}): "
-          f"max |log p live - offline| {worst:.4f}; log loss live {np.average(ll_live, weights=w):.4f}, "
-          f"offline {np.average(ll_off, weights=w):.4f}")
+          f"max |log p live - offline| {worst:.4f} (move {worst_at[1]} in {worst_at[0]}: p offline {worst_at[2]:.2e}, live {worst_at[3]:.2e}); "
+          f"over moves with p >= 0.01 {worst_big:.4f}; max |p live - p offline| {worst_p:.4f}; "
+          f"log loss live {np.average(ll_live, weights=w):.4f}, offline {np.average(ll_off, weights=w):.4f}")
 
 
 RULE_MAIN = CONFIGS[MAIN]["rule"]
