@@ -1,21 +1,25 @@
 {
   "rules": {
     "w_elo": {
-      "form": "share_logistic",
+      "form": "share_tbl_hill",
       "params": [
-        -22.344938367352775,
-        15.488894017011383,
-        9.76427227769727,
-        -2.0908829028821274,
-        0.5454901392076605,
-        0.18136301785037065,
-        -0.06409993079190911
+        -29.13483087348435,
+        20.14821244805859,
+        13.327285877484895,
+        -1.4696692716765736,
+        -0.275544257029846,
+        -1.0289034534434922,
+        -1.7898004400107053,
+        -0.9712157727773456,
+        -0.6675761734818455,
+        -0.40478276205077474,
+        1.3690438115105694
       ],
       "spread_scale": 54.58706025035975,
-      "describe": "prior = base -22.3 +15.5 ln share +9.76 ln N; w = logistic(-2.09 +0.55 ln n +0.18 ln N -0.06 ln(1+spread/54.6))",
+      "describe": "prior = base -29.1 +20.1 ln share +13.3 ln N; w by games: 1: 0.19, 2: 0.33, 3: 0.41, 4-5: 0.45, 6-10: 0.55, 11-20: 0.67; above 20: w = n^0.67/(n^0.67+3.93)",
       "provenance": {
         "fitted": "2026-11-12",
-        "commit": "464a9e5",
+        "commit": "ce3c9e8",
         "sample": {
           "table": "full",
           "walks": 3000,
@@ -34,9 +38,9 @@
         "collect": "python -m tnh.web.shrinkfit collect --table full --walks 3000 --seed 7 --tempi classical --split-year 2024 --out <file>",
         "command": "python -m tnh.web.shrinkfit fit --data <collect output> --write-rules",
         "oof_mse": {
-          "mse": 1411.966047501051,
-          "lo": 1189.8211741270634,
-          "hi": 1672.3087788324833
+          "mse": 1416.2826151799254,
+          "lo": 1194.0184349543415,
+          "hi": 1678.265255140345
         },
         "runner_up": "share_hill",
         "lead": {
@@ -47,21 +51,27 @@
       }
     },
     "b_elo": {
-      "form": "share_logistic",
+      "form": "share_tbl_logistic",
       "params": [
-        -24.266391269797136,
-        16.888590960768717,
-        10.73352207397587,
-        -1.3493724216171776,
-        0.561459579575863,
-        0.12202046487863819,
-        -0.5655069234911548
+        -27.55591979967629,
+        23.32296684726851,
+        15.161471142520613,
+        -1.5010882398496197,
+        -0.25360958739398426,
+        -0.9158177743789491,
+        -3.606156492482796,
+        -0.683136196277469,
+        -0.9567220225517782,
+        0.9302905197104245,
+        0.6940964581832793,
+        -0.14731562830650907,
+        -1.5152678885391322
       ],
       "spread_scale": 55.32952105155654,
-      "describe": "prior = base -24.3 +16.9 ln share +10.7 ln N; w = logistic(-1.35 +0.56 ln n +0.12 ln N -0.57 ln(1+spread/55.3))",
+      "describe": "prior = base -27.6 +23.3 ln share +15.2 ln N; w by games: 1: 0.18, 2: 0.33, 3: 0.42, 4-5: 0.43, 6-10: 0.55, 11-20: 0.64; above 20: w = logistic(0.93 +0.69 ln n -0.15 ln N -1.52 ln(1+spread/55.3))",
       "provenance": {
         "fitted": "2026-11-12",
-        "commit": "464a9e5",
+        "commit": "f3b3eff",
         "sample": {
           "table": "full",
           "walks": 3000,
@@ -80,34 +90,40 @@
         "collect": "python -m tnh.web.shrinkfit collect --table full --walks 3000 --seed 7 --tempi classical --split-year 2024 --out <file>",
         "command": "python -m tnh.web.shrinkfit fit --data <collect output> --write-rules",
         "oof_mse": {
-          "mse": 1403.2928692252808,
-          "lo": 1162.6518021195836,
-          "hi": 1669.7442282109876
+          "mse": 1406.7117990350353,
+          "lo": 1164.4300776092493,
+          "hi": 1675.8085325702943
         },
-        "runner_up": "share_hill",
+        "runner_up": "share_tbl_logistic",
         "lead": {
-          "mse": 5.472496765530877,
-          "lo": 2.5462365148534616,
-          "hi": 9.046581776714923
+          "mse": 3.418929809754445,
+          "lo": -0.28040553467801577,
+          "hi": 7.365709111930152
         }
       }
     },
     "chooser": {
-      "form": "share_logistic",
+      "form": "share_tbl_logistic",
       "params": [
-        -2.1364489209611266,
-        15.486785280460785,
-        7.038109082003717,
-        -0.6471484129852942,
-        0.4964033793700993,
-        0.0790799970390707,
-        -0.7197461504435176
+        -42.708184230535515,
+        25.127906336141496,
+        19.65387858764226,
+        -1.1511531315267263,
+        -0.36396347124830397,
+        -1.00136326169063,
+        -1.9315425377700592,
+        -1.073610550622796,
+        -0.9170472361455351,
+        1.5557306342009518,
+        0.6667659670544895,
+        -0.2128166106292991,
+        -1.5282046203306392
       ],
       "spread_scale": 63.912086308926696,
-      "describe": "prior = base -2.14 +15.5 ln share +7.04 ln N; w = logistic(-0.65 +0.50 ln n +0.08 ln N -0.72 ln(1+spread/63.9))",
+      "describe": "prior = base -42.7 +25.1 ln share +19.7 ln N; w by games: 1: 0.24, 2: 0.39, 3: 0.48, 4-5: 0.51, 6-10: 0.60, 11-20: 0.69; above 20: w = logistic(1.56 +0.67 ln n -0.21 ln N -1.53 ln(1+spread/63.9))",
       "provenance": {
         "fitted": "2026-11-12",
-        "commit": "464a9e5",
+        "commit": "f3b3eff",
         "sample": {
           "table": "full",
           "walks": 3000,
@@ -126,34 +142,40 @@
         "collect": "python -m tnh.web.shrinkfit collect --table full --walks 3000 --seed 7 --tempi classical --split-year 2024 --out <file>",
         "command": "python -m tnh.web.shrinkfit fit --data <collect output> --write-rules",
         "oof_mse": {
-          "mse": 1549.9159616864526,
-          "lo": 1298.314074840884,
-          "hi": 1837.7105097265253
+          "mse": 1553.6887166429165,
+          "lo": 1301.1111286461328,
+          "hi": 1841.4437537496494
         },
-        "runner_up": "share_hill",
+        "runner_up": "share_tbl_logistic",
         "lead": {
-          "mse": 5.937719794094846,
-          "lo": 2.830797927004363,
-          "hi": 9.686952622199417
+          "mse": 3.772754956463814,
+          "lo": -0.5388188798752935,
+          "hi": 8.04684698115484
         }
       }
     },
     "gap": {
-      "form": "share_logistic",
+      "form": "share_tbl_logistic",
       "params": [
-        -3.8589586225331196,
-        3.7584994848836866,
-        1.2301243939985385,
-        -1.6089371898721976,
-        0.373571822416941,
-        0.033011178344582864,
-        -0.5665190770994835
+        -3.8997031956966213,
+        3.8110343398824154,
+        1.168018615430409,
+        -2.726910743901495,
+        -0.4484165771680914,
+        -2.7923202728257346,
+        -0.8776145394079637,
+        -0.6468655930063582,
+        -1.037886629843902,
+        -1.0930995726794153,
+        0.28265768578193784,
+        0.026317378455279632,
+        -0.4526844760625832
       ],
       "spread_scale": 38.418866129321934,
-      "describe": "prior = base -3.86 +3.76 ln share +1.23 ln N; w = logistic(-1.61 +0.37 ln n +0.03 ln N -0.57 ln(1+spread/38.4))",
+      "describe": "prior = base -3.9 +3.81 ln share +1.17 ln N; w by games: 1: 0.06, 2: 0.11, 3: 0.12, 4-5: 0.17, 6-10: 0.25, 11-20: 0.32; above 20: w = logistic(-1.09 +0.28 ln n +0.03 ln N -0.45 ln(1+spread/38.4))",
       "provenance": {
         "fitted": "2026-11-12",
-        "commit": "464a9e5",
+        "commit": "f3b3eff",
         "sample": {
           "table": "full",
           "walks": 3000,
@@ -172,31 +194,37 @@
         "collect": "python -m tnh.web.shrinkfit collect --table full --walks 3000 --seed 7 --tempi classical --split-year 2024 --out <file>",
         "command": "python -m tnh.web.shrinkfit fit --data <collect output> --write-rules",
         "oof_mse": {
-          "mse": 519.0537633993305,
-          "lo": 426.68766291470297,
-          "hi": 622.3765435725255
+          "mse": 519.05908122909,
+          "lo": 427.3613823259591,
+          "hi": 622.3085866186677
         },
-        "runner_up": "share_hill",
+        "runner_up": "share_tbl_logistic",
         "lead": {
-          "mse": 0.9907158649853045,
-          "lo": 0.45272392414117063,
-          "hi": 1.6018555173003846
+          "mse": 0.0053178297595195545,
+          "lo": -0.9785387708400919,
+          "hi": 0.8195778498994329
         }
       }
     },
     "score": {
-      "form": "logistic",
+      "form": "tbl_logistic",
       "params": [
-        -3.8454405306779305,
-        0.3183236770256043,
-        0.3032440251679833,
-        0.42139338181004743
+        -2.596420809093728,
+        -0.33455816840747277,
+        -0.9865026147521941,
+        -1.396649842784804,
+        -1.3055329367094002,
+        -0.5394309795131476,
+        -2.9174765890036944,
+        0.17127538096323716,
+        0.2702671329083235,
+        0.5572353765665636
       ],
       "spread_scale": 0.06377193354163133,
-      "describe": "w = logistic(-3.85 +0.32 ln n +0.30 ln N +0.42 ln(1+spread/0.0638))",
+      "describe": "w by games: 1: 0.07, 2: 0.13, 3: 0.18, 4-5: 0.22, 6-10: 0.27, 11-20: 0.40; above 20: w = logistic(-2.92 +0.17 ln n +0.27 ln N +0.56 ln(1+spread/0.0638))",
       "provenance": {
         "fitted": "2026-11-12",
-        "commit": "464a9e5",
+        "commit": "f3b3eff",
         "sample": {
           "table": "full",
           "walks": 3000,
@@ -215,9 +243,9 @@
         "collect": "python -m tnh.web.shrinkfit collect --table full --walks 3000 --seed 7 --tempi classical --split-year 2024 --out <file>",
         "command": "python -m tnh.web.shrinkfit fit --data <collect output> --write-rules",
         "oof_mse": {
-          "mse": 0.0017196661994654165,
-          "lo": 0.001393699925941317,
-          "hi": 0.0021008759328790647
+          "mse": 0.0017244666400344066,
+          "lo": 0.0013975431409359574,
+          "hi": 0.0021063928009718933
         },
         "runner_up": "logistic",
         "lead": {
@@ -228,21 +256,27 @@
       }
     },
     "draw": {
-      "form": "share_logistic",
+      "form": "share_tbl_logistic",
       "params": [
-        0.003424432519268257,
-        0.009628527652614745,
-        0.0009653442221468079,
-        -5.635067993596973,
-        0.4649443190294393,
-        0.34522951165641064,
-        1.1067073157020486
+        0.004421351357060579,
+        0.009555724726585037,
+        0.000673788463467956,
+        -3.0962260849888272,
+        -1.3362922651788987,
+        -1.2310765372655301,
+        -1.0697349061128891,
+        -1.120094563424834,
+        -0.9102791402302418,
+        -4.844214594054295,
+        0.2985451708802555,
+        0.3291760868408144,
+        1.432326981965018
       ],
       "spread_scale": 0.0620250805684785,
-      "describe": "prior = base +0.00342 +0.00963 ln share +0.000965 ln N; w = logistic(-5.64 +0.46 ln n +0.35 ln N +1.11 ln(1+spread/0.062))",
+      "describe": "prior = base +0.00442 +0.00956 ln share +0.000674 ln N; w by games: 1: 0.04, 2: 0.06, 3: 0.07, 4-5: 0.10, 6-10: 0.13, 11-20: 0.19; above 20: w = logistic(-4.84 +0.30 ln n +0.33 ln N +1.43 ln(1+spread/0.062))",
       "provenance": {
         "fitted": "2026-11-12",
-        "commit": "464a9e5",
+        "commit": "f3b3eff",
         "sample": {
           "table": "full",
           "walks": 3000,
@@ -261,15 +295,15 @@
         "collect": "python -m tnh.web.shrinkfit collect --table full --walks 3000 --seed 7 --tempi classical --split-year 2024 --out <file>",
         "command": "python -m tnh.web.shrinkfit fit --data <collect output> --write-rules",
         "oof_mse": {
-          "mse": 0.001879603748904977,
-          "lo": 0.0015210168812623574,
-          "hi": 0.002304234314930321
+          "mse": 0.0018793660204625996,
+          "lo": 0.0015204963205135088,
+          "hi": 0.002304680220171538
         },
-        "runner_up": "share_hill",
+        "runner_up": "share_logistic",
         "lead": {
-          "mse": 5.772182781527786e-06,
-          "lo": 2.8448823057805868e-06,
-          "hi": 9.85811687622149e-06
+          "mse": 2.3772844237731836e-07,
+          "lo": -1.9914659334134163e-06,
+          "hi": 2.269692906078663e-06
         }
       }
     }
