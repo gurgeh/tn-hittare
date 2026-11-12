@@ -460,7 +460,7 @@ def mistake_tables(w, r, kinds, ref_offsets):
     ratio of mass to observed share at the reference offsets."""
     offs = r["offsets"]
     for kind in kinds:
-        if kind not in r:
+        if not isinstance(r.get(kind), dict):     # "glance" and "prior" also name the feature dirs when unused
             continue
         rows = []
         for c, x in r[kind]["pooled"].items():
@@ -488,8 +488,9 @@ def sec_mistakes_extra(w, r, title, note, ref_offsets):
     if not r:
         w("_Not run._\n\n"); return
     t = r["thresholds"]
-    w(f"{note} Shallow `{r['shallow']}`, deep `{r['deep']}`" + (f", at a glance `{r['glance']}`" if r.get("glance") else "")
-      + (f", prior `{r['prior']}`" if r.get("prior") else "") + f". Sound: deep loss <= {t['sound']}. "
+    w(f"{note} Shallow `{r['shallow']}`, deep `{r['deep']}`"
+      + (", at a glance: Lc0's raw child values" if isinstance(r.get("glance"), dict) else "")
+      + (", prior: Lc0's policy" if isinstance(r.get("prior"), dict) else "") + f". Sound: deep loss <= {t['sound']}. "
       f"{r['rows']} rows kept; dropped {r['dropped_missing_value']} with a move without a value, "
       f"{r['dropped_decided']} decided.\n\n")
     if r.get("glance_def"):
