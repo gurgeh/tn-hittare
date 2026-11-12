@@ -214,11 +214,41 @@ learn, and which move in each, to maximise my expected score.
   function of the position and both ratings, read after a few plies of plain
   expectation over both models.
 - **Search:** a knapsack on the tree by dynamic programming, the value of a
-  subtree given k positions to spend in it, with subtrees pruned below a
-  reach probability.
-- **Output:** the learned positions with their move, reach probability and
-  what learning each is worth; the curve of expected score against N; the
-  engine value of each line if the opponent plays the best moves.
+  subtree given k positions to spend in it. Exact on a tree; on a graph with
+  transpositions the DP is repaired and every reported value is the exact
+  expected score of the reported set on that graph.
+- **Graph:** grown lazily against the models, best-first on a reach bound
+  (`grow`), then below the current solution (`refine`). A node is a position
+  key, `tnh.data.edges.pos_hash`, so transpositions share a node and a model
+  call. Reach pruning does not bound the work: a sound move of mine has reach
+  1 because I could learn it. Growth is therefore a heuristic, and
+  `frontier_mass` reports how much of the result rests on positions that were
+  never expanded.
+- **Pessimism**, two parameters that model different failures and combine
+  exactly:
+  - `lam`: a share of opponents play the engine's best move everywhere (a
+    prepared or stronger opponent). On a tree this is per-node mixing with
+    the posterior that he is that type given his moves so far.
+  - `lam_node`: at every opponent node a share of the probability moves to
+    the engine's best move (model error, independent between nodes). This
+    one favours difficulty spread over many nodes above a single trap.
+  Both are set by the backtest (step 4), not by taste.
+- **Bias at the frontier:** the maximum over my sound moves picks up noise in
+  the frontier values, and a line that has been grown loses optimism that an
+  ungrown line keeps. `solve_until_stable` grows below the chosen set until
+  the same set is chosen twice and says so when it does not converge;
+  `Params.shrink` pulls a frontier value toward its parent's.
+- **Deep soundness:** the learned moves are few, so each is checked again
+  with a deep engine search inside the loop (`tnh.builder.deepcheck`); a move
+  that fails is banned and the search reruns.
+- **Budget:** N positions, or a price `mu` per position (`budget_for_price`);
+  the curve gives both.
+- **Output:** the learned positions with their move, reach probability, the
+  loss if that position alone were forgotten and the rise of the curve where
+  it entered; the curve of expected score against N; each line played out
+  with the engine's best replies and the engine value at its end; the frontier
+  mass; the swing of the chosen set's value between rounds.
+- **CPU:** one BLAS/OpenMP thread. The builder is one process on one core.
 
 Every model enters through the interfaces above, so the builder can be tested
 on synthetic models where the best repertoire is planted and known.
