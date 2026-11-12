@@ -182,16 +182,29 @@ def cmd_chess(a) -> None:
                 log.append(f"refine {r}: {k} expansions, {len(ex.graph)} nodes")
                 print(log[-1], flush=True)
 
+        checker = DeepChecker(a.deep_nodes) if a.deep_nodes else None
+        deep_cache: dict = {}
+
+        def check(k, m):
+            if (k, m) not in deep_cache:
+                node = ex.graph.nodes[Game(ex.graph, ex.params).by_key[k][0]]
+                deep_cache[(k, m)] = checker.check(list(root_moves) + rel_path(node), m, params.eps(me_white))
+            return deep_cache[(k, m)]
+
         if a.stable_rounds:
             from tnh.builder.drift import solve_until_stable
-            st = solve_until_stable(ex, a.N, per_round=a.drift_per_round, tol=a.stable_tol, max_rounds=a.stable_rounds)
-            lines = [f"until stable (tol {a.stable_tol}, {a.drift_per_round} expansions per round): "
+            st = solve_until_stable(ex, a.N, per_round=a.drift_per_round, tol=a.stable_tol, max_rounds=a.stable_rounds,
+                                    check=check if checker else None)
+            lines = [f"until stable (tol {a.stable_tol}, same set twice, {a.drift_per_round} expansions per round, "
+                     f"deep check {'inside' if checker else 'off'}): "
                      f"{'converged' if st.converged else 'NOT converged'} after {st.rounds} rounds",
                      "round  nodes   choice's value   after growing below it"]
             lines += [f"{r:5d}  {nn:5d}   {v:.4f}           {after:.4f}" for r, v, after, nn in st.history]
+            lines += st.log
             report["stable"] = "\n".join(lines)
             print(report["stable"], flush=True)
             sols = st.sols
+            params = ex.params          # carries the bans
 
         if a.compare:
             # the same graph under each pessimism; lam_node needs the engine at every opponent's node
@@ -227,18 +240,16 @@ def cmd_chess(a) -> None:
             print(report["drift"], flush=True)
 
         final_game = Game(ex.graph, params)
-        if a.deep_nodes:
-            with DeepChecker(a.deep_nodes) as dc:
-                check = lambda k, m: dc.check(list(root_moves) + rel_path(ex.graph.nodes[final_game.by_key[k][0]]), m,
-                                              params.eps(me_white))
-                chk = check_repertoire(ex.graph, params, a.N, a.N, check)
+        if checker:
+            chk = check_repertoire(ex.graph, params, a.N, a.N, check)
+            checker.close()
             log += chk.log
             print("\n".join(chk.log), flush=True)
             sols = chk.sols
             final_game = Game(ex.graph, chk.params)
             deep = {k: d for (k, m), d in chk.results.items() if sols[a.N].learned.get(k) == m}
             report["deep"] = [{"line": san(rel_path(ex.graph.nodes[final_game.by_key[k][0]]) + [m]), **d}
-                              for (k, m), d in chk.results.items()]
+                              for (k, m), d in deep_cache.items()]
         else:
             sols = _solve_report(final_game, a.N, "final solve", log)
             deep = None

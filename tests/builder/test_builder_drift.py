@@ -68,3 +68,23 @@ def test_solve_until_stable_converges_and_says_when_it_does_not():
     assert abs(after - before) < 1e-3 or before == after
     st2 = solve_until_stable(RevealExpander(full, params, depth=3), 3, per_round=1, tol=1e-12, max_rounds=2)
     assert not st2.converged and st2.rounds == 2
+
+
+def test_until_stable_bans_failing_moves_inside_the_loop():
+    full, params = noisy_world(4)
+    first = solve(Game(RevealExpander(full, params, depth=3).graph, params), 3)[1][3].learned
+    bad = next(iter(first.items()))
+    calls = []
+
+    def check(k, m):
+        calls.append((k, m))
+        return {"passes": (k, m) != bad, "move_value": 0.0, "alt_move": "?", "alt_value": 1.0}
+
+    ex = RevealExpander(full, params, depth=3)
+    st = solve_until_stable(ex, 3, per_round=10, tol=1e-3, max_rounds=50, check=check)
+    assert bad in ex.params.banned
+    assert st.sols[3].learned.get(bad[0]) != bad[1]
+    assert any("fails the deep check" in line for line in st.log)
+    assert len(calls) == len(set(calls))          # each move checked once
+    if st.converged:
+        assert all(st.checks[(k, m)]["passes"] for k, m in st.sols[3].learned.items())

@@ -110,27 +110,65 @@ class Stable:
     history: list[tuple[int, float, float, int]]     # round, value of the choice, its value after growth, nodes
     converged: bool
     rounds: int
+    log: list[str] = field(default_factory=list)
+    checks: dict = field(default_factory=dict)      # (key, move) -> the deep check's result
 
 
-def solve_until_stable(expander, N: int, *, per_round: int, tol: float, max_rounds: int) -> Stable:
-    """Remedy (a): solve, grow below the choice, re-value it, until it moves less than `tol`."""
-    history = []
+def solve_until_stable(expander, N: int, *, per_round: int, tol: float, max_rounds: int,
+                       check=None, repeats: int = 2) -> Stable:
+    """Remedy (a): solve, grow below the choice, re-value it, until it holds.
+
+    Converged means: the same learned set in `repeats` consecutive rounds, and in each
+    of them its value moved less than `tol` when the positions below it were grown.
+    One small move is not enough: on the real example the value swung both ways by
+    up to 0.008 between rounds before it landed within 0.001 once by chance.
+
+    `check(key, move) -> dict` with `passes` (the deep soundness check) runs inside the
+    loop: a failing move is banned in `expander.params` and the round is solved again
+    before anything is grown, so the loop never converges on a set it then discards.
+    """
+    from dataclasses import replace
+    history, log, checks = [], [], {}
+    streak, last = 0, None
     for r in range(max_rounds):
-        game = Game(expander.graph, expander.params)
-        _, sols = solve(game, N)
-        chosen, v = sols[N].learned, sols[N].value
-        if grow_below(expander, chosen, per_round) == 0:
-            history.append((r, v, v, len(game.order)))
-            return Stable(sols, history, True, r + 1)
-        after = Game(expander.graph, expander.params).evaluate(chosen)
-        history.append((r, v, after, len(game.order)))
-        if abs(after - v) < tol:
+        while True:
             game = Game(expander.graph, expander.params)
             _, sols = solve(game, N)
-            return Stable(sols, history, True, r + 1)
-    game = Game(expander.graph, expander.params)
-    _, sols = solve(game, N)
-    return Stable(sols, history, False, max_rounds)
+            chosen, v = sols[N].learned, sols[N].value
+            if check is None:
+                break
+            failed = []
+            for k, m in chosen.items():
+                if (k, m) not in checks:
+                    checks[(k, m)] = check(k, m)
+                if not checks[(k, m)]["passes"]:
+                    failed.append((k, m))
+            if not failed:
+                break
+            for k, m in failed:
+                d = checks[(k, m)]
+                log.append(f"round {r}: {m} at {k} fails the deep check ({d['move_value']:.3f} against "
+                           f"{d['alt_move']} {d['alt_value']:.3f}); banned")
+            expander.params = replace(expander.params, banned=expander.params.banned | frozenset(failed))
+        if grow_below(expander, chosen, per_round) == 0:
+            history.append((r, v, v, len(game.order)))
+            return Stable(sols, history, True, r + 1, log, checks)
+        after = Game(expander.graph, expander.params).evaluate(chosen)
+        history.append((r, v, after, len(game.order)))
+        held = abs(after - v) < tol
+        if held and streak > 0 and chosen == last:
+            streak += 1
+        else:
+            streak = 1 if held else 0
+        last = dict(chosen)
+        if streak >= repeats:
+            _, sols = solve(Game(expander.graph, expander.params), N)
+            if sols[N].learned == chosen:
+                return Stable(sols, history, True, r + 1, log, checks)
+            streak = 0
+    _, sols = solve(Game(expander.graph, expander.params), N)
+    log.append(f"not converged after {max_rounds} rounds")
+    return Stable(sols, history, False, max_rounds, log, checks)
 
 
 # -- a synthetic game with a known truth -------------------------------------------------
