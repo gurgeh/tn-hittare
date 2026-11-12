@@ -179,6 +179,7 @@ class Params:
     cost: Callable[[Node, int], int] = uniform_cost
     force: frozenset = frozenset()
     root_eps: float | None = None
+    mix: Callable | None = None
     lam_node: float = 0.0
     shrink: float = 0.0
     shrink_to: str = "parent"
@@ -220,7 +221,10 @@ def best_index(engine: np.ndarray | None, node: Node) -> int:
 def model_type_dist(node: Node, params: Params) -> np.ndarray:
     """The model-type opponent: counts over the model, with the per-node share `lam_node`
     on the engine's best move."""
-    q = blend(node.counts, node.p_model, params.kappa_at(node))
+    if params.mix is not None and node.counts is not None and np.sum(node.counts) > 0:
+        q = np.asarray(params.mix(node.counts, node.p_model), dtype=np.float64)
+    else:
+        q = blend(node.counts, node.p_model, params.kappa_at(node))
     if params.lam_node > 0:
         q = (1.0 - params.lam_node) * q
         q[best_index(node.engine, node)] += params.lam_node
