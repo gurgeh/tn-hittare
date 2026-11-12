@@ -306,6 +306,16 @@ learn, and which move in each, to maximise my expected score.
   move model at my rating and Lc0's policy, descent by probability at the
   opponent's moves, leaves valued by the result model in batches. It runs as
   long as it is given and its answer only gets finer.
+- **Two tiers of the move model in the search.** A node is first expanded
+  with the default model (no child values). Without them that model gives
+  large mistakes 1.43 times their real frequency (1.62 at 2200-2399) and 1.26
+  times the real expected loss per move, against 1.18 and 1.12 with child
+  values. A leaf's value says how good the position is but does not change
+  how often the opponent is thought to play into it, so once a node's likely
+  children have been valued, its move probabilities are recomputed with those
+  values as the child columns (the `+ch` trees). The child values then cost
+  nothing extra, and the accurate model applies where the search spends its
+  time.
 - **A price per non-obvious learned move** in place of a fixed N as the
   default: a move is learned where reach times gain exceeds the price, so the
   depth sets itself.
