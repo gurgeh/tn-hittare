@@ -272,6 +272,156 @@ def cmd_analyse(a) -> None:
                                                   "pairs": n, "groups": out, "coefficients": coef})
 
 
+# --- the repair: fit on both positions of each move ------------------------------------------------------------
+
+def _pair_rows(df: pl.DataFrame, srcs: list[str]):
+    """Design matrices, classes and frames for the n rows and the c rows (the child's side to move)."""
+    from tnh.eval.result import context, design
+    me, op = df.get_column("mover_elo").to_numpy().astype(float), df.get_column("opp_elo").to_numpy().astype(float)
+    ply = df.get_column("ply").to_numpy().astype(float)
+    wtm = df.get_column("white_to_move").to_numpy().astype(bool)
+    norm = lambda v: v / v.sum(1, keepdims=True)   # noqa: E731
+    wn = {k: norm(np.array(df.get_column(f"{k}_n").to_list(), float)) for k in srcs}
+    wc = {k: norm(np.array(df.get_column(f"{k}_c").to_list(), float)) for k in srcs}
+    Xn = design(wn, context(me, op, ply, wtm), srcs)
+    Xc = design(wc, context(op, me, ply + 1, ~wtm), srcs)
+    yn = np.array([{1.0: 0, 0.5: 1, 0.0: 2}[x] for x in df.get_column("result_mover").to_list()])
+    yc = 2 - yn
+    fn = df.select("mover_elo", "opp_elo", "ply")
+    fc = df.select(pl.col("opp_elo").alias("mover_elo"), pl.col("mover_elo").alias("opp_elo"), (pl.col("ply") + 1).alias("ply"))
+    band = np.searchsorted(BANDS["rating"][0], (me + op) / 2, side="right") - 1
+    return Xn, Xc, yn, yc, fn, fc, band
+
+
+def _probs_grad(theta, X):
+    from tnh.eval.result import mlogit_probs
+    return mlogit_probs(theta, X)
+
+
+def fit_pairs(Xn, Xc, yn, yc, band, *, free: np.ndarray, mu: float = 0.0, theta0=None) -> np.ndarray:
+    """Multinomial logit on the n and c rows together (each row weight 1), parameters outside `free` fixed at 0,
+    plus mu * sum over rating bands of (mean s(c) - s(n))^2 (s(c) for the mover at n), by L-BFGS."""
+    from scipy.optimize import minimize
+    X = np.vstack([Xn, Xc])
+    y = np.concatenate([yn, yc])
+    Xi = np.column_stack([np.ones(len(X)), X])
+    Xin, Xic = Xi[: len(Xn)], Xi[len(Xn):]
+    Y = np.zeros((len(y), 3))
+    Y[np.arange(len(y)), y] = 1
+    bands = [band == b for b in np.unique(band)]
+    k = Xi.shape[1]
+
+    def f(free_theta):
+        th = np.zeros(2 * k)
+        th[free] = free_theta
+        p = _probs_grad(th, X)
+        nll = -np.mean(np.log(p[np.arange(len(y)), y]))
+        g = -((Y[:, :2] - p[:, :2]).T @ Xi).ravel() / len(y)
+        if mu > 0:
+            pn, pc = p[: len(Xn)], p[len(Xn):]
+            En, Ec = es(pn), es(pc)
+            gap = (1 - Ec) - En                        # s(c) - s(n), mover at n
+            # dE/d eta_w = p_w (1 - E), dE/d eta_d = p_d (0.5 - E)
+            dn = np.column_stack([pn[:, 0] * (1 - En), pn[:, 1] * (0.5 - En)])
+            dc = np.column_stack([pc[:, 0] * (1 - Ec), pc[:, 1] * (0.5 - Ec)])
+            for m in bands:
+                gm = gap[m].mean()
+                nll += mu * gm ** 2
+                dgap = -(dc[m].T @ Xic[m]) - (dn[m].T @ Xin[m])          # 2 x k, summed over rows
+                g += 2 * mu * gm * dgap.ravel() / m.sum()
+        return nll, g[free]
+
+    x0 = np.zeros(int(free.sum())) if theta0 is None else theta0[free]
+    res = minimize(f, x0, jac=True, method="L-BFGS-B", options={"maxiter": 5000})
+    if not res.success:
+        raise RuntimeError(f"fit did not converge: {res.message}")
+    th = np.zeros(2 * k)
+    th[free] = res.x
+    return th
+
+
+def cmd_refit(a) -> None:
+    import json
+
+    from tnh.eval.common import boot_counts, boot_means, cluster_codes, est, write_result
+    from tnh.eval.result import PARAMS, calibration, losses, mlogit_probs
+
+    params = json.loads(PARAMS.read_text())
+    old = params[a.base]
+    srcs = old["sources"]
+    fit, test = pl.read_parquet(a.fit_pairs), pl.read_parquet(a.pairs)
+    Fn, Fc, fyn, fyc, _, _, fband = _pair_rows(fit, srcs)
+    Tn, Tc, yn, yc, fn, fc, band = _pair_rows(test, srcs)
+    k = Fn.shape[1] + 1
+    names = ["intercept"] + [f"{s}_{t}" for s in srcs for t in ("logodds", "draw")] + ["ctx_mean", "ctx_diff", "ctx_ply", "ctx_white"]
+    allfree = np.ones(2 * k, bool)
+    no_mean_win = allfree.copy()
+    no_mean_win[names.index("ctx_mean")] = False                # the win-vs-loss equation's mean-rating term
+    th_a = fit_pairs(Fn, Fc, fyn, fyc, fband, free=allfree)
+    models = {
+        f"{a.base} (stored)": np.array(old["coef"]),
+        "a: both parities": th_a,
+        "b: both, no side-to-move x mean rating": fit_pairs(Fn, Fc, fyn, fyc, fband, free=no_mean_win, theta0=th_a),
+        "c: both + consistency penalty": fit_pairs(Fn, Fc, fyn, fyc, fband, free=allfree, mu=a.mu, theta0=th_a),
+    }
+    cl = cluster_codes(test)
+    counts = boot_counts(cl.max() + 1, a.boot, a.seed)
+    w1 = np.ones(len(yn))
+    base_key = f"{a.base} (stored)"
+    P = {m: (mlogit_probs(th, Tn), mlogit_probs(th, Tc)) for m, th in models.items()}
+    lb_n, lb_c = losses(P[base_key][0], yn)[0], losses(P[base_key][1], yc)[0]
+    out = {}
+    bnames = BANDS["rating"][1]
+    for m, (pn, pc) in P.items():
+        ln, lc = losses(pn, yn)[0], losses(pc, yc)[0]
+        gap = (1 - es(pc)) - es(pn)
+        cols = [ln, lc, ln - lb_n, lc - lb_c, gap, pn[:, 1], pc[:, 1], (yn == 1).astype(float)]
+        bm = boot_means(np.column_stack(cols), w1, cl, counts)
+        gaps = {}
+        for b, lab in enumerate(bnames):
+            mm = band == b
+            gb = boot_means(gap[mm], w1[mm], cl[mm], counts)
+            gaps[lab] = est(gap[mm].mean(), gb[:, 0])
+        gaps_ply = {}
+        pb = np.searchsorted(BANDS["ply"][0], fn.get_column("ply").to_numpy(), side="right") - 1
+        for b, lab in enumerate(BANDS["ply"][1]):
+            mm = pb == b
+            if mm.sum() >= 30:
+                gb = boot_means(gap[mm], w1[mm], cl[mm], counts)
+                gaps_ply[lab] = est(gap[mm].mean(), gb[:, 0])
+        out[m] = {"coef": models[m].tolist(), "gap_by_ply": gaps_ply,
+                  "logloss_n": est(ln.mean(), bm[:, 0]), "logloss_c": est(lc.mean(), bm[:, 1]),
+                  "minus_stored_n": est((ln - lb_n).mean(), bm[:, 2]), "minus_stored_c": est((lc - lb_c).mean(), bm[:, 3]),
+                  "gap_all": est(gap.mean(), bm[:, 4]), "gap_by_band": gaps,
+                  "pred_draw_n": float(pn[:, 1].mean()), "pred_draw_c": float(pc[:, 1].mean()),
+                  "draw_rate": float((yn == 1).mean()),
+                  "calibration_n": {by: calibration(fn, pn, yn, by) for by in ("rating", "ply")},
+                  "calibration_c": {by: calibration(fc, pc, yc, by) for by in ("rating", "ply")}}
+        r = out[m]
+        print(f"\n{m}\n  log loss n {f_(r['logloss_n'])} (minus stored {f_(r['minus_stored_n'])}); "
+              f"c {f_(r['logloss_c'])} (minus stored {f_(r['minus_stored_c'])})\n  s(c) - s(n): all {f_(r['gap_all'])}; "
+              + "; ".join(f"{lab} {f_(e)}" for lab, e in gaps.items())
+              + "\n  by ply: " + "; ".join(f"{lab} {f_(e)}" for lab, e in gaps_ply.items())
+              + f"\n  draws: observed {r['draw_rate']:.3f}, predicted at n {r['pred_draw_n']:.3f}, at c {r['pred_draw_c']:.3f}")
+        for side in ("n", "c"):
+            for by, rows in r[f"calibration_{side}"].items():
+                print(f"  calibration {side} by {by}: " + "; ".join(
+                    f"{x['group']} {x['score']:.3f}/{x['pred_score']:.3f} d {x['draw_rate']:.3f}/{x['pred_draw']:.3f}" for x in rows))
+        print("  coefficients win: " + ", ".join(f"{nm} {v:+.3f}" for nm, v in zip(names, models[m][:k])))
+    write_result(a.results, "result_cheap_pairs", {
+        "what": "cheap result model refitted on both positions of each sampled move (fit games), tested on the test "
+                "games' positions n and after the played move c; live sources", "fit_pairs": str(a.fit_pairs),
+        "test_pairs": str(a.pairs), "mu": a.mu, "names": names, "models": out})
+    if a.store:
+        chosen = out[a.store]
+        params[f"{a.base}-v1"] = old
+        params[a.base] = {**old, "coef": chosen["coef"], "fit": "both positions of each move (n and after the played move), "
+                          f"{a.store}; {a.fit_pairs}", "date": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                          "refit": "uv run python -m tnh.eval.consistency refit --store '<variant>'"}
+        PARAMS.write_text(json.dumps(params, indent=1) + "\n")
+        print(f"stored {a.store!r} as {a.base!r} in {PARAMS}; the old coefficients as {a.base}-v1")
+
+
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(prog="python -m tnh.eval.consistency", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -294,6 +444,16 @@ def main(argv=None) -> None:
     sp.add_argument("--boot", type=int, default=1000)
     sp.add_argument("--seed", type=int, default=7)
     sp.set_defaults(fn=cmd_analyse)
+    sp = sub.add_parser("refit")
+    sp.add_argument("--fit-pairs", type=Path, default=PAIRS.parent / "pairs_fit.parquet")
+    sp.add_argument("--pairs", type=Path, default=PAIRS)
+    sp.add_argument("--base", default="cheap")
+    sp.add_argument("--mu", type=float, default=1000.0)
+    sp.add_argument("--store", help="the variant to store as the new cheap model (old kept as <base>-v1)")
+    sp.add_argument("--results", type=Path, default=REPORTS / "step1")
+    sp.add_argument("--boot", type=int, default=1000)
+    sp.add_argument("--seed", type=int, default=7)
+    sp.set_defaults(fn=cmd_refit)
     a = p.parse_args(argv)
     a.fn(a)
 

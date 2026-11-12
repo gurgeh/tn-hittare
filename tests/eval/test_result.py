@@ -127,3 +127,41 @@ def test_exact_full_reproduces_the_exact_averages():
     assert all(f["c_kept"]) and np.allclose(p @ w, v1[0])
     e2 = sum(pc * (np.array(rp) @ np.array(rw) if rp else wc) for pc, wc, rp, rw in zip(p, w, f["r_p"], f["r_wdl"]))
     assert np.allclose(e2, v2[0])
+
+
+def test_stored_cheap_model_is_the_two_parity_fit_and_the_old_one_stays_selectable():
+    import json
+
+    from tnh.eval.result import PARAMS, ResultModel
+
+    d = json.loads(PARAMS.read_text())
+    assert d["cheap"]["sources"] == d["cheap-v1"]["sources"]
+    k = len(d["cheap"]["coef"]) // 2
+    names = ["intercept"] + [f"{s}_{t}" for s in d["cheap"]["sources"] for t in ("logodds", "draw")] + \
+        ["ctx_mean", "ctx_diff", "ctx_ply", "ctx_white"]
+    assert len(names) == k
+    assert d["cheap"]["coef"][names.index("ctx_mean")] == 0.0     # no side-to-move x mean-rating term
+    assert ResultModel("cheap-v1").theta.tolist() == d["cheap-v1"]["coef"]
+    assert ResultModel("cheap").theta.tolist() != ResultModel("cheap-v1").theta.tolist()
+
+
+def test_fit_pairs_removes_a_planted_side_to_move_shift():
+    from tnh.eval.consistency import es, fit_pairs
+    from tnh.eval.result import mlogit_probs
+
+    rng = np.random.default_rng(0)
+    n = 6000
+    z = rng.normal(size=n)                      # a source's log odds for the mover at n; at c it is -z
+    band = rng.integers(0, 2, n)
+    Xn = np.column_stack([z, band])
+    Xc = np.column_stack([-z, band])
+    th_true = np.array([0.0, 1.0, 0.0, -1.0, 0.0, 0.0])
+    yn = np.array([rng.choice(3, p=p) for p in mlogit_probs(th_true, Xn)])
+    yc = 2 - yn
+    free = np.ones(6, bool)
+    th = fit_pairs(Xn, Xc, yn, yc, band, free=free)
+    gap = (1 - es(mlogit_probs(th, Xc))) - es(mlogit_probs(th, Xn))
+    assert abs(gap.mean()) < 0.003
+    th_p = fit_pairs(Xn, Xc, yn, yc, band, free=free, mu=1000.0)
+    gap_p = (1 - es(mlogit_probs(th_p, Xc))) - es(mlogit_probs(th_p, Xn))
+    assert all(abs(gap_p[band == b].mean()) < 0.001 for b in (0, 1))

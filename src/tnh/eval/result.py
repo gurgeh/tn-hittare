@@ -344,24 +344,32 @@ def cmd_cheap(a) -> None:
 # --- the stored model and its live features ------------------------------------------------------------
 
 def cmd_refit(a) -> None:
-    """Fit the chosen variant on all fitting games and store it (the test games are not used)."""
+    """Fit the full model on the fitting games' sampled positions and store it (the test games are not used).
+
+    The default cheap model is fitted on both positions of each move by ``tnh.eval.consistency refit --store``
+    (consistent across a move); it and every other stored entry are kept. ``--cheap S`` also refits a cheap model
+    on one position per game, stored as ``cheap-single``."""
     fit = read_sample(a.fit)
     wf, cf, yf = table(fit, SOURCES)
-    out = {"date": time.strftime("%Y-%m-%dT%H:%M:%S"), "fit": str(a.fit), "games": len(yf)}
-    for name, srcs in (("full", a.full.split(",")), ("cheap", a.cheap.split(","))):
+    out = json.loads(PARAMS.read_text()) if PARAMS.exists() else {}
+    out.update({"date": time.strftime("%Y-%m-%dT%H:%M:%S"), "fit": str(a.fit), "games": len(yf)})
+    todo = [("full", a.full.split(","))] + ([("cheap-single", a.cheap.split(","))] if a.cheap else [])
+    for name, srcs in todo:
         th = fit_mlogit(design(wf, cf, srcs), yf)
         out[name] = {"sources": srcs, "context": CONTEXT, "coef": th.tolist(), "model": "logit"}
     out["sources"] = {k: str(v) for k, v in SOURCES.items()}
-    out["refit"] = "uv run python -m tnh.eval.result refit"
+    out["refit"] = "uv run python -m tnh.eval.result refit (full); uv run python -m tnh.eval.consistency refit --store (cheap)"
     PARAMS.write_text(json.dumps(out, indent=1) + "\n")
-    print(f"wrote {PARAMS}")
+    print(f"wrote {PARAMS}: {', '.join(k for k, _ in todo)}")
 
 
 class ResultModel:
     """Win, draw, loss for the side to move given both FIDE ratings, from the stored logit.
 
     ``variant="full"`` uses Lc0 at 50 nodes with ``WDLCalibrationElo`` (13.6 positions/s, the search);
-    ``variant="cheap"`` only network calls (Maia-3 at two ratings and Lc0's raw value), the leaf of the
+    ``variant="cheap"`` only network calls (Maia-3 at two ratings and Lc0's raw value), fitted on both positions of
+    each move so that its mean expected score does not shift across a move (``tnh.eval.consistency``; the older
+    one-position fit is ``variant="cheap-v1"``), the leaf of the
     look-ahead in ``tnh.eval.lookahead``. Same shape as ``tnh.models.combo.FrontierValue``.
     """
 
@@ -598,7 +606,7 @@ def main(argv=None) -> None:
     sp = sub.add_parser("refit")
     sp.add_argument("--fit", type=Path, default=CORPUS / "samples" / "fit_value20k.parquet")
     sp.add_argument("--full", default="lc0w,lc0raw,maia0,maia600")
-    sp.add_argument("--cheap", default="maia0,maia600,lc0raw")
+    sp.add_argument("--cheap", help="also refit a one-position-per-game cheap model on these sources, as cheap-single")
     sp.set_defaults(fn=cmd_refit)
     sp = sub.add_parser("bench")
     sp.add_argument("--test", type=Path, default=CORPUS / "samples" / "test_value_all.parquet")

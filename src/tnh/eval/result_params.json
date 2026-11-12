@@ -58,6 +58,54 @@
    "ctx_white"
   ],
   "coef": [
+   0.0749628822091357,
+   -0.008605941069058463,
+   0.02132744100903608,
+   0.23101233993534712,
+   0.008734025494041628,
+   0.4689898421739891,
+   0.00036686975001911124,
+   0.0,
+   0.48749612448240875,
+   -0.04729875847384187,
+   -0.09691968266830714,
+   1.0008971383480088,
+   -0.007033067194894962,
+   0.516096419031944,
+   0.16060191002220403,
+   0.14148892255709797,
+   0.22931481172402784,
+   0.39010738249859656,
+   -0.05026909884124522,
+   0.216018029655413,
+   -0.14518543039136436,
+   -0.05011033104842233
+  ],
+  "model": "logit",
+  "fit": "both positions of each move (n and after the played move), b: both, no side-to-move x mean rating; /home/gurgeh/out/tn-hittare/scratch/eval/consistency/pairs_fit.parquet",
+  "date": "2026-11-12T17:25:03",
+  "refit": "uv run python -m tnh.eval.consistency refit --store '<variant>'"
+ },
+ "sources": {
+  "lc0w": "/home/gurgeh/out/tn-hittare/features/lc0-bt4/nodes50-wdl-offset+400",
+  "lc0raw": "/home/gurgeh/out/tn-hittare/features/lc0-bt4/policy",
+  "maia0": "/home/gurgeh/out/tn-hittare/features/maia3-79m/offset+0",
+  "maia600": "/home/gurgeh/out/tn-hittare/features/maia3-79m/offset+600"
+ },
+ "refit": "uv run python -m tnh.eval.result refit",
+ "cheap-v1": {
+  "sources": [
+   "maia0",
+   "maia600",
+   "lc0raw"
+  ],
+  "context": [
+   "ctx_mean",
+   "ctx_diff",
+   "ctx_ply",
+   "ctx_white"
+  ],
+  "coef": [
    0.06993165590645294,
    0.002873293862215365,
    0.018692719703481513,
@@ -82,12 +130,5 @@
    -0.05281532417625479
   ],
   "model": "logit"
- },
- "sources": {
-  "lc0w": "/home/gurgeh/out/tn-hittare/features/lc0-bt4/nodes50-wdl-offset+400",
-  "lc0raw": "/home/gurgeh/out/tn-hittare/features/lc0-bt4/policy",
-  "maia0": "/home/gurgeh/out/tn-hittare/features/maia3-79m/offset+0",
-  "maia600": "/home/gurgeh/out/tn-hittare/features/maia3-79m/offset+600"
- },
- "refit": "uv run python -m tnh.eval.result refit"
+ }
 }

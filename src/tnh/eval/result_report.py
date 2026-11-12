@@ -176,6 +176,19 @@ def main(argv=None) -> None:
                 w(table(["group", "games", "score", "predicted", "draw rate", "predicted draws"],
                         [[r["group"], r["n"], f"{r['score']:.3f}", f"{r['pred_score']:.3f}", f"{r['draw_rate']:.3f}",
                           f"{r['pred_draw']:.3f}"] for r in rows]))
+    cp = load(R, "result_cheap_pairs")
+    if cp:
+        w("\n## The cheap model across a move\n\n")
+        w("Each test game's sampled position n and the position c after the played move (live sources; "
+          "`python -m tnh.eval.consistency refit`). `s(c) - s(n)`: the change of the expected score for the mover at "
+          "n across his own move; a calibrated model has mean 0. The stored default `cheap` is fitted on both "
+          "positions of each move of the fitting games; the old one-position fit is `cheap-v1`.\n\n")
+        bands = list(next(iter(cp["models"].values()))["gap_by_band"])
+        w(table(["model", "log loss n", "minus stored n", "log loss c", "minus stored c", "s(c) - s(n)"] + bands
+                + ["draws n (observed)"],
+                [[k, f(v["logloss_n"]), f(v["minus_stored_n"]), f(v["logloss_c"]), f(v["minus_stored_c"]), f(v["gap_all"])]
+                 + [f(v["gap_by_band"][b]) for b in bands] + [f"{v['pred_draw_n']:.3f} ({v['draw_rate']:.3f})"]
+                 for k, v in cp["models"].items()]))
     if eng:
         w("\n## Look-ahead by search\n\n")
         w(table(["variant", "log loss", "minus 50 nodes", "Brier"],
