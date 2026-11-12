@@ -34,8 +34,9 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--table", default=None, help="EdgeDB table name: full or dev (default: full if it exists)")
     ap.add_argument("--move-model", default="policy-trees",
                     help="model 1: policy-trees, combo-p0.5, combo, fake, or import:module:Name (any MoveModel)")
-    ap.add_argument("--value-model", default="frontier",
-                    help="model 2: frontier, fake, or import:module:Name (any object with .wdl(queries))")
+    ap.add_argument("--value-model", default="shared",
+                    help="model 2: shared (the move model's own wdl, one copy of the networks), result-cheap, "
+                         "result-full, frontier, fake, or import:module:Name (any object with .wdl(queries))")
     ap.add_argument("--no-models", action="store_true", help="the database alone: no models and no engine")
     ap.add_argument("--repertoires", type=Path, default=DATA_ROOT / "repertoires",
                     help="directory of the repertoire builder's runs (tnh.builder.export), shown as a layer")

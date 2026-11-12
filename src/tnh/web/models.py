@@ -58,6 +58,8 @@ MOVE_MODELS: dict[str, Callable[[], object]] = {
     "combo": lambda: _combo().Combo(),
     "fake": lambda: _fakes().FakeMoveModel(),
 }
+SHARED = "shared"   # value model spec: the move model object itself, which must have `wdl(queries)`
+
 VALUE_MODELS: dict[str, Callable[[], object]] = {
     "result-cheap": lambda: importlib.import_module("tnh.eval.result").ResultModel("cheap"),
     "result-full": lambda: importlib.import_module("tnh.eval.result").ResultModel("full"),
@@ -170,6 +172,10 @@ class Hub:
         self._sf = None
         self.stockfish_processes = stockfish_processes
         self._move_lock, self._value_lock, self._sf_lock = threading.Lock(), threading.Lock(), threading.Lock()
+        if value_model == SHARED:
+            # One object answers both (the default move model fills `wdl` from its own network
+            # calls): one copy of the networks on the GPU, so one lock for both kinds of request.
+            self._value_lock = self._move_lock
         self._move_cache, self._value_cache, self._sf_cache = _LRU(cache_size), _LRU(cache_size * 4), _LRU(cache_size)
         self.load_s: dict[str, float] = {}
         self.counts = {"value_queries": 0, "value_cached": 0, "value_terminal": 0, "move_queries": 0}
@@ -188,7 +194,13 @@ class Hub:
     def _get_value(self):
         if self._value is None:
             t = time.perf_counter()
-            self._value = load_value_model(self._value_spec)
+            if self._value_spec == SHARED:
+                model = self._get_move()   # the caller holds the lock the two share
+                if not callable(getattr(model, "wdl", None)):
+                    raise TypeError(f"value model {SHARED!r}: the move model {self._name(model, self._move_spec)} has no wdl(queries)")
+                self._value = model
+            else:
+                self._value = load_value_model(self._value_spec)
             self.load_s["value_model"] = time.perf_counter() - t
         return self._value
 
