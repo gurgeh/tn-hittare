@@ -106,8 +106,17 @@ Online events are dropped. In TWIC they are marked by a `Site` ending in
 The same game arriving from two sources is stored once. The copy with clock
 times wins, then the copy with more tags filled in. Two copies of one game
 put their tournaments in the same split. So do near copies, which the key
-does not catch and which are still stored as two games: the same date and
-moves under differently spelt names, and a truncated copy of a longer game.
+does not catch: the same date and moves under differently spelt names, and a
+truncated copy of a longer game. Those are merged in a second pass: games of
+20 plies or more with the same date and the same moves, and truncated copies,
+are one game. The copy with clocks is kept, else the longer one, and it keeps
+its own `game_id`; the removed copies' ids go to
+`games_extra.merged_near_copy_ids` and are counted in `parse_stats.json` as
+`near_copies_removed`. A truncated copy with two different longer
+continuations is left alone.
+
+`games.parquet` is sorted by `game_id`, and `positions.parquet` by
+`(game_id, ply)`. The sampler relies on both.
 
 ## `corpus/positions.parquet`
 
@@ -168,8 +177,10 @@ below 80.
 
 A position is identified by `pos_hash`, the 64-bit Zobrist hash that
 `chess.polyglot.zobrist_hash` gives: pieces, side to move, castling rights,
-and the en passant square only when a capture there is legal. Transpositions
-share a hash.
+and the en passant square when a pawn stands ready to capture there, whether
+or not the capture is legal. (`positions.pos_key` uses the legal-capture
+rule; the two differ only when that pawn is pinned.) Transpositions share a
+hash.
 
 One row per (position, move, year, rating band, tempo):
 
@@ -190,8 +201,33 @@ A row is kept only when its position was reached by at least two games; the
 rest of a game past that point is in `games.parquet`.
 
 `corpus/pos_index.parquet`, one row per position with at least two games:
-`pos_hash`, `epd` (one representative), `n`, and the results. It is the
-lookup for a position's total and for the count of any child.
+`pos_hash`, `epd` (of the first game in `game_id` order to reach it), `n`,
+and the results. It is the lookup for a position's total and for the count
+of any child.
+
+`corpus/parents.parquet`, derived from edges: `child_hash`, `pos_hash`,
+`move`, `n`, over all years, bands and tempos. It answers "which positions
+lead here".
+
+Counting. `pos_index.n` is the number of games that reach the position at a
+ply up to 80 (the position after ply 79 included), each game once however
+often it returns, including games that end there. `edges.n` is the number of
+games that played the move from the position, each game once per (position,
+move). A game that returns to a position and plays another move counts once
+for each move, so a position's moves can add up to more than the games that
+went on from it.
+
+Layout. `edges` and `pos_index` are sorted by `pos_hash`, `parents` by
+`child_hash`, in small row groups (32 k rows for edges, 8 k for the others).
+`EdgeDB` reads the row groups' min and max once and then only the groups and
+columns a lookup needs; a lookup costs 10 to 30 ms.
+
+`tnh.data.edges.EdgeDB(name="full" | "dev")` is the reader: `total`, `moves`
+(with `n_rated` and `last_year`), `moves_by_year`, `children`, `panel` (the
+database view of a position in one scan) and `parents`. The `dev` tables
+(`edges_dev.parquet` and so on) hold the games dated 2024 or later.
+`edges.performance` is the one definition of rating performance:
+`opp - 400 * log10(1 / score - 1)`, the difference capped at 800.
 
 Hash collisions: with a few hundred million positions the chance of one
 anywhere is about one in a thousand. Accepted.
