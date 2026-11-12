@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import os
 import re
 import threading
 import time
@@ -19,7 +20,9 @@ from tnh.web.models import ModelHub, ModelsOff, Superseded, _LRU, query
 from tnh.web.models import _board as _models_board
 from tnh.web.stats import TEMPI, Filters, Shrink, Stats, TrendRule, model_table, report
 
-STATIC = Path(__file__).parent / "static"
+# $TNH_WEB_STATIC serves another copy of the page, so it can be changed without touching the
+# one a running server serves from the working tree.
+STATIC = Path(os.environ.get("TNH_WEB_STATIC", Path(__file__).parent / "static"))
 MAX_ENGINE_NODES = 5_000_000
 API_VERSION = 3      # the page checks it: an older server lacks /api/model and the Elo deltas
 P_LIST = 0.01        # model 1's moves at or above this probability are listed beside the database's

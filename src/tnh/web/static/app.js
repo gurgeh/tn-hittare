@@ -10,29 +10,30 @@ import {MoveTree, START_FEN} from "./tree.js"
 const $ = id => document.getElementById(id)
 const LAST_MOVE = {class: "marker-last", slice: "markerSquare"}
 const CURSOR_ARROW = {class: "arrow-cursor"}
-// Choices of presentation; each is one switch here. `view` was decided by the owner on
-// 2026-11-12: always from White, and classical games as the default tempo. `ratings` is still open.
+// Choices of presentation; each is one switch here. Decided by the owner on 2026-11-12:
+// always from White, classical games as the default tempo.
 const CHOICES = {
-    view: "white",          // "white": scores, ratings, performance, engine and W/D/L from White; "mover": from the side to move
+    view: "white",          // "white": scores, engine and W/D/L from White; "mover": from the side to move
     defaultTempi: ["classical"],   // tempi when the URL names none: null = all, ["classical"] = classical only
-    ratings: "both",        // the Maia line: "both" (FIDE -> Maia), "fide" or "maia"
+    elo: "colours",         // "colours": W-Elo and B-Elo deltas; "chooser": the chooser's delta and the rating-gap delta
+    trend: true,            // the per-year share column
 }
-const MAIA_MIN = 0.01        // Maia moves below this are not listed unless "all legal"
-const DELTA_MIN_GAMES = 20   // no Δ column below this many games in the position
+const API = 3                // the server's /api/info "api" this page needs
 
 const state = {
     tree: new MoveTree(),
     orientation: COLOR.white,
     filters: {y0: "", y1: "", e0: "", e1: "", tempi: CHOICES.defaultTempi},
-    me: 2200, opp: 2200, nodes: 200000, sfauto: false,
+    white: 2200, black: 2200, nodes: 200000, sfauto: false,
     showAll: false,
     sort: {key: "n", desc: true},
     cursor: null,     // uci of the highlighted row
-    stats: null, maia: null, engine: null,
+    stats: null, model: null, engine: null,
+    modelBusy: false,
     info: null,
 }
-const cache = {stats: new Map(), maia: new Map(), engine: new Map()}
-const inflight = {stats: null, maia: null, engine: null}
+const cache = {stats: new Map(), model: new Map(), engine: new Map()}
+const inflight = {stats: null, model: null, engine: null}
 const timing = {}
 
 // ---------------------------------------------------------------- URL state
@@ -42,8 +43,13 @@ function readUrl() {
     const f = state.filters
     for (const k of ["y0", "y1", "e0", "e1"]) if (p.has(k)) f[k] = p.get(k)
     if (p.has("t")) f.tempi = p.get("t") === "all" ? null : p.get("t") ? p.get("t").split(",") : []
-    if (p.has("me")) state.me = +p.get("me")
-    if (p.has("opp")) state.opp = +p.get("opp")
+    if (p.has("w")) state.white = +p.get("w")
+    if (p.has("b")) state.black = +p.get("b")
+    if (p.has("me") && !p.has("w")) {   // links from before 2026-11-12: me/opp, me at the bottom
+        const meWhite = p.get("o") !== "b"
+        state.white = +(meWhite ? p.get("me") : p.get("opp") || 2200)
+        state.black = +(meWhite ? p.get("opp") || 2200 : p.get("me"))
+    }
     if (p.has("nodes")) state.nodes = +p.get("nodes")
     if (p.has("sf")) state.sfauto = p.get("sf") === "1"
     if (p.get("o") === "b") state.orientation = COLOR.black
@@ -69,8 +75,8 @@ function writeUrl() {
     const f = state.filters
     for (const k of ["y0", "y1", "e0", "e1"]) if (f[k] !== "") p.set(k, f[k])
     if (JSON.stringify(f.tempi) !== JSON.stringify(CHOICES.defaultTempi)) p.set("t", f.tempi ? f.tempi.join(",") : "all")
-    p.set("me", state.me)
-    p.set("opp", state.opp)
+    p.set("w", state.white)
+    p.set("b", state.black)
     if (state.nodes !== 200000) p.set("nodes", state.nodes)
     if (state.sfauto) p.set("sf", "1")
     if (state.orientation === COLOR.black) p.set("o", "b")
@@ -80,6 +86,7 @@ function writeUrl() {
 // ---------------------------------------------------------------- formatting
 
 const pct = (x, d = 0) => x == null ? "" : (100 * x).toFixed(d)
+const signed = x => x == null ? "" : Math.round(x) === 0 ? "0" : (x > 0 ? "+" : "−") + Math.abs(Math.round(x))
 // A share in whole percent; a share that is not zero but rounds to it shows as "<1".
 const pctShare = x => x == null ? "" : x > 0 && x < 0.005 ? "<1" : (100 * x).toFixed(0)
 const int = x => x == null ? "" : Math.round(x).toString()
@@ -92,15 +99,6 @@ function flipped() {
 const povScore = x => x == null ? null : flipped() ? 1 - x : x
 const povWdl = wdl => flipped() ? [wdl[2], wdl[1], wdl[0]] : wdl
 const VIEW = () => CHOICES.view === "white" ? "White" : "the side to move"
-
-// The same formula as tnh.data.edges.performance, for White's view, where the
-// performance of the side not to move is needed.
-function perfRating(score, opp) {
-    if (score == null || opp == null) return null
-    const lo = 1 / (1 + 10 ** 2)
-    const s = Math.min(1 - lo, Math.max(lo, score))
-    return opp - 400 * Math.log10(1 / s - 1)
-}
 
 function cpText(sf) {
     if (!sf) return ""
@@ -257,7 +255,11 @@ async function fetchJson(kind, url) {
     const body = await r.json()
     inflight[kind] = null
     timing[kind] = performance.now() - t
-    if (!r.ok) throw new Error(`${kind}: ${body.detail || r.status}`)
+    if (!r.ok) {
+        const e = new Error(`${kind}: ${body.detail || r.status}`)
+        e.status = r.status
+        throw e
+    }
     return body
 }
 
@@ -284,29 +286,38 @@ function fetchStats() {
     })
 }
 
-function elos() {
-    const meWhite = state.orientation === COLOR.white
-    return meWhite ? [state.me, state.opp] : [state.opp, state.me]
-}
-
 const modelsOff = () => state.info && state.info.models && state.info.models.disabled
+const oldServer = () => state.info && state.info.api !== API
 
-function fetchMaia() {
-    if (modelsOff()) return
+function fetchModel() {
+    state.model = null
+    if (modelsOff() || oldServer()) return
     const fen = state.tree.current.fen
+    if (new Chess(fen).isGameOver()) return
     const moves = historyMoves()
-    const [w, b] = elos()
-    const key = [fen, moves.slice(-7).join("."), moves.length < 7, w, b].join("|")
-    state.maia = null
-    load("maia", key, `/api/maia?fen=${encodeURIComponent(fen)}&moves=${moves.join(",")}&white=${w}&black=${b}`, d => {
-        if (state.tree.current.fen !== fen) return
-        state.maia = d
+    const q = filterQuery()
+    const key = [fen, moves.slice(-8).join("."), moves.length < 8, state.white, state.black, q].join("|")
+    state.modelBusy = true
+    const url = `/api/model?fen=${encodeURIComponent(fen)}&moves=${moves.join(",")}&white=${state.white}&black=${state.black}&${q}`
+    const hit = cache.model.get(key)
+    if (hit) { state.model = hit; state.modelBusy = false; return }
+    fetchJson("model", url).then(d => {
+        cache.model.set(key, d)
+        state.modelBusy = false
+        if (state.tree.current.fen !== fen || filterQuery() !== q) return
+        state.model = d
+        render()
+    }).catch(e => {
+        state.modelBusy = false
+        // A newer position superseded this request on the server: not an error.
+        if (e.name === "AbortError" || e.status === 409) return
+        status(e.message, true)
         render()
     })
 }
 
 function fetchEngine(force) {
-    if (modelsOff()) return
+    if (modelsOff() || oldServer()) return
     const fen = state.tree.current.fen
     const key = fen.split(" ").slice(0, 4).join(" ") + "|" + state.nodes
     state.engine = cache.engine.get(key) || null
@@ -324,35 +335,51 @@ function fetchEngine(force) {
 
 // ---------------------------------------------------------------- table
 
-const COLS = [
-    {k: "san", h: "Move", num: false, t: "Move. Italic: not played in the database under these filters"},
-    {k: "n", h: "Games", t: "Games that played the move from this position, under the filters"},
-    {k: "share", h: "%", t: "Share of the moves played from this position, under the filters"},
-    {k: "score", h: "Score", t: () => `Score for ${VIEW()}, %`},
-    {k: "draw", h: "Draw", t: "Draw rate, %"},
-    {k: "elo", h: "Elo", t: () => CHOICES.view === "white" ? "Average rating of White (games with both ratings)" : "Average rating of the player who made the move (games with both ratings)"},
-    {k: "opp_elo", h: "Opp", t: () => CHOICES.view === "white" ? "Average rating of Black" : "Average rating of the opponent"},
-    {k: "perf", h: "Perf", t: () => `Performance of ${VIEW()}: opponents' average - 400 log10(1/score - 1), capped at ±800`},
-    {k: "last_year", h: "Last", t: "Last year the move was played"},
-    {k: "reach", h: "Reach", t: "Games reaching the position after the move by any move order; unfiltered, all tempi"},
-    {k: "trend", h: "Trend", num: false, t: "Share per year. ▲/▼: recent share differs from the earlier share beyond chance"},
-    {k: "maia", h: "Maia", t: "Maia-3 probability for the side to move at the set ratings, % (blitz scale)"},
-    {k: "delta", h: "Δ", t: "Maia − database share, percentage points. Fair only when the rating filter is near the Maia ratings; Maia is on a blitz scale"},
-    {k: "sf", h: "SF", t: () => `Stockfish after the move, pawns from ${VIEW()}'s view`},
-]
+// The columns. A column whose figure comes from the models shows the database figure,
+// dimmed, until the models answer (or for good when they are off).
+function eloCols() {
+    if (CHOICES.elo === "chooser") return [
+        {k: "elo1", h: "Δ Elo", t: "The chooser's rating against the position: the mean rating of the side to move in the games with this move minus its mean over all moves from here, shrunk n/(n+k) toward zero (n = games with both ratings)"},
+        {k: "elo2", h: "Δ gap", t: "The rating gap (chooser minus opponent) in the games with this move minus the same gap over all moves from here, shrunk n/(n+k): above zero, the move is chosen against relatively weaker opponents"},
+    ]
+    return [
+        {k: "elo1", h: "W-Elo", t: "White's rating in the games with this move against White's mean over all moves from here, shrunk n/(n+k) toward zero (n = games with both ratings): the expected difference for the next White to reach the position after it"},
+        {k: "elo2", h: "B-Elo", t: "The same for Black"},
+    ]
+}
+
+function cols() {
+    const sh = state.info && state.info.shrink || {}
+    return [
+        {k: "san", h: "Move", num: false, w: 62, t: "Move. Italic: not played in the database under these filters"},
+        {k: "n", h: "Games", w: 62, t: "Games that played the move from this position, under the filters"},
+        {k: "p_mix", h: "Prob", w: 46, t: `Probability of the move: (games + κ·model) / (all games + κ), κ = ${sh.kappa}. The database share alone in the cell's tooltip`},
+        {k: "p_model", h: "Model", w: 50, t: "Model 1's probability for the side to move at the header's ratings"},
+        {k: "delta", h: "Δ", w: 44, t: "Prob − Model, percentage points: where the games depart from the model, weighted by how many there are"},
+        {k: "score", h: "Score", w: 50, t: `White's expected score, %: (games·database + κv·model 2) / (games + κv), κv = ${sh.kappa_v}, model 2 for the position after the move at the header's ratings`},
+        {k: "draw", h: "Draw", w: 46, t: `Draw probability, %, mixed the same way (κv = ${sh.kappa_v})`},
+        ...eloCols().map(c => ({...c, w: 58, t: c.t + ` (k = ${sh.k_elo})`})),
+        {k: "last_year", h: "Last", w: 44, t: "Last year the move was played"},
+        {k: "reach", h: "Reach", w: 62, t: "Games reaching the position after the move by any move order; unfiltered, all tempi"},
+        ...(CHOICES.trend ? [{k: "trend", h: "Trend", num: false, w: 82, t: "Share per year. ▲/▼: recent share differs from the earlier share beyond chance"}] : []),
+        {k: "sf", h: "SF", w: 52, t: () => `Stockfish after the move, pawns from ${VIEW()}'s view`},
+    ]
+}
 
 function rows() {
     const fen = state.tree.current.fen
     const chess = new Chess(fen)
     const legal = new Map(chess.moves({verbose: true}).map(m => [m.from + m.to + (m.promotion || ""), m.san]))
-    const s = state.stats, mp = state.maia && state.maia.moves, en = state.engine && state.engine.moves
+    const s = state.stats, md = state.model && state.model.moves, en = state.engine && state.engine.moves
+    const pList = (state.info && state.info.p_list) || 0.01
     const byUci = new Map()
     const add = uci => {
-        if (!byUci.has(uci)) byUci.set(uci, {uci, san: legal.get(uci) || uci, db: null})
+        if (!byUci.has(uci)) byUci.set(uci, {uci, san: legal.get(uci) || uci, db: null, m: null})
         return byUci.get(uci)
     }
     if (s) for (const m of s.moves) add(m.uci).db = m
-    if (mp) for (const [u, p] of Object.entries(mp)) if (p >= MAIA_MIN || state.showAll) add(u)
+    if (md) for (const [u, v] of Object.entries(md)) if (v.p_model >= pList || v.n > 0 || state.showAll) add(u).m = v
+    if (md) for (const r of byUci.values()) r.m = md[r.uci] || r.m
     if (state.showAll) for (const u of legal.keys()) add(u)
     let bestSf = null
     if (en) {
@@ -360,24 +387,28 @@ function rows() {
         if (bestSf) add(bestSf)
     }
     const total = s && s.status === "ok" ? s.total.played : 0
+    const flip = !fen.includes(" w ") && CHOICES.view === "mover"
     const out = []
     for (const r of byUci.values()) {
-        const d = r.db || {}
+        const d = r.db || {}, m = r.m
         r.n = total ? d.n || 0 : null          // 0 is data only where the position has games
         r.share = total ? (d.n || 0) / total : null
-        for (const k of ["draw", "last_year", "reach", "n_rated"]) r[k] = d[k] ?? null
-        r.score = povScore(d.score ?? null)
-        if (flipped()) {   // White's view with Black to move: the mover is Black
-            r.elo = d.opp_elo ?? null
-            r.opp_elo = d.elo ?? null
-            r.perf = perfRating(r.score, r.opp_elo)
-        } else {
-            r.elo = d.elo ?? null
-            r.opp_elo = d.opp_elo ?? null
-            r.perf = d.perf ?? null
+        for (const k of ["last_year", "reach", "n_rated"]) r[k] = d[k] ?? null
+        if (d.white_wins != null) {
+            r.dbScore = d.n ? (d.white_wins + 0.5 * d.draws) / d.n : null
+            r.dbDraw = d.n ? d.draws / d.n : null
+        } else {   // a server from before api 3 sends the mover's score only
+            r.dbScore = d.score == null ? null : fen.includes(" w ") ? d.score : 1 - d.score
+            r.dbDraw = d.draw ?? null
         }
-        r.maia = mp ? (mp[r.uci] ?? 0) : null
-        r.delta = r.maia != null && total >= DELTA_MIN_GAMES ? r.maia - r.share : null
+        r.p_mix = m ? m.p_mix : null
+        r.p_model = m ? m.p_model : null
+        r.delta = m ? m.delta : null
+        r.score = m ? m.score_mix : r.dbScore
+        r.draw = m ? m.draw_mix : r.dbDraw
+        if (flip && r.score != null) r.score = 1 - r.score
+        r.elo1 = CHOICES.elo === "chooser" ? d.mover_elo_delta ?? null : d.w_elo_delta ?? null
+        r.elo2 = CHOICES.elo === "chooser" ? d.gap_delta ?? null : d.b_elo_delta ?? null
         r.sfv = en ? en[r.uci] : null
         r.sf = r.sfv ? povScore(r.sfv.value) : null
         r.best = r.uci === bestSf
@@ -385,21 +416,24 @@ function rows() {
         out.push(r)
     }
     const {key, desc} = state.sort
-    const val = r => key === "san" ? r.san : r[key]
+    const val = r => key === "san" ? r.san : key === "n" ? r.n ?? -1 : r[key]
+    const tie = (a, b) => (b.p_model || 0) - (a.p_model || 0)
     out.sort((a, b) => {
         const va = val(a), vb = val(b)
-        if (va == null && vb == null) return (b.maia || 0) - (a.maia || 0)
+        if (va == null && vb == null) return tie(a, b)
         if (va == null) return 1
         if (vb == null) return -1
         const c = typeof va === "string" ? va.localeCompare(vb) : va - vb
-        return (desc ? -c : c) || (b.maia || 0) - (a.maia || 0)
+        return (desc ? -c : c) || tie(a, b)
     })
     return out
 }
 
 function renderHead() {
+    const cs = cols()
+    $("cols").innerHTML = cs.map(c => `<col style="width:${c.w}px">`).join("")
     const tr = document.querySelector("#tbl thead tr")
-    tr.innerHTML = COLS.map(c => {
+    tr.innerHTML = cs.map(c => {
         const sorted = state.sort.key === c.k ? (state.sort.desc ? " ▾" : " ▴") : ""
         let t = typeof c.t === "function" ? c.t() : c.t
         if (c.k === "trend" && state.stats && state.stats.trend) t += ". " + state.stats.trend.test
@@ -429,32 +463,76 @@ function deltaCell(r) {
     const v = 100 * r.delta
     const a = Math.min(1, Math.abs(v) / 20)
     const bg = v > 0 ? `rgba(40,120,220,${a * 0.45})` : `rgba(220,90,40,${a * 0.45})`
-    const txt = Math.round(v) === 0 ? "0" : (v > 0 ? "+" : "") + v.toFixed(0)
+    const txt = Math.round(v) === 0 ? "0" : (v > 0 ? "+" : "−") + Math.abs(v).toFixed(0)
     return `<span class="pill" style="background:${bg}">${txt}</span>`
+}
+
+function pending() {
+    return modelsOff() ? "models off: the database alone" : oldServer() ? "the server is older than this page: restart it"
+        : state.modelBusy ? "models computing: the database alone for now" : "the database alone"
+}
+
+function probCell(r) {
+    const db = r.share == null ? "no games in the position" : `database ${pctShare(r.share)}% (${r.n ?? 0} of ${state.stats.total.played})`
+    if (r.p_mix != null) return `<td class="num" title="${esc(db + `; model ${pct(r.p_model, 1)}%`)}">${pctShare(r.p_mix)}</td>`
+    return `<td class="num pending" title="${esc(db + "; " + pending())}">${pctShare(r.share)}</td>`
+}
+
+function mixCell(r, kind) {
+    const m = r.m
+    const v = kind === "score" ? r.score : r.draw
+    const dbv = kind === "score" ? r.dbScore : r.dbDraw
+    const db = dbv == null ? "no games" : `database ${pct(dbv, 1)}% of ${r.n}`
+    if (m && v != null) {
+        const mv = kind === "score" ? m.score_model : m.draw_model
+        return `<td class="num" title="${esc(`${db}; model 2 ${pct(mv, 1)}%`)}">${pct(v)}</td>`
+    }
+    return `<td class="num pending" title="${esc(db + "; " + pending())}">${pct(dbv)}</td>`
+}
+
+function eloCell(r, which) {
+    const d = r.db
+    const v = which === 1 ? r.elo1 : r.elo2
+    if (!d || v == null) return `<td class="num"></td>`
+    const t = state.stats.total
+    let tip
+    if (CHOICES.elo === "chooser") {
+        const chooser = state.stats.white_to_move ? "White" : "Black"
+        tip = which === 1
+            ? `${chooser} (chooser) here ${int(state.stats.white_to_move ? d.white_elo : d.black_elo)}, position ${int(state.stats.white_to_move ? t.white_elo : t.black_elo)}`
+            : `gap chooser − opponent: this move ${signed(d.gap)}, position ${signed(t.gap)}`
+    } else {
+        tip = which === 1 ? `White here ${int(d.white_elo)}, position ${int(t.white_elo)}` : `Black here ${int(d.black_elo)}, position ${int(t.black_elo)}`
+    }
+    return `<td class="num" title="${esc(`${tip}; ${d.n_rated} games with both ratings`)}">${signed(v)}</td>`
+}
+
+function totalsLine(s) {
+    const t = s.total, table = state.info ? state.info.stats.table : "the"
+    if (s.status === "none") return `<b>No games.</b> Fewer than two games in the ${table} table reach this position.`
+    if (s.status === "ended") return `<b>${t.reach}</b> games reach this position; none played on from it (they ended here or at ply 80).`
+    if (s.status === "filtered") return `<b>No games under these filters.</b> ${t.reach} games reach this position without them.`
+    const pos = state.model && state.model.position
+    const dbScore = t.white_score ?? (t.white_wins + 0.5 * t.draws) / t.played   // ?? : servers before api 3
+    const dbDraw = t.draw ?? t.draws / t.played
+    const score = pos && pos.score_mix != null ? pos.score_mix : dbScore
+    const draw = pos && pos.draw_mix != null ? pos.draw_mix : dbDraw
+    const cls = pos && pos.score_mix != null ? "" : "pending"
+    const tip = `database ${pct(dbScore, 1)}% / draws ${pct(dbDraw, 1)}% of ${t.played}` +
+        (pos && pos.score_model != null ? `; model 2 ${pct(pos.score_model, 1)}% / ${pct(pos.draw_model, 1)}%` : `; ${pending()}`)
+    const elo = t.white_elo === undefined ? "" : CHOICES.elo === "chooser"
+        ? `gap ${s.white_to_move ? "White" : "Black"} − opponent ${signed(t.gap)}`
+        : `White ${int(t.white_elo)} · Black ${int(t.black_elo)}`
+    return `<b title="Games that played a move from here, under the filters (a game that comes back and plays another move counts for both)">${t.played}</b> games` +
+        ` <span class="dim" title="Games that reached this position: all years, bands and tempi, each game once">(${t.reach} reached)</span>` +
+        ` · <span class="${cls}" title="${esc(tip)}">White ${pct(score, 1)}% · draw ${pct(draw)}%</span>` +
+        (elo ? ` · <span title="Mean ratings over the moves' games with both ratings (${t.n_rated})">${elo}</span>` : "")
 }
 
 function render() {
     const s = state.stats
-    const total = $("totals")
     if (s) {
-        const t = s.total, table = state.info ? state.info.stats.table : "the"
-        const side = s.white_to_move ? "White" : "Black"
-        let h
-        if (s.status === "none") {
-            h = `<b>No games.</b> Fewer than two games in the ${table} table reach this position.`
-        } else if (s.status === "ended") {
-            h = `<b>${t.reach}</b> games reach this position; none played on from it (they ended here or at ply 80).`
-        } else if (s.status === "filtered") {
-            h = `<b>No games under these filters.</b> ${t.reach} games reach this position without them.`
-        } else {
-            const w = t.white_wins / t.played, d = t.draws / t.played, b = t.black_wins / t.played
-            const scoreSide = CHOICES.view === "white" ? "White" : side
-            const score = CHOICES.view === "white" ? (t.white_wins + 0.5 * t.draws) / t.played : t.score
-            h = `<b title="Games that played a move from here, under the filters (a game that comes back and plays another move counts for both)">${t.played}</b> games` +
-                ` <span class="dim" title="Games that reached this position: all years, bands and tempi, each game once">(${t.reach} reached)</span>` +
-                ` · W ${pct(w)} D ${pct(d)} B ${pct(b)} · score ${scoreSide} ${pct(score, 1)}%`
-        }
-        total.innerHTML = h + ` <span class="dim mono" title="Zobrist hash">${s.hash}</span>`
+        $("totals").innerHTML = totalsLine(s) + ` <span class="dim mono" title="Zobrist hash">${s.hash}</span>`
         const mo = s.move_orders
         if (mo && mo.length > 1) {
             $("orders").innerHTML = `Transposition: reached by ${mo.length} different last moves · ` +
@@ -463,7 +541,7 @@ function render() {
             $("orders").textContent = ""
         }
     } else {
-        total.innerHTML = '<span class="dim">loading…</span>'
+        $("totals").innerHTML = '<span class="dim">loading…</span>'
     }
     renderHead()
     const rs = rows()
@@ -475,53 +553,46 @@ function render() {
         return `<tr data-uci="${r.uci}" class="${cls}">` +
             `<td class="san">${esc(r.san)}</td>` +
             `<td class="num${r.db ? "" : " dim"}">${r.n ?? ""}</td>` +
-            `<td class="num${r.db ? "" : " dim"}">${pctShare(r.share)}</td>` +
-            `<td class="num">${pct(r.score)}</td>` +
-            `<td class="num">${pct(r.draw)}</td>` +
-            `<td class="num" title="${r.n_rated == null ? "" : r.n_rated + " games with both ratings"}">${int(r.elo)}</td>` +
-            `<td class="num">${int(r.opp_elo)}</td>` +
-            `<td class="num">${int(r.perf)}</td>` +
+            probCell(r) +
+            `<td class="num model">${r.p_model == null ? "" : pctShare(r.p_model)}</td>` +
+            `<td class="num">${deltaCell(r)}</td>` +
+            mixCell(r, "score") + mixCell(r, "draw") +
+            eloCell(r, 1) + eloCell(r, 2) +
             `<td class="num">${r.last_year ?? ""}</td>` +
             `<td class="num dim">${r.reach ?? ""}</td>` +
-            `<td>${trendCell(r, s)}</td>` +
-            `<td class="num maia">${pctShare(r.maia)}</td>` +
-            `<td class="num">${deltaCell(r)}</td>` +
+            (CHOICES.trend ? `<td>${trendCell(r, s)}</td>` : "") +
             `<td class="num ${r.best ? "best" : ""}" title="${sfTitle}">${cpText(r.sfv)}</td>` +
             `</tr>`
     }).join("")
-    if (!rs.length) body.innerHTML = `<tr><td colspan="${COLS.length}" class="dim">${s ? "no moves to show" : ""}</td></tr>`
+    if (!rs.length) body.innerHTML = `<tr><td colspan="${cols().length}" class="dim">${s ? "no moves to show" : ""}</td></tr>`
     showArrow(state.cursor)
     renderModels()
     renderStatus()
 }
 
 function renderModels() {
-    const m = state.maia, e = state.engine
-    let h = ""
-    if (m) {
-        const [w, d, l] = povWdl(m.wdl)
-        const rating = (fide, maia) => CHOICES.ratings === "fide" ? `${fide}` : CHOICES.ratings === "maia" ? `${maia}`
-            : `${fide}<span class="dim">→${maia}</span>`
-        h += `<span title="Ratings: FIDE → the Maia rating it is translated to (maia = 1580 + 0.558 · FIDE, step 1). W/D/L for ${VIEW()}. Trained on online blitz: under-predicts draws in classical games">` +
-            `<b>${esc(m.model)}</b> · mover ${rating(m.mover_fide, m.mover_maia)} v ${rating(m.opp_fide, m.opp_maia)}` +
-            ` · W ${pct(w)} D ${pct(d)} L ${pct(l)}` +
-            (state.tree.fromStart ? "" : ' · <span class="warn" title="Position set from a FEN: Maia sees no earlier positions">no move history</span>') + `</span>`
+    const m = state.model, e = state.engine
+    let h
+    if (oldServer()) {
+        h = '<span class="warn">The server is older than this page: restart it (the database columns still work).</span>'
     } else if (modelsOff()) {
-        h += '<span class="dim">models off (server started with --no-models)</span>'
+        h = '<span class="dim">models off (server started with --no-models): every column is the database alone</span>'
+    } else if (m) {
+        const c = m.cost
+        h = `<span title="Model 1: moves for the side to move. Model 2: win, draw, loss of each position. Both at White ${m.white}, Black ${m.black} (FIDE)">` +
+            `<b>${esc(m.move_model)}</b> + <b>${esc(m.value_model)}</b> · W ${m.white} B ${m.black}</span>` +
+            ` <span class="dim" title="Model 2 positions: asked, computed now (the rest were cached)">· ${c.value_queries} positions, ${c.value_computed} new, ${(c.total_ms / 1000).toFixed(1)} s</span>` +
+            (state.tree.fromStart ? "" : ' · <span class="warn" title="Position set from a FEN: the models see no earlier positions">no move history</span>')
+    } else if (state.modelBusy) {
+        h = '<span class="dim">models: computing…</span>'
     } else {
-        h += '<span class="dim">Maia: loading…</span>'
+        h = '<span class="dim">models: —</span>'
     }
-    h += "<br>"
     if (e) {
         const ew = e.wdl ? povWdl(e.wdl) : null
-        const wdl = ew ? ` · W ${pct(ew[0])} D ${pct(ew[1])} L ${pct(ew[2])}` : ""
-        h += `<b>${esc(e.model)}</b>${wdl}`
-    } else if (modelsOff()) {
-        h = h.replace(/<br>$/, "")
+        h += ` · <b>${esc(e.model)}</b>` + (ew ? ` W ${pct(ew[0])} D ${pct(ew[1])} L ${pct(ew[2])}` : "")
     } else if (state.engineBusy) {
-        h += '<span class="dim">engine: running…</span>'
-    } else {
-        h += '<span class="dim">engine: e to run</span>'
+        h += ' · <span class="dim">engine: running…</span>'
     }
     $("models").innerHTML = h
 }
@@ -529,7 +600,7 @@ function renderModels() {
 function renderStatus() {
     const parts = []
     if (state.stats) parts.push(`stats ${state.stats.ms.toFixed(0)} ms server`)
-    for (const k of ["stats", "maia", "engine"]) if (timing[k] != null) parts.push(`${k} ${timing[k].toFixed(0)} ms`)
+    for (const k of ["stats", "model", "engine"]) if (timing[k] != null) parts.push(`${k} ${timing[k].toFixed(0)} ms`)
     if (!$("status").classList.contains("err")) $("status").textContent = parts.join(" · ")
 }
 
@@ -550,7 +621,7 @@ function update() {
     $("fen").textContent = state.tree.current.fen
     writeUrl()
     fetchStats()
-    fetchMaia()
+    fetchModel()
     fetchEngine(false)
     render()
 }
@@ -563,6 +634,7 @@ function setFilter() {
     f.tempi = on.length === boxes.length ? null : on
     writeUrl()
     fetchStats()
+    fetchModel()
     render()
 }
 
@@ -581,12 +653,12 @@ function initControls() {
     ).join("")
     for (const id of ["y0", "y1", "e0", "e1"]) $(id).addEventListener("change", setFilter)
     $("tempi").addEventListener("change", setFilter)
-    $("me").value = state.me
-    $("opp").value = state.opp
-    for (const id of ["me", "opp"]) $(id).addEventListener("change", () => {
+    $("white").value = state.white
+    $("black").value = state.black
+    for (const id of ["white", "black"]) $(id).addEventListener("change", () => {
         state[id] = +$(id).value
         writeUrl()
-        fetchMaia()
+        fetchModel()
         render()
     })
     $("nodes").value = String(state.nodes)
@@ -676,8 +748,6 @@ function command(k) {
             state.orientation = state.orientation === COLOR.white ? COLOR.black : COLOR.white
             board.setOrientation(state.orientation)
             writeUrl()
-            fetchMaia()   // "me" is the side at the bottom
-            render()
             return
         case "engine": fetchEngine(true); render(); return
         case "all": state.showAll = !state.showAll; render(); return
@@ -726,7 +796,7 @@ async function main() {
     }
     initControls()
     initBoard()
-    window.tnh = {state, play, command}   // for the end-to-end test and the console
+    window.tnh = {state, play, command, render, CHOICES}   // for the end-to-end test and the console
     update()
 }
 

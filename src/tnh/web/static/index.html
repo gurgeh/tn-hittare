@@ -18,9 +18,9 @@
     <label>Rating <select id="e0"></select></label>–<select id="e1"></select>
   </span>
   <span class="grp" id="tempi" title="Tempo as decided in games.parquet"></span>
-  <span class="grp" title="FIDE ratings for Maia-3, translated to its scale (1580 + 0.558 · FIDE). Me = the side at the bottom of the board (f flips)">
-    <label>Me <input id="me" type="number" min="0" max="4000" step="50"></label>
-    <label>Opp <input id="opp" type="number" min="0" max="4000" step="50"></label>
+  <span class="grp" title="FIDE ratings of White and Black, for both models: model 1 for the side to move, model 2 for every position">
+    <label>White <input id="white" type="number" min="0" max="4000" step="50"></label>
+    <label>Black <input id="black" type="number" min="0" max="4000" step="50"></label>
   </span>
   <span class="grp" title="Stockfish node budget for the whole MultiPV search (every legal move)">
     <label>SF nodes <select id="nodes">
@@ -43,11 +43,12 @@
   <section id="right">
     <div id="totals"></div>
     <div id="orders" class="dim"></div>
+    <div id="models"></div>
     <table id="tbl">
+      <colgroup id="cols"></colgroup>
       <thead><tr></tr></thead>
       <tbody></tbody>
     </table>
-    <div id="models"></div>
     <div id="stubs">
       <button disabled title="Statistics under best play, with shrinkage toward the model: not wired yet (tnh.builder)">Best-play stats</button>
       <button disabled title="Repertoire search from this position: not wired yet (tnh.builder)">Repertoire</button>

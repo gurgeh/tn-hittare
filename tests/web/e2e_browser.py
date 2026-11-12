@@ -5,8 +5,8 @@ without DISPLAY or WAYLAND_DISPLAY, so no window can open:
 
     env -u DISPLAY -u WAYLAND_DISPLAY python3 tests/web/e2e_browser.py http://127.0.0.1:PORT/ [SHOT_DIR]
 
-Expects the server to serve the eight games of `_webfix.GAMES`. Exits non-zero on the
-first failed check.
+Expects the server to serve the eight games of `_webfix.GAMES` with the fake models
+(`--move-model fake --value-model fake`). Exits non-zero on the first failed check.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ def counts(page) -> dict[str, int]:
 
 
 def settle(page) -> None:
-    page.wait_for_function("window.tnh && window.tnh.state.stats && window.tnh.state.maia")
+    page.wait_for_function("window.tnh && window.tnh.state.stats && window.tnh.state.model")
 
 
 def square_center(page, sq: str) -> tuple[float, float]:
@@ -45,9 +45,22 @@ def main() -> None:
         page.on("pageerror", lambda e: errors.append(str(e)))
         page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
 
-        page.goto(BASE)
+        page.goto(BASE + "#t=all")
         settle(page)
         assert counts(page) == {"e2e4": 4, "d2d4": 2, "c2c4": 2}, counts(page)
+        # the model columns are filled: no cell still waits for the models
+        expect(page.locator("#tbl td.pending")).to_have_count(0)
+        expect(page.locator("#models")).to_contain_text("fake-move")
+        expect(page.locator("#tbl thead")).to_contain_text("W-Elo")
+        # the other form of the rating columns, one switch away
+        page.evaluate("window.tnh.CHOICES.elo = 'chooser'; window.tnh.render()")
+        expect(page.locator("#tbl thead")).to_contain_text("Δ gap")
+        page.evaluate("window.tnh.CHOICES.elo = 'colours'; window.tnh.render()")
+        # the ratings go to the models and the URL
+        page.locator("#white").fill("2400")
+        page.locator("#white").press("Enter")
+        page.locator("#white").blur()
+        page.wait_for_function("location.hash.includes('w=2400') && window.tnh.state.model && window.tnh.state.model.white === 2400")
 
         # drag e2-e4 on the board
         page.mouse.move(*square_center(page, "e2"))
@@ -75,7 +88,7 @@ def main() -> None:
         settle(page)
         for t in ("rapid", "blitz", "unknown"):
             page.locator(f"#tempi input[value='{t}']").uncheck()
-        page.wait_for_function("location.hash.includes('t=classical')")
+        page.wait_for_function("!location.hash.includes('t=')")   # classical is the default
         settle(page)
         assert counts(page) == {"e2e4": 2, "d2d4": 1, "c2c4": 2}, counts(page)
         page.locator("#tempi input[value='rapid']").check()
@@ -84,7 +97,7 @@ def main() -> None:
         settle(page)
 
         # the URL carries the position: reload lands on it
-        page.goto(BASE + "#m=d2d4.g8f6.c2c4")
+        page.goto(BASE + "#m=d2d4.g8f6.c2c4&t=all")
         page.reload()
         settle(page)
         assert counts(page) == {"e7e6": 3, "g7g6": 1}, counts(page)
@@ -106,7 +119,7 @@ def main() -> None:
         assert counts(page) == {}, counts(page)
         expect(page.locator("#totals")).to_contain_text("No games.")
         expect(page.locator("#models")).to_contain_text("no move history")
-        expect(page.locator("#models")).to_contain_text("2200→2808")
+        expect(page.locator("#models")).to_contain_text("fake-move")
         if SHOTS:
             page.screenshot(path=f"{SHOTS}/e2e_fen.png")
         browser.close()

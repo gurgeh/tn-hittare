@@ -4,7 +4,8 @@
     --dim: #77756f;
     --line: #dddbd5;
     --panel: #ffffff;
-    --hover: #eef2f8;
+    --hover: #e6edf8;
+    --zebra: #f7f7f4;
     --cursor: #dfe8f6;
     --cur: #2b62c4;
     --up: #1a7f37;
@@ -22,6 +23,7 @@
         --line: #303236;
         --panel: #1e1f22;
         --hover: #26303d;
+        --zebra: #222327;
         --cursor: #2c3a50;
         --cur: #7aa7f5;
         --up: #4ade80;
@@ -128,9 +130,15 @@ main {
     border-bottom: 2px solid var(--line);
 }
 #tbl th.num, #tbl td.num { text-align: right; }
+#tbl { table-layout: fixed; }
+#tbl th, #tbl td { overflow: hidden; text-overflow: clip; }
 #tbl tbody tr { cursor: pointer; }
+#tbl tbody tr:nth-child(even) { background: var(--zebra); }
 #tbl tbody tr:hover { background: var(--hover); }
 #tbl tbody tr.cursor { background: var(--cursor); }
+#tbl td.pending { color: var(--dim); font-style: italic; }
+#tbl td.model { color: var(--maia); }
+.pending { color: var(--dim); }
 #tbl td.san { font-weight: 600; }
 #tbl tr.nodb td.san { font-weight: 400; font-style: italic; }
 #tbl td.maia { color: var(--maia); }
@@ -144,7 +152,7 @@ main {
 b.up { color: var(--up); font-size: 10px; margin-left: 2px; }
 b.down { color: var(--down); font-size: 10px; margin-left: 2px; }
 
-#models { font-size: 12px; }
+#models { font-size: 12px; min-height: 1.4em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #stubs { display: flex; gap: 6px; align-items: center; }
 #keys { font-size: 11px; }
 #status { font-size: 11px; color: var(--dim); min-height: 1.3em; }
