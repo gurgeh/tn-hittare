@@ -54,6 +54,9 @@ class EngineSpec:
     # score with the inverse shift, so a tree kept from another contempt shows wrong scores.
     # Never preppy's: it keeps its graph across positions and settings on purpose.
     reset_on: tuple[str, ...] = ()
+    # Options the engine accepts but does not declare in its `uci` answer (Lc0's hidden ones),
+    # with the declaration the page should use.
+    hidden: dict[str, dict] = field(default_factory=dict)
 
     def available(self) -> str | None:
         """None when it can start, else why not."""
@@ -83,27 +86,51 @@ def default_specs(*, threads: int = 4, hash_mb: int = 256, lc0_minibatch: int = 
         "lc0": EngineSpec("lc0", "Lc0", [str(lc0.binary())],
                           {"WeightsFile": str(lc0.network_path()), "Backend": "cuda-auto",
                            "BackendOptions": f"max_batch={lc0_minibatch}", "MinibatchSize": str(lc0_minibatch),
-                           "MaxPrefetch": "0", "Threads": "2", "UCI_ShowWDL": "true"},
-                          ("Contempt", "WDLCalibrationElo", "ContemptMode"), gpu_mb=2500, short="Lc0",
-                          derive=lc0_contempt, reset_on=("Contempt", "ContemptMode", "WDLCalibrationElo")),
+                           "MaxPrefetch": "0", "Threads": "2", "UCI_ShowWDL": "true",
+                           "WDLDrawRateReference": "0.62"},          # BT4's draw rate, per the Lc0 guide
+                          ("Contempt", "WDLCalibrationElo", "WDLEvalObjectivity", "WDLContemptAttenuation",
+                           "ContemptMode", "MovesLeftThreshold"), gpu_mb=2500, short="Lc0",
+                          derive=lc0_contempt, reset_on=LC0_RESET,
+                          hidden={"WDLContemptAttenuation": {"name": "WDLContemptAttenuation", "type": "string",
+                                                             "default": "1", "vars": []}}),
         "preppy": EngineSpec("preppy", "preppy", [sys.executable, "-m", "tnh.engine.uci"], {},
                              ("MyElo", "OppElo", "Side", "Tempo", "Price", "Cap", "Obvious", "Prepared", "DrawScore"),
                              gpu_mb=2500, short="preppy"),
     }
 
 
+LC0_RESET = ("Contempt", "ContemptMode", "WDLCalibrationElo", "WDLEvalObjectivity", "WDLContemptAttenuation",
+             "MovesLeftThreshold")
+
+
+def _unit(settings: dict, key: str, default: str) -> str:
+    raw = str(settings.get(key, "") or "").strip() or default
+    try:
+        x = float(raw)
+    except ValueError as e:
+        raise EngineError(f"{key} must be a number from 0 to 1, not {raw!r}") from e
+    if not 0 <= x <= 1:
+        raise EngineError(f"{key} must be from 0 to 1, not {raw}")
+    return raw
+
+
 def lc0_contempt(settings: dict, me: str) -> dict:
-    """Lc0's contempt from the page: `Contempt` in Elo (empty or 0 = off), positive when "me"
-    (the side at the bottom of the board) is the stronger side. On, `ContemptMode` is
-    `white_side_analysis` or `black_side_analysis` for that side, never `play`, which would
-    favour whichever side is to move; off, `ContemptMode disable` and an empty `Contempt`.
-    `WDLCalibrationElo` passes through (0 = off). `WDLEvalObjectivity` stays at its default.
-    Measured with Lc0 v0.32.1 and BT4 on the Najdorf (2026-11-12), a fresh tree each time and
-    about 42k nodes: off, the lines were 6.f3 +0.34, 6.Be3 +0.25, 6.Be2 +0.24 (White's view);
-    Contempt 200 for White, 6.f3 +0.04, 6.Bg5 0.00, 6.Bc4 0.00; Contempt 200 for Black (the same
-    as -200 for White), 6.Be3 +0.41, 6.Be2 +0.38, 6.f3 +0.45. So the choice of moves changes
-    and the shown score is not fully objective: it moves by about -0.3 and +0.1. (An earlier
-    test kept the tree across settings and showed shifts of over a pawn: that was the reuse.)"""
+    """Lc0's contempt settings from the page, after the Lc0 team's guide to WDL contempt
+    (reference/lc0-sadler-wdl-contempt.md, "Suggested use for opening research"):
+
+    - `Contempt` in Elo (empty or 0 = off), positive when "me" (the side at the bottom of the
+      board) is the stronger side. On, `ContemptMode` is `white_side_analysis` or
+      `black_side_analysis` for that side, never `play`, which would favour whichever side is
+      to move; off, `ContemptMode disable` and an empty `Contempt`.
+    - `WDLCalibrationElo` (0 = off), `WDLEvalObjectivity` and `WDLContemptAttenuation` (0-1,
+      default 1) pass through.
+    - `MovesLeftThreshold` 0.95 when |Contempt| is above 250 (the guide's advice for extreme
+      values), else Lc0's default 0.8.
+
+    `WDLDrawRateReference` 0.62 (BT4's draw rate) is set once at start, not here. A change of
+    any of these clears Lc0's tree (`EngineSpec.reset_on`): it shifts leaf values by its
+    contempt when it evaluates them, so a kept tree shows scores from another setting.
+    """
     raw = str(settings.get("Contempt", "") or "").strip()
     try:
         c = float(raw) if raw else 0.0
@@ -116,9 +143,24 @@ def lc0_contempt(settings: dict, me: str) -> dict:
         float(elo)
     except ValueError as e:
         raise EngineError(f"WDLCalibrationElo must be a number, not {elo!r}") from e
-    if c == 0:
-        return {"Contempt": "", "ContemptMode": "disable", "WDLCalibrationElo": elo}
-    return {"Contempt": f"{c:g}", "ContemptMode": f"{me}_side_analysis", "WDLCalibrationElo": elo}
+    out = {"Contempt": f"{c:g}" if c else "", "ContemptMode": f"{me}_side_analysis" if c else "disable",
+           "WDLCalibrationElo": elo,
+           "WDLEvalObjectivity": _unit(settings, "WDLEvalObjectivity", "1"),
+           "WDLContemptAttenuation": _unit(settings, "WDLContemptAttenuation", "1"),
+           "MovesLeftThreshold": "0.95" if abs(c) > 250 else "0.8"}
+    return out
+
+
+def lc0_from_ratings(white: int, black: int, me: str, tempo: str) -> dict:
+    """Lc0's contempt settings from the two players, after the guide's recipe: the calibration
+    Elo is the rating of "me" plus about 50 per doubling of thinking time from 3'+2" (+200
+    for classical, 0 for blitz), and Contempt is the rating difference from my side. Equal
+    ratings give Contempt 0: the draw rate of that level, no contempt."""
+    if me not in ("white", "black"):
+        raise EngineError(f"me must be white or black, not {me!r}")
+    mine, theirs = (white, black) if me == "white" else (black, white)
+    extra = 0 if tempo == "blitz" else 200
+    return {"Contempt": str(int(mine - theirs)), "WDLCalibrationElo": str(int(mine + extra))}
 
 
 def gpu_free_mb() -> int | None:
@@ -344,10 +386,12 @@ class EngineManager:
             p.send("uci")
             lines = p.wait_for("uciok", self.start_timeout)
             self._options = {o["name"]: o for o in (parse_option(x) for x in lines) if o}
+            for k, d in spec.hidden.items():
+                self._options.setdefault(k, d)
             for k, v in spec.options.items():
                 p.send(f"setoption name {k} value {v}")
             p.send("isready")
-            p.wait_for("readyok", self.start_timeout)
+            _check_accepted(spec, p.wait_for("readyok", self.start_timeout))
         except EngineError:
             p.quit()
             self._phase = "off"
@@ -412,7 +456,7 @@ class EngineManager:
                     self._proc.send("ucinewgame")
                 if changed:
                     self._proc.send("isready")
-                    self._proc.wait_for("readyok", self.start_timeout)
+                    _check_accepted(spec, self._proc.wait_for("readyok", self.start_timeout))
                     self._applied.update(changed)
                 with self._data:
                     self._gen += 1
@@ -487,6 +531,13 @@ class EngineManager:
                     if self._proc is not None and time.monotonic() - self._touched > self.idle_s:
                         self._quit()
                         self._error = f"stopped after {self.idle_s:g} s without a page asking"
+
+
+def _check_accepted(spec: EngineSpec, lines: list[str]) -> None:
+    """An engine's complaint about a `setoption` comes back on stdout before `readyok`."""
+    bad = [ln for ln in lines if "error" in ln.lower() or "unknown option" in ln.lower() or "no such option" in ln.lower()]
+    if bad:
+        raise EngineError(f"{spec.label} refused: {' | '.join(bad)[:300]}")
 
 
 def _board(fen: str, moves: list[str]) -> chess.Board:

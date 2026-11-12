@@ -782,10 +782,13 @@ main()
 const ENG_STORE = "tnh.engine"
 // Options the page feeds from its own controls rather than a settings box: preppy's sides,
 // ratings and tempo; Lc0's ContemptMode (the server derives it from Contempt and "me").
-const FED = ["MyElo", "OppElo", "Side", "Tempo", "ContemptMode"]
+const FED = ["MyElo", "OppElo", "Side", "Tempo", "ContemptMode", "MovesLeftThreshold"]
+// Lc0's tooltips follow the Lc0 team's guide (reference/lc0-sadler-wdl-contempt.md).
 const OPTION_TIPS = {
-    Contempt: "Lc0's contempt in Elo: positive when I (the side at the bottom) am the stronger side; empty or 0 = off. It changes Lc0's choice of moves; the shown score is not fully objective either (WDLEvalObjectivity left at its default): measured on the Najdorf with a fresh tree, 6.f3 went from +0.34 to +0.04 with Contempt 200 for White and to +0.45 with 200 for Black. A change of contempt clears Lc0's tree",
-    WDLCalibrationElo: "Lc0: the rating its WDL is calibrated to; 0 = off",
+    Contempt: "Lc0's contempt: the Elo difference from my side (the side at the bottom); positive when I am the stronger side; empty or 0 = off. Let Lc0 run at least 10k nodes before trusting the lines, so that they are not just the usual main lines from its policy. A change clears Lc0's tree. Above 250 the page also sends MovesLeftThreshold 0.95",
+    WDLCalibrationElo: "Lc0: the rating level its W/D/L is simulated at (0 = off): my rating, plus about 50 per doubling of thinking time from 3'+2\". It does not weaken the search. The same Contempt has less effect at a higher calibration Elo",
+    WDLEvalObjectivity: "Lc0, 0-1 (default 1). Objectivity 0 with attenuation 1: the realistic W/D/L of this matchup and suitable lines. Objectivity 1 with attenuation between 0 and 1: different levels of aggression, with the objective evaluation of the chosen lines (which is why the shown score can drop for the favoured side: contempt picks lines that are objectively a little worse)",
+    WDLContemptAttenuation: "Lc0, 0-1 (default 1): how much of the contempt acts. With objectivity 1, values between 0 and 1 give different levels of aggression with the objective evaluation of the chosen lines",
     DrawScore: "preppy: what a draw is worth to me (0-1, 0.5 = half a point). The rating difference in the White and Black boxes is preppy's real contempt; DrawScore only changes what a draw is worth",
 }
 
@@ -834,6 +837,26 @@ async function initEngine() {
         const moves = a.dataset.pv.split(".").filter(Boolean)
         for (const m of moves) if (!state.tree.play(m)) { status("illegal move in the engine's line: " + m, true); break }
         update()
+    })
+    $("engset").addEventListener("click", async e => {
+        if (e.target.id !== "engfill") return
+        const me = state.orientation === COLOR.white ? "white" : "black"
+        const t = state.filters.tempi
+        const tempo = t && t.length === 1 && t[0] === "blitz" ? "blitz" : "classical"
+        try {
+            const r = await fetch(`/api/uci/fill?white=${state.white}&black=${state.black}&me=${me}&tempo=${tempo}`)
+            const d = await r.json()
+            if (!r.ok) throw new Error(d.detail || r.status)
+            Object.assign(state.eng.settings, d)
+            for (const [k, v] of Object.entries(d)) {
+                const el = $("engset").querySelector(`[data-opt="${k}"]`)
+                if (el) el.value = v
+            }
+            storePut()
+            engineGo()
+        } catch (err) {
+            status("fill: " + err.message, true)
+        }
     })
     $("engset").addEventListener("change", e => {
         const el = e.target.closest("[data-opt]")
@@ -993,9 +1016,13 @@ function renderEngine() {
         const ap = s.applied || {}
         if ("ContemptMode" in ap) {
             const mode = ap.ContemptMode
-            set += ` <span class="dim" title="What the server sent to Lc0: ContemptMode follows the side at the bottom (f flips it)">sent: ` +
+            set += ` <button id="engfill" title="Fill Contempt (my rating minus the other's) and WDLCalibrationElo (my rating, +200 for classical, +0 for blitz) from the White and Black boxes and the side at the bottom; edit them after if you like">from ratings</button>`
+            set += ` <span class="dim" title="What the server sent to Lc0 (WDLDrawRateReference 0.62, BT4's draw rate, is always sent): ContemptMode follows the side at the bottom (f flips it)">sent: ` +
                 (mode === "disable" ? "contempt off" : `Contempt ${esc(ap.Contempt)} for ${mode.split("_")[0]} (${esc(mode)})`) +
-                (ap.WDLCalibrationElo && ap.WDLCalibrationElo !== "0" ? ` · WDLCalibrationElo ${esc(ap.WDLCalibrationElo)}` : "") + `</span>`
+                (ap.WDLCalibrationElo && !/^0(\.0*)?$/.test(ap.WDLCalibrationElo) ? ` · WDLCalibrationElo ${esc(ap.WDLCalibrationElo)}` : "") +
+                (ap.WDLEvalObjectivity && ap.WDLEvalObjectivity !== "1" ? ` · objectivity ${esc(ap.WDLEvalObjectivity)}` : "") +
+                (ap.WDLContemptAttenuation && ap.WDLContemptAttenuation !== "1" ? ` · attenuation ${esc(ap.WDLContemptAttenuation)}` : "") +
+                (ap.MovesLeftThreshold === "0.95" ? " · MovesLeftThreshold 0.95" : "") + `</span>`
         }
         if (feedsSides() && Object.keys(fedSettings()).length) {
             const f = fedSettings()

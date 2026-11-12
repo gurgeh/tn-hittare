@@ -234,7 +234,10 @@ def test_lc0_contempt_mapping():
     flipped so that I am Black, then off again."""
     from tnh.web.engine import lc0_contempt
     spec = EngineSpec("lc0f", "Lc0 (fake)", [sys.executable, FAKE], {},
-                      ("Contempt", "WDLCalibrationElo", "ContemptMode"), short="Lc0", derive=lc0_contempt)
+                      ("Contempt", "WDLCalibrationElo", "WDLEvalObjectivity", "WDLContemptAttenuation", "ContemptMode",
+                       "MovesLeftThreshold"), short="Lc0", derive=lc0_contempt,
+                      hidden={"WDLContemptAttenuation": {"name": "WDLContemptAttenuation", "type": "string",
+                                                         "default": "1", "vars": []}})
     m = EngineManager({"lc0f": spec}, gpu_free=lambda: None)
     try:
         def sent(settings, me):
@@ -242,15 +245,16 @@ def test_lc0_contempt_mapping():
             wait_lines(m, 1)
             return m.snapshot()["applied"]
 
-        assert sent({}, "white") == {"Contempt": "", "ContemptMode": "disable", "WDLCalibrationElo": "0"}
+        base = {"WDLEvalObjectivity": "1", "WDLContemptAttenuation": "1", "MovesLeftThreshold": "0.8"}
+        assert sent({}, "white") == {"Contempt": "", "ContemptMode": "disable", "WDLCalibrationElo": "0", **base}
         assert sent({"Contempt": "0"}, "white")["ContemptMode"] == "disable"
         on = sent({"Contempt": "200", "WDLCalibrationElo": "2200"}, "white")
-        assert on == {"Contempt": "200", "ContemptMode": "white_side_analysis", "WDLCalibrationElo": "2200"}
+        assert on == {"Contempt": "200", "ContemptMode": "white_side_analysis", "WDLCalibrationElo": "2200", **base}
         assert sent({"Contempt": "200", "WDLCalibrationElo": "2200"}, "black")["ContemptMode"] == "black_side_analysis"
         assert sent({"Contempt": "-150"}, "black") == {"Contempt": "-150", "ContemptMode": "black_side_analysis",
-                                                       "WDLCalibrationElo": "0"}
+                                                       "WDLCalibrationElo": "0", **base}
         off = sent({"Contempt": ""}, "black")
-        assert off == {"Contempt": "", "ContemptMode": "disable", "WDLCalibrationElo": "0"}
+        assert off == {"Contempt": "", "ContemptMode": "disable", "WDLCalibrationElo": "0", **base}
         # the engine was told each time (the fake echoes every setoption)
         assert m._applied["ContemptMode"] == "disable"
         with pytest.raises(EngineError, match="Contempt"):
@@ -298,3 +302,70 @@ def test_contempt_change_clears_lc0s_tree_not_preppys(tmp_path):
         assert news(log_p) == 0
     finally:
         m.close()
+
+
+def lc0_like(*extra: str) -> EngineSpec:
+    """The real Lc0 spec's settings, start options and rules, on the fake engine."""
+    from tnh.web.engine import default_specs
+    real = default_specs()["lc0"]
+    return EngineSpec("lc0f", "Lc0 (fake)", [sys.executable, FAKE, "--strict", *extra],
+                      {"WDLDrawRateReference": real.options["WDLDrawRateReference"]}, real.settings,
+                      derive=real.derive, reset_on=real.reset_on, hidden=real.hidden, short="Lc0")
+
+
+def test_lc0_guide_settings(tmp_path):
+    """BT4's draw rate at start; objectivity and attenuation pass through and clear the tree;
+    the hidden attenuation option is sent and accepted; MovesLeftThreshold 0.95 above 250."""
+    from tnh.web.engine import lc0_contempt
+    log = tmp_path / "lc0.log"
+    m = EngineManager({"lc0f": lc0_like("--log", str(log))}, gpu_free=lambda: None)
+    try:
+        m.go("lc0f", *after(), multipv=1, me="white")
+        wait_lines(m, 1)
+        cmds = log.read_text().splitlines()
+        assert "setoption name WDLDrawRateReference value 0.62" in cmds
+        assert cmds.index("setoption name WDLDrawRateReference value 0.62") < cmds.index("go infinite")
+        s = m.snapshot()
+        assert {o["name"] for o in s["options"]} >= {"Contempt", "WDLEvalObjectivity", "WDLContemptAttenuation"}
+        n = log.read_text().count("ucinewgame")
+        m.go("lc0f", *after(), multipv=1, me="white",
+             settings={"Contempt": "200", "WDLEvalObjectivity": "0", "WDLContemptAttenuation": "0.5"})
+        wait_lines(m, 1)
+        a = m.snapshot()["applied"]
+        assert (a["WDLEvalObjectivity"], a["WDLContemptAttenuation"], a["MovesLeftThreshold"]) == ("0", "0.5", "0.8")
+        assert "setoption name WDLContemptAttenuation value 0.5" in log.read_text()
+        assert log.read_text().count("ucinewgame") == n + 1
+        m.go("lc0f", *after(), multipv=1, me="white", settings={"Contempt": "300"})
+        wait_lines(m, 1)
+        assert m.snapshot()["applied"]["MovesLeftThreshold"] == "0.95"
+        m.go("lc0f", *after(), multipv=1, me="black", settings={"Contempt": "-260"})
+        wait_lines(m, 1)
+        assert m.snapshot()["applied"]["MovesLeftThreshold"] == "0.95"
+        assert lc0_contempt({"Contempt": "250"}, "white")["MovesLeftThreshold"] == "0.8"
+        with pytest.raises(EngineError, match="0 to 1"):
+            m.go("lc0f", *after(), multipv=1, me="white", settings={"WDLEvalObjectivity": "2"})
+    finally:
+        m.close()
+
+
+def test_a_refused_option_is_an_error():
+    spec = lc0_like()
+    spec.options["NoSuchThing"] = "1"
+    m = EngineManager({"lc0f": spec}, gpu_free=lambda: None)
+    try:
+        with pytest.raises(EngineError, match="refused.*No such option"):
+            m.go("lc0f", *after(), multipv=1, me="white")
+    finally:
+        m.close()
+
+
+def test_fill_from_ratings():
+    from tnh.web.engine import lc0_from_ratings
+    assert lc0_from_ratings(2200, 2200, "white", "classical") == {"Contempt": "0", "WDLCalibrationElo": "2400"}
+    assert lc0_from_ratings(2200, 2000, "white", "classical") == {"Contempt": "200", "WDLCalibrationElo": "2400"}
+    assert lc0_from_ratings(2200, 2000, "black", "classical") == {"Contempt": "-200", "WDLCalibrationElo": "2200"}
+    assert lc0_from_ratings(2200, 2000, "white", "blitz") == {"Contempt": "200", "WDLCalibrationElo": "2200"}
+    c = TestClient(create_app(stats(), fake_hub(), shrink=Shrink(rules={}, prob=mm.Rule())))
+    r = c.get("/api/uci/fill", params={"white": 1900, "black": 2300, "me": "black", "tempo": "classical"})
+    assert r.json() == {"Contempt": "400", "WDLCalibrationElo": "2500"}
+    assert c.get("/api/uci/fill", params={"white": 1900, "black": 2300, "me": "both"}).status_code == 400

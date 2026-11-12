@@ -29,7 +29,11 @@ OPTIONS = [
     "option name ContemptMode type combo default play var play var white_side_analysis var black_side_analysis var disable",
     "option name WDLCalibrationElo type string default 0",
     "option name DrawScore type string default 0.5",
+    "option name WDLEvalObjectivity type string default 1",
+    "option name WDLDrawRateReference type string default 0.5",
+    "option name MovesLeftThreshold type string default 0.8",
 ]
+HIDDEN = ["WDLContemptAttenuation"]      # accepted, not declared (as in Lc0)
 
 
 def main():
@@ -37,6 +41,7 @@ def main():
     ap.add_argument("--slow-start", type=float, default=0.0)
     ap.add_argument("--die-on-go", action="store_true")
     ap.add_argument("--log", help="append every command received to this file")
+    ap.add_argument("--strict", action="store_true", help="refuse setoption of an undeclared option, as an engine does")
     a = ap.parse_args()
     out_lock = threading.Lock()
 
@@ -83,6 +88,10 @@ def main():
         elif cmd == "setoption":
             name = t[t.index("name") + 1:t.index("value")]
             value = " ".join(t[t.index("value") + 1:])
+            declared = {o.split(" type ")[0][len("option name "):] for o in OPTIONS}
+            if a.strict and " ".join(name) not in declared | set(HIDDEN):
+                say(f"error No such option: {' '.join(name)}")
+                continue
             state["options"][" ".join(name)] = value
             say(f"info string set {' '.join(name)} {value}")
             if name == ["MultiPV"]:

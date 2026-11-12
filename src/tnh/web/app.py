@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
-from tnh.web.engine import EngineError, EngineManager
+from tnh.web.engine import EngineError, EngineManager, lc0_from_ratings
 from tnh.web.models import ModelHub, ModelsOff, Superseded, _LRU, query
 from tnh.web.models import _board as _models_board
 from tnh.web.stats import TEMPI, Filters, Shrink, Stats, TrendRule, model_table, report
@@ -224,6 +224,15 @@ def create_app(stats: Stats, hub: ModelHub, *, trend_rule: TrendRule = TrendRule
         except EngineError as e:
             raise HTTPException(503, str(e)) from e
         return {"gen": gen}
+
+    @app.get("/api/uci/fill")
+    def uci_fill(white: int = Query(..., ge=0, le=4000), black: int = Query(..., ge=0, le=4000),
+                 me: str = "white", tempo: str = "classical"):
+        """Lc0's Contempt and WDLCalibrationElo from the players' ratings (the guide's recipe)."""
+        try:
+            return lc0_from_ratings(white, black, me, tempo)
+        except EngineError as e:
+            raise HTTPException(400, str(e)) from e
 
     @app.get("/api/uci/state")
     def uci_state():
