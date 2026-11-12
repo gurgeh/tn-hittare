@@ -111,14 +111,14 @@ def move_times(clocks: list[int | None] | None, tc_raw: str | None, tempo_source
 def process_chunk(args: tuple) -> tuple[int, int, int, int]:
     """Worker: replay one row group of the input games.
 
-    Writes the rows to a part file, and the positions reached by the chunk's
-    counted games (each game once per position) as sorted unique hashes with
-    their count and source: ``hashes/c<idx>_{keys,counts,src}.npy``.
-    Returns (chunk, rows, rows with a clock but no move time, peak MB).
+    Writes the rows to a part file. Returns (chunk, rows, rows with a clock
+    but no move time, peak MB, and the positions reached by the chunk's counted
+    games as sorted unique hashes with their counts and source codes).
 
     ``args`` is (chunk, input path, max_ply, parts dir[, sources]); without
     ``sources`` (the four-element form ``tnh.eval.sample`` uses to rebuild
-    rows) the source codes are the sorted sources of the chunk.
+    rows) the source codes are the sorted sources of the chunk, and the part
+    keeps the ``_h`` column, which that caller drops.
     """
     idx, input_path, max_ply, parts_dir = args[:4]
     sources = args[4] if len(args) > 4 else None
@@ -172,6 +172,8 @@ def process_chunk(args: tuple) -> tuple[int, int, int, int]:
             hashes.setdefault(cols["source"][i], []).append(np.fromiter(game_hashes, dtype=np.uint64, count=len(game_hashes)))
     schema = {**{c: t for c, t in POSITIONS_SCHEMA.items() if c != "pos_count"}, "_h": pl.UInt64}
     part = pl.DataFrame(rows, schema=schema)
+    if sources is not None:
+        part = part.drop("_h")  # the build recomputes it from pos_key: 1.7 GB less on disk
     part_path = Path(parts_dir) / f"part-{idx:05d}.parquet"
     part.write_parquet(part_path)
     _drop_cache(part_path)
@@ -186,51 +188,65 @@ def process_chunk(args: tuple) -> tuple[int, int, int, int]:
             src_l.append(np.full(len(k), si, np.uint8))
     keys = np.concatenate(keys_l) if keys_l else np.empty(0, np.uint64)
     order = np.argsort(keys, kind="stable")
-    hdir = Path(parts_dir) / "hashes"
-    hdir.mkdir(exist_ok=True)
-    for name, arr in (("keys", keys[order]),
-                      ("counts", (np.concatenate(counts_l) if counts_l else np.empty(0, np.uint32))[order]),
-                      ("src", (np.concatenate(src_l) if src_l else np.empty(0, np.uint8))[order])):
-        np.save(hdir / f"c{idx:05d}_{name}.npy", arr)
-        _drop_cache(hdir / f"c{idx:05d}_{name}.npy")
-    return idx, len(part), n_null_move_time, _peak_mb()
+    counts = (np.concatenate(counts_l) if counts_l else np.empty(0, np.uint32))[order]
+    src = (np.concatenate(src_l) if src_l else np.empty(0, np.uint8))[order]
+    return idx, len(part), n_null_move_time, _peak_mb(), keys[order], counts, src
+
+
+class BucketCounts:
+    """Counts of 64-bit keys per source, in 64 buckets on the top bits, merged in memory as they come.
+
+    A bucket's new arrays are merged into its running unique arrays when they
+    pass ``merge_at`` entries, so memory stays near the number of distinct keys
+    (8 bytes plus 4 per source each) and a merge never sorts more than one bucket.
+    """
+
+    def __init__(self, n_sources: int, merge_at: int = 2_000_000):
+        self.n_sources, self.merge_at = n_sources, merge_at
+        self.keys = [np.empty(0, np.uint64) for _ in range(N_BUCKETS)]
+        self.counts = [np.empty((0, n_sources), np.uint32) for _ in range(N_BUCKETS)]
+        self.pending: list[list[tuple[np.ndarray, np.ndarray]]] = [[] for _ in range(N_BUCKETS)]
+        self.n_pending = [0] * N_BUCKETS
+        bounds = np.arange(1, N_BUCKETS, dtype=np.uint64) << np.uint64(BUCKET_SHIFT)
+        self.bounds = bounds
+
+    def add(self, keys: np.ndarray, counts: np.ndarray, src: np.ndarray) -> None:
+        """Sorted keys of one chunk, with their counts and source codes."""
+        cuts = np.searchsorted(keys, self.bounds)
+        start = 0
+        for b, end in enumerate([*cuts.tolist(), len(keys)]):
+            if end > start:
+                m = np.zeros((end - start, self.n_sources), np.uint32)
+                m[np.arange(end - start), src[start:end]] = counts[start:end]
+                self.pending[b].append((keys[start:end].copy(), m))
+                self.n_pending[b] += end - start
+                if self.n_pending[b] >= self.merge_at:
+                    self._merge(b)
+            start = end
+
+    def _merge(self, b: int) -> None:
+        if not self.pending[b]:
+            return
+        k = np.concatenate([self.keys[b], *(x for x, _ in self.pending[b])])
+        c = np.concatenate([self.counts[b], *(y for _, y in self.pending[b])])
+        uk, inv = np.unique(k, return_inverse=True)
+        out = np.zeros((len(uk), self.n_sources), np.uint32)
+        np.add.at(out, inv, c)
+        self.keys[b], self.counts[b] = uk, out
+        self.pending[b], self.n_pending[b] = [], 0
+
+    def finish(self) -> tuple[np.ndarray, np.ndarray]:
+        """(sorted unique keys, counts per source as columns)."""
+        for b in range(N_BUCKETS):
+            self._merge(b)
+        keys = np.concatenate(self.keys)
+        counts = np.concatenate(self.counts)
+        self.keys = self.counts = None
+        return keys, counts
 
 
 N_BUCKETS = 64
 BUCKET_SHIFT = 58
-
-
-def merge_bucket(args: tuple[int, str, int, int]) -> tuple[int, int]:
-    """Worker: the counts of one bucket of hashes (top six bits), over all chunks and per source.
-
-    Reads each chunk's slice of the bucket from memory-mapped arrays, so only
-    that slice is touched. Writes ``buckets/b<b>.npz`` (keys, total, one count
-    array per source). Returns (bucket, distinct keys).
-    """
-    b, parts_dir, n_chunks, n_sources = args
-    hdir = Path(parts_dir) / "hashes"
-    lo, hi = np.uint64(b) << np.uint64(BUCKET_SHIFT), (np.uint64(b + 1) << np.uint64(BUCKET_SHIFT)) if b + 1 < N_BUCKETS else None
-    ks, cs, ss = [], [], []
-    for c in range(n_chunks):
-        k = np.load(hdir / f"c{c:05d}_keys.npy", mmap_mode="r")
-        i0 = np.searchsorted(k, lo)
-        i1 = np.searchsorted(k, hi) if hi is not None else len(k)
-        ks.append(np.array(k[i0:i1]))
-        cs.append(np.array(np.load(hdir / f"c{c:05d}_counts.npy", mmap_mode="r")[i0:i1]))
-        ss.append(np.array(np.load(hdir / f"c{c:05d}_src.npy", mmap_mode="r")[i0:i1]))
-        del k
-    keys = np.concatenate(ks) if ks else np.empty(0, np.uint64)
-    counts = np.concatenate(cs) if cs else np.empty(0, np.uint32)
-    src = np.concatenate(ss) if ss else np.empty(0, np.uint8)
-    del ks, cs, ss
-    uk, inv = np.unique(keys, return_inverse=True)
-    out = {"keys": uk, "total": np.bincount(inv, weights=counts, minlength=len(uk)).astype(np.uint32)}
-    for si in range(n_sources):
-        m = src == si
-        out[f"s{si}"] = np.bincount(inv[m], weights=counts[m], minlength=len(uk)).astype(np.uint32)
-    np.savez(Path(parts_dir) / "buckets" / f"b{b:02d}.npz", **out)
-    _drop_cache(Path(parts_dir) / "buckets" / f"b{b:02d}.npz")
-    return b, len(uk)
 
 
 def _drop_cache(path: Path) -> None:
@@ -241,6 +257,11 @@ def _drop_cache(path: Path) -> None:
         os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
     finally:
         os.close(fd)
+
+
+def _rss_mb() -> int:
+    with open("/proc/self/statm") as f:
+        return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") // 2**20
 
 
 def _peak_mb() -> int:
@@ -265,19 +286,19 @@ INPUT_COLUMNS = ["game_id", "source", "moves_uci", "clocks_s", "white_elo", "bla
 
 
 def build(max_ply: int, workers: int, chunk: int, out_dir: Path | None = None, fraction: float | None = None) -> None:
-    """Replay the games in chunks, count positions in buckets on disk, then write the rows with pos_count.
+    """Replay the games in chunks, count positions in memory by bucket, then write the rows with pos_count.
 
-    Memory: one input batch, one bucket of hashes per worker, and in the last
-    step the merged counts of every distinct position (about 12 bytes plus 4
-    per source each: some 3.5 GB for the 179 M positions of the 2026-11 corpus).
+    Memory: the merged counts of every distinct position (8 bytes plus 4 per
+    source each, about 2.9 GB for the 179 M positions of the 2026-11 corpus)
+    and one part at a time. Disk: the parts (the rows without pos_count), each
+    deleted as soon as it is written out.
     """
     t0 = time.time()
     out_dir = out_dir or CORPUS
     parts_dir = DATA_ROOT / "scratch" / "positions" / "parts"
     if parts_dir.exists():
         shutil.rmtree(parts_dir)
-    (parts_dir / "hashes").mkdir(parents=True)
-    (parts_dir / "buckets").mkdir()
+    parts_dir.mkdir(parents=True)
     os.environ["POLARS_MAX_THREADS"] = "1"  # read by the spawned workers; the worker count is the CPU budget
 
     def log(msg: str) -> None:
@@ -324,29 +345,27 @@ def build(max_ply: int, workers: int, chunk: int, out_dir: Path | None = None, f
     sources_l = sorted(sources)
     log(f"{n_in:,} games in {n_groups} chunks; {n_emit:,} classical games with both ratings -> {est_rows:,} rows")
 
-    # 2. replay
+    # 2. replay, with the counts merged in memory as the chunks come back
     n_rows = n_null_mt = 0
+    counter = BucketCounts(len(sources_l))
     tasks = [(i, str(input_path), max_ply, str(parts_dir), sources_l) for i in range(n_groups)]
     ctx = multiprocessing.get_context("spawn")  # not fork: forking after polars has started its threads can deadlock
     with ctx.Pool(workers, maxtasksperchild=20) as pool:
-        for k, (_, n, nn, peak) in enumerate(pool.imap_unordered(process_chunk, tasks), 1):
+        for k, (_, n, nn, peak, keys_c, counts_c, src_c) in enumerate(pool.imap_unordered(process_chunk, tasks), 1):
+            counter.add(keys_c, counts_c, src_c)
             n_rows += n
             n_null_mt += nn
             if k % 20 == 0 or k == len(tasks):
-                log(f"  {k}/{len(tasks)} chunks, {n_rows:,} rows; worker peak {peak} MB")
+                log(f"  {k}/{len(tasks)} chunks, {n_rows:,} rows; worker peak {peak} MB, main {_rss_mb()} MB")
 
-    # 3. counts per bucket
-    with ctx.Pool(workers, maxtasksperchild=8) as pool:
-        n_keys = sum(n for _, n in pool.imap_unordered(
-            merge_bucket, [(b, str(parts_dir), n_groups, len(sources_l)) for b in range(N_BUCKETS)]))
-    shutil.rmtree(parts_dir / "hashes")
-    loaded = [np.load(parts_dir / "buckets" / f"b{b:02d}.npz") for b in range(N_BUCKETS)]
-    keys = np.concatenate([z["keys"] for z in loaded])
-    counts = np.concatenate([z["total"] for z in loaded])
-    per_source = {src: np.concatenate([z[f"s{si}"] for z in loaded]) for si, src in enumerate(sources_l)}
-    del loaded
-    shutil.rmtree(parts_dir / "buckets")
-    log(f"{n_keys:,} distinct positions reached by games with both ratings >= {COUNT_MIN_ELO}")
+    # 3. the merged counts
+    keys, by_source = counter.finish()
+    del counter
+    counts = by_source.sum(axis=1, dtype=np.uint64).astype(np.uint32)
+    per_source = {src: np.ascontiguousarray(by_source[:, si]) for si, src in enumerate(sources_l)}
+    del by_source
+    n_keys = len(keys)
+    log(f"{n_keys:,} distinct positions reached by games with both ratings >= {COUNT_MIN_ELO}; main {_rss_mb()} MB")
 
     # 4. rows with pos_count, and the book-exit table
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -357,8 +376,8 @@ def build(max_ply: int, workers: int, chunk: int, out_dir: Path | None = None, f
     exits = []
     for part_path in sorted(parts_dir.glob("part-*.parquet")):
         part = pl.read_parquet(part_path)
-        _drop_cache(part_path)
-        h = part["_h"].to_numpy()
+        part_path.unlink()  # disk: parts and the output must not both be whole at once
+        h = np.fromiter((key_hash(k) for k in part["pos_key"].to_list()), np.uint64, part.height)
         part = part.with_columns(pl.Series("pos_count", lookup(keys, counts, h), dtype=pl.Int32))
         only = {f"pc_{src}": lookup(keys, c, h) for src, c in per_source.items()}
         exits.append(

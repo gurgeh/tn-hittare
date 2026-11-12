@@ -109,3 +109,25 @@ def test_book_exit_table(built, tmp_path):
     # all counted games are from source "test", so the source-only count is the same
     assert g6["exit5_only_test"] == g6["exit5_all"]
     assert sorted(be["game_id"]) == ["g1", "g3", "g6"]
+
+
+def test_bucket_counts_merge_as_they_come():
+    import numpy as np
+
+    rng = np.random.default_rng(1)
+    all_k, all_c, all_s = [], [], []
+    bc = positions.BucketCounts(n_sources=2, merge_at=5)
+    for _ in range(30):
+        k = np.unique(rng.integers(0, 2**64 - 1, 40, dtype=np.uint64) | (rng.integers(0, 4, 40, dtype=np.uint64)))
+        k = np.concatenate([k, np.array([7, 2**63 + 5], np.uint64)])  # keys seen in every chunk
+        k.sort()
+        c = rng.integers(1, 4, len(k)).astype(np.uint32)
+        s = rng.integers(0, 2, len(k)).astype(np.uint8)
+        bc.add(k, c, s)
+        all_k.append(k), all_c.append(c), all_s.append(s)
+    keys, counts = bc.finish()
+    k, c, s = np.concatenate(all_k), np.concatenate(all_c), np.concatenate(all_s)
+    uk, inv = np.unique(k, return_inverse=True)
+    expect = np.zeros((len(uk), 2), np.uint32)
+    np.add.at(expect, (inv, s), c)
+    assert np.array_equal(keys, uk) and np.array_equal(counts, expect)
