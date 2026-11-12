@@ -77,6 +77,19 @@ class FirstObvious:
         return 0 if node.info["p_first"][j] >= self.threshold else 1
 
 
+class StubFix:
+    """Until `tnh.movefix` exists: the shares measured on real games by rating, flat in ply."""
+
+    def share(self, elo, ply) -> float:
+        return float(np.interp(elo, [2000.0, 2200.0, 2400.0], [0.15, 0.30, 0.35]))
+
+    def apply(self, p, best_index, elo, ply) -> np.ndarray:
+        s = self.share(elo, ply)
+        out = (1 - s) * np.asarray(p, float)
+        out[best_index] += s
+        return out
+
+
 @dataclass(frozen=True)
 class Settings:
     my_elo: int = 2200
@@ -88,6 +101,7 @@ class Settings:
     obvious: float = 0.85             # a move is obvious when my move model gives it at least this
     prepared: float = 0.0             # share of the opponent's probability on his best reply, per position
     draw_score: float = 0.5           # what a draw is worth to me (0.5 = expected score; the opponent gets 1 minus it)
+    mistake_fix: str = "fitted"       # the move model's mistake correction (tnh.movefix): "fitted" or "off"
     mix: str = "fitted"               # the opponent's database mix: "fitted" (tnh.movemix) or "kappa"
     kappa: float = 100.0              # with mix="kappa": the model's weight in games
     db_filter: Hashable = "auto"      # passed to the evaluator's counts; "auto" = the tempo's own
@@ -99,10 +113,11 @@ class Settings:
     policy_weight: float = 0.5        # Lc0's raw policy in my prior
     prior_min: float = 0.002          # safety net: a candidate needs at least this prior
     explore_uniform: float = 0.0      # share of a uniform prior mixed into PUCT's (tests: reach every move)
-    blunder: float = 0.15             # safety net: a learned move's child at most this far below the position
+    blunder: float = 0.30             # safety net: a learned move's child at most this far below the position
     batch: int = 12
     solve_every: int = 120            # at least this many expansions between full solves
-    solve_ratio: float = 4.0          # and time since the last solve >= this x its duration
+    solve_ratio: float = 4.0          # and expansions since the last solve >= this x its estimated cost
+    solve_cost: float = 0.007         # a solve's cost per position in its graph, in expansions
     expand_root: bool = True          # every legal move at the root is expanded once
 
     EVAL_KEYS = ("my_elo", "opp_elo", "my_side", "tempo")
@@ -473,6 +488,59 @@ class Engine:
                 "visits": np.array([self.visits[c.id] for c in kids]),
                 "mover_elo": self._elos(self.pos[i])[0], "opp_elo": self._elos(self.pos[i])[1]}
 
+    # -- the mistake correction (tnh.movefix) ----------------------------------------------------
+
+    def fix_rule(self):
+        """The fitted rule, or None when off. Without `tnh.movefix` a stub with the shares the
+        result developer measured (0.15 at 2000, 0.30 at 2200, 0.35 at 2400), named as such."""
+        if self.s.mistake_fix == "off":
+            return None
+        if self.s.mistake_fix != "fitted":
+            raise ValueError(f"mistake_fix must be fitted or off, got {self.s.mistake_fix!r}")
+        if getattr(self, "_fix", None) is None:
+            try:
+                from tnh import movefix
+                self._fix, self.fix_source = movefix.load(), "fitted"
+            except ImportError:
+                self._fix, self.fix_source = StubFix(), "stub"
+        return self._fix
+
+    def mover_value(self, parent: Node, child: Node) -> float:
+        return child.value if parent.me_to_move else 1.0 - child.value
+
+    def fixed(self, i: int, best: int | None) -> np.ndarray:
+        """The node's first probabilities with the mistake correction: a share moved onto its
+        best move (`best`; the most likely move when None)."""
+        n = self.graph.nodes[i]
+        first = n.info["p_first"]
+        rule = self.fix_rule()
+        if rule is None:
+            return first
+        b = int(np.argmax(first)) if best is None else best
+        p = np.asarray(rule.apply(first, b, self._elos(self.pos[i])[0], n.ply), dtype=np.float64)
+        return p / p.sum()
+
+    def best_valued(self, i: int) -> int | None:
+        """The child with the highest static value for the mover among the children that have
+        a value of their own (None while none has)."""
+        g = self.graph
+        n = g.nodes[i]
+        best, bj = -1.0, None
+        for j, c in enumerate(n.children):
+            cn = g.nodes[c]
+            if cn.info.get("valued") or "result_mover" in cn.info or cn.children is not None:
+                v = self.mover_value(n, cn)
+                if v > best:
+                    best, bj = v, j
+        return bj
+
+    def fix_share_root(self) -> float:
+        """The share in use at the root's ply for the opponent's rating (for the info line)."""
+        rule = self.fix_rule()
+        if rule is None:
+            return 0.0
+        return float(rule.share(self.s.opp_elo, self.graph.nodes[self.graph.root].ply))
+
     def _prior(self, n: Node) -> np.ndarray:
         p = n.info.get("p_first", n.p_model)
         pol = n.info.get("policy")
@@ -491,9 +559,13 @@ class Engine:
             n = g.nodes[i]
             if n.children is None or not n.moves:
                 continue
+            # the mistake correction, then the update hook: mix(counts, update(fix(first))) at
+            # his positions, and the same correction where I play by my model
+            p = self.fixed(i, self.best_valued(i))
             if self.update is not identity_update:
-                q = np.asarray(self.update(n, n.info["p_first"], self.move_facts(i)), dtype=np.float64)
-                n.p_model = q / q.sum()
+                p = np.asarray(self.update(n, p, self.move_facts(i)), dtype=np.float64)
+                p = p / p.sum()
+            n.p_model = p
             if n.me_to_move:
                 prior = self._prior(n)
                 eng = np.full(len(n.moves), np.nan)
@@ -560,12 +632,17 @@ class Engine:
         return res
 
     def _due(self) -> bool:
-        """Solve when at least `solve_every` expansions have been made and the time since the
-        last solve is at least `solve_ratio` times that solve's duration, so solving stays
-        about 1 / (1 + solve_ratio) of the time however large the graph grows."""
+        """Solve when at least `solve_every` expansions have been made and at least
+        `solve_ratio` times the last solve's estimated cost, in expansion-equivalents
+        (`solve_cost` per position in its graph: on the real models a solve is about 20 s per
+        million positions and an expansion about 3 ms). Solving stays about
+        1 / (1 + solve_ratio) of the time however large the graph grows, and the schedule is
+        a function of the search's own counts, not of the clock, so two identical searches
+        are identical whatever else runs on the machine."""
         if self.since_solve < self.s.solve_every:
             return False
-        return time.perf_counter() - self.last_solve_end >= self.s.solve_ratio * self.last_solve_seconds
+        size = len(self.game.order) if self.game is not None else 0
+        return self.since_solve >= self.s.solve_ratio * self.s.solve_cost * size
 
     # -- selection ------------------------------------------------------------------------------
 

@@ -14,7 +14,7 @@ from tnh.engine.search import Engine, Settings
 from tnh.engine.synth import SynthEvaluator
 
 INF = float("inf")
-BROAD = dict(my_side="white", kappa=INF, prior_min=0.0, blunder=1.0, batch=4, solve_every=10,
+BROAD = dict(my_side="white", kappa=INF, mistake_fix="off", prior_min=0.0, blunder=1.0, batch=4, solve_every=10,
              c_puct=4.0, fpu=0.0, explore_uniform=0.3)
 
 

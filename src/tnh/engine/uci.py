@@ -31,7 +31,8 @@ This docstring is the contract for a GUI (the web page's engine section).
 | Price | string (float) | 0.001 | >= 0 | price per non-obvious learned move, in expected score |
 | Cap | spin | 0 | 0-1000 | at most this many non-obvious learned moves (0 = off; then Price decides). A cap can return fewer: the price reaches only the concave hull of value against cost |
 | Obvious | string (float) | 0.85 | 0-1 | a move is obvious (costs 0) when my move model alone gives it at least this |
-| Prepared | string (float) | 0 | 0-1 | share of the opponent's probability on his best reply, at every position |
+| Prepared | string (float) | 0 | 0-1 | share of the opponent's probability on his best reply, at every position (applied after MistakeFix and the database mix, so the share on his best reply composes as 1 - (1 - fix)(1 - Prepared) on the model part) |
+| MistakeFix | combo | fitted | fitted, off | the move model's mistake correction (`tnh.movefix`): a share of the mover's probability, by his rating and the ply, moved onto his best move by the result model's static value, before the database mix, for both sides wherever a move is played by the model. off shows the uncorrected model. A re-solve, no model calls |
 | DrawScore | string (float) | 0.5 | 0-1 | what a draw is worth to me: a position's value for me is W + DrawScore x D from the result model (the opponent gets 1 minus it), a drawn finished game is worth DrawScore; the opponent's move probabilities do not change. 0.5 is the plain expected score. The real contempt is the rating difference (MyElo against OppElo), which the models play out; this only re-weights draws |
 | Mix | combo | fitted | fitted, kappa | the opponent's database mix: the fitted rule (tnh.movemix) or (count + kappa p) / (n + kappa) |
 | Kappa | string (float) | 100 | > 0 | with Mix = kappa |
@@ -42,9 +43,9 @@ This docstring is the contract for a GUI (the web page's engine section).
 | CPuct | string (float) | 1.5 | > 0 | PUCT exploration at my moves |
 | PolicyWeight | string (float) | 0.5 | 0-1 | Lc0's raw policy in my prior (the rest is my move model) |
 | PriorMin | string (float) | 0.002 | 0-1 | safety net: a move with a smaller prior is not a candidate |
-| Blunder | string (float) | 0.15 | 0-1 | safety net: a learned move's position may be at most this much worse than the one before |
+| Blunder | string (float) | 0.3 | 0-1 | safety net: a candidate of mine whose own value is more than this below the position's own value is dropped (1 = the value gate off) |
 | Batch | spin | 12 | 1-512 | positions evaluated per batch |
-| SolveRatio | string (float) | 4 | >= 0 | solve again when the time since the last solve is this many times its duration (solving stays about 1/(1+ratio) of the time) |
+| SolveRatio | string (float) | 4 | >= 0 | solve again after this many times the last solve's estimated cost in expansions (solving stays about 1/(1+ratio) of the time; the schedule depends on counts, not the clock) |
 
 ## Output
 
@@ -62,7 +63,7 @@ most about once per second. Per line, in order of `multipv`:
 
 and once per round:
 
-    info string preppy root value=V net=NET price=P cost=C cap=X stand_in=S frontier=F finished=G expanded=E provisional=0|1
+    info string preppy root value=V net=NET price=P cost=C cap=X stand_in=S frontier=F finished=G expanded=E provisional=0|1 fix=F fix_source=fitted|off
 
 - `value`: the line's expected score for the side to move at the root (6 decimals).
 - `net` (me to move): value minus price times the non-obvious moves the line's repertoire
@@ -73,6 +74,8 @@ and once per round:
   likely); a number: the opponent's probability of the move.
 - With me to move the lines are my candidate moves by net value; with the opponent to
   move, his most likely replies.
+- `fix`: the mistake correction's share at the root's ply for the opponent's rating (0 when
+  MistakeFix is off); `fix_source` says where the rule came from.
 - `provisional=1`: the round comes from the last solve made at another root or with
   other settings (sent at once after `position` or `setoption`, so the page has lines
   while the new root is solved); the next round with `provisional=0` replaces it. Only
@@ -91,7 +94,7 @@ is complete yet and it is the depth in progress), `value_in_progress` its value 
 depth being searched, and `inside` the positions inside its horizon. All root moves share
 one horizon, so their values compare. My moves in the pv are my best moves (flag `L`).
 The root line: `info string preppy root value=V mode=bestmove depth=K complete=0|1
-provisional=0|1 depth_in_progress=K expanded=E`.
+provisional=0|1 depth_in_progress=K expanded=E fix=F fix_source=fitted|off`.
 """
 
 from __future__ import annotations
@@ -124,6 +127,7 @@ OPTIONS = {
     "Obvious": ("obvious", float, "type string default 0.85"),
     "Prepared": ("prepared", float, "type string default 0"),
     "DrawScore": ("draw_score", float, "type string default 0.5"),
+    "MistakeFix": ("mistake_fix", str, "type combo default fitted var fitted var off"),
     "Mix": ("mix", str, "type combo default fitted var fitted var kappa"),
     "Kappa": ("kappa", float, "type string default 100"),
     "DbFilter": ("db_filter", str, "type combo default auto var auto var classical var blitz var all var off"),
@@ -133,7 +137,7 @@ OPTIONS = {
     "CPuct": ("c_puct", float, "type string default 1.5"),
     "PolicyWeight": ("policy_weight", float, "type string default 0.5"),
     "PriorMin": ("prior_min", float, "type string default 0.002"),
-    "Blunder": ("blunder", float, "type string default 0.15"),
+    "Blunder": ("blunder", float, "type string default 0.3"),
     "Batch": ("batch", int, "type spin default 12 min 1 max 512"),
     "SolveRatio": ("solve_ratio", float, "type string default 4"),
 }
@@ -194,7 +198,7 @@ class UCI:
         cap = "-" if eng.s.cap == 0 else str(eng.s.cap)
         self.send(f"info string preppy root value={v:.6f} net={s.net:.6f} price={s.mu:.6g} cost={s.cost} cap={cap} "
                   f"stand_in={m['stand_in']:.4f} frontier={m['frontier']:.4f} finished={m['finished']:.4f} "
-                  f"expanded={nodes} provisional={int(r.provisional)}")
+                  f"expanded={nodes} provisional={int(r.provisional)} {self._fix_keys()}")
 
     def report_bestmove(self, r: Result) -> None:
         if self.trace and r.lines:
@@ -216,7 +220,13 @@ class UCI:
             self.send(f"info string preppy multipv={k} value={line.value:.6f} net=- nonobvious=0 "
                       f"reach={line.reach:.6f} {tail} inside={line.inside} value_in_progress={vp} moves={flags}")
         self.send(f"info string preppy root value={r.root_value:.6f} {tail} depth_in_progress={r.depth_in_progress} "
-                  f"expanded={nodes}")
+                  f"expanded={nodes} {self._fix_keys()}")
+
+    def _fix_keys(self) -> str:
+        e = self.engine
+        share = e.fix_share_root()
+        src = "off" if e.s.mistake_fix == "off" else getattr(e, "fix_source", "fitted")
+        return f"fix={share:.2f} fix_source={src}"
 
     def bestmove(self, r: Result | None) -> None:
         if r is not None and r.lines:

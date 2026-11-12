@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from tnh.builder.game import Node, model_type_dist
+from tnh.builder.game import Node
 
 
 def theta(k: int) -> float:
@@ -74,10 +74,24 @@ class BestMove:
     def _finished(self, n: Node) -> bool:
         return "result_mover" in n.info
 
+    def _mix(self, n: Node, p: np.ndarray) -> np.ndarray:
+        """His database mix laid over probabilities p (no prepared share)."""
+        from tnh.builder.game import blend
+        params = self.e.params()
+        if params.mix is not None and n.counts is not None and np.sum(n.counts) > 0:
+            return np.asarray(params.mix(n.counts, p), dtype=np.float64)
+        return blend(n.counts, p, params.kappa_at(n))
+
+    def _q_rho(self, n: Node) -> np.ndarray:
+        """For the horizon: his mix over the move model's first probabilities (no correction,
+        so the horizon depends on the move model alone)."""
+        return self._mix(n, n.info["p_first"])
+
     def _q(self, n: Node) -> np.ndarray:
-        """His mix of database and model, without the prepared share."""
-        from dataclasses import replace
-        return model_type_dist(n, replace(self.e.params(), lam_node=0.0))
+        """For the values: his mix over the corrected probabilities, the correction's best move
+        being the child with the highest static value for him among all his evaluated
+        children (all of them, once the position is inside a completed depth)."""
+        return self._mix(n, self.e.fixed(n.id, self.e.best_valued(n.id)))
 
     def _candidates(self, i: int) -> list[int]:
         """My candidate move indices at an evaluated position: the prior gate, then the
@@ -106,7 +120,7 @@ class BestMove:
             top = max(prior[j] for j in cand)
             a = self.e.s.alpha
             return [(n.children[j], 1.0 if at_root else (prior[j] / top) ** a) for j in cand]
-        q = self._q(n)
+        q = self._q_rho(n)
         return [(c, float(q[j])) for j, c in enumerate(n.children) if q[j] > 0]
 
     # -- the horizon ---------------------------------------------------------------------------

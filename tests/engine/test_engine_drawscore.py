@@ -79,3 +79,27 @@ def test_draw_score_survives_a_root_move_and_needs_no_model_calls():
     eng.set_position(C4)
     assert eng.solve().value == v_root
     assert fb.calls == calls
+
+
+def test_the_search_does_not_read_the_clock_for_its_decisions(monkeypatch):
+    """The flaky failure of the test above in a loaded combined run: the solve schedule
+    followed wall time, so two identical searches solved at different moments. Now a search
+    under a clock that jumps by a minute at every reading gives the same result."""
+    import tnh.engine.search as S
+
+    def run():
+        eng = Engine(ChessEvaluator({"fake": FakeBundle()}), Settings(tempo="fake", price=0.002))
+        eng.set_position(C4)
+        eng.search(nodes=200)
+        return eng.last.net, dict(eng.last.learned), eng.stats["solves"]
+
+    a = run()
+    real = S.time.perf_counter
+    ticks = [0.0]
+
+    def jumpy():
+        ticks[0] += 60.0
+        return real() + ticks[0]
+    monkeypatch.setattr(S.time, "perf_counter", jumpy)
+    b = run()
+    assert a == b

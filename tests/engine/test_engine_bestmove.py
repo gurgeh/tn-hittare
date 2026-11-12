@@ -17,7 +17,8 @@ INF = float("inf")
 
 
 def settings(**kw):
-    return Settings(**{"my_side": "white", "kappa": INF, "mix": "kappa", "mode": "bestmove", "prior_min": 0.02,
+    return Settings(**{"my_side": "white", "kappa": INF, "mix": "kappa", "mode": "bestmove", "mistake_fix": "off",
+                       "prior_min": 0.02,
                        "blunder": 0.3, "alpha": 1.0, **kw})
 
 
