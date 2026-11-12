@@ -36,6 +36,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--slow-start", type=float, default=0.0)
     ap.add_argument("--die-on-go", action="store_true")
+    ap.add_argument("--log", help="append every command received to this file")
     a = ap.parse_args()
     out_lock = threading.Lock()
 
@@ -64,6 +65,9 @@ def main():
         say(f"bestmove {legal[0].uci() if legal else '0000'}")
 
     for line in sys.stdin:
+        if a.log:
+            with open(a.log, "a") as f:
+                f.write(line)
         t = line.split()
         if not t:
             continue

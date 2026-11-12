@@ -784,7 +784,7 @@ const ENG_STORE = "tnh.engine"
 // ratings and tempo; Lc0's ContemptMode (the server derives it from Contempt and "me").
 const FED = ["MyElo", "OppElo", "Side", "Tempo", "ContemptMode"]
 const OPTION_TIPS = {
-    Contempt: "Lc0's contempt in Elo: positive when I (the side at the bottom) am the stronger side; empty or 0 = off. WDLEvalObjectivity is left at its default, but in this Lc0 (v0.32.1) the shown score moves too, not only the choice of moves: measured on the Najdorf, Contempt 200 for White took White's score from +0.36 to -0.04",
+    Contempt: "Lc0's contempt in Elo: positive when I (the side at the bottom) am the stronger side; empty or 0 = off. It changes Lc0's choice of moves; the shown score is not fully objective either (WDLEvalObjectivity left at its default): measured on the Najdorf with a fresh tree, 6.f3 went from +0.34 to +0.04 with Contempt 200 for White and to +0.45 with 200 for Black. A change of contempt clears Lc0's tree",
     WDLCalibrationElo: "Lc0: the rating its WDL is calibrated to; 0 = off",
     DrawScore: "preppy: what a draw is worth to me (0-1, 0.5 = half a point). The rating difference in the White and Black boxes is preppy's real contempt; DrawScore only changes what a draw is worth",
 }

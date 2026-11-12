@@ -259,3 +259,42 @@ def test_lc0_contempt_mapping():
                               for c in ("", "0", "100", "-100") for me in ("white", "black")}
     finally:
         m.close()
+
+
+def test_contempt_change_clears_lc0s_tree_not_preppys(tmp_path):
+    """A change of Lc0's contempt settings (a flip included) sends ucinewgame before the next
+    search; a position change does not; preppy never gets one on a setting change."""
+    from tnh.web.engine import lc0_contempt
+    log_l, log_p = tmp_path / "lc0.log", tmp_path / "preppy.log"
+    lc0 = EngineSpec("lc0f", "Lc0 (fake)", [sys.executable, FAKE, "--log", str(log_l)], {},
+                     ("Contempt", "WDLCalibrationElo", "ContemptMode"), derive=lc0_contempt,
+                     reset_on=("Contempt", "ContemptMode", "WDLCalibrationElo"))
+    pre = EngineSpec("preppyf", "preppy (fake)", [sys.executable, FAKE, "--log", str(log_p)], {}, PREPPY + ("DrawScore",))
+    m = EngineManager({"lc0f": lc0, "preppyf": pre}, gpu_free=lambda: None)
+    try:
+        def news(path):
+            return path.read_text().count("ucinewgame")
+
+        m.go("lc0f", *after(), multipv=1, me="white")                      # first settings: disable
+        wait_lines(m, 1)
+        n0 = news(log_l)
+        m.go("lc0f", *after("e2e4"), multipv=1, me="white")                # position only
+        wait_lines(m, 1)
+        assert news(log_l) == n0
+        m.go("lc0f", *after("e2e4"), multipv=1, settings={"Contempt": "200"}, me="white")
+        wait_lines(m, 1)
+        assert news(log_l) == n0 + 1
+        m.go("lc0f", *after("e2e4"), multipv=1, settings={"Contempt": "200"}, me="black")   # a flip
+        wait_lines(m, 1)
+        assert news(log_l) == n0 + 2
+        cmds = log_l.read_text().splitlines()
+        i = len(cmds) - 1 - cmds[::-1].index("ucinewgame")
+        assert cmds[i - 1].startswith("setoption name ContemptMode value black_side_analysis")
+        assert cmds[i + 1:i + 2] == ["isready"] and "go infinite" in cmds[i + 2:]
+        m.go("preppyf", *after(), multipv=1, settings={"Price": "0.002", "Side": "white"})
+        wait_lines(m, 1)
+        m.go("preppyf", *after(), multipv=1, settings={"Price": "0.003", "Side": "black", "DrawScore": "0.6"})
+        wait_lines(m, 1)
+        assert news(log_p) == 0
+    finally:
+        m.close()

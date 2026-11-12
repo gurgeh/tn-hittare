@@ -49,6 +49,11 @@ class EngineSpec:
     short: str = ""                                             # column header
     # Turns the page's settings and its "me" side into the options to send (Lc0's contempt).
     derive: Callable[[dict, str], dict] | None = None
+    # Options whose change must also clear the engine's search tree (`ucinewgame`) before the
+    # next search. Lc0 shifts leaf values by its contempt when it evaluates them and shows the
+    # score with the inverse shift, so a tree kept from another contempt shows wrong scores.
+    # Never preppy's: it keeps its graph across positions and settings on purpose.
+    reset_on: tuple[str, ...] = ()
 
     def available(self) -> str | None:
         """None when it can start, else why not."""
@@ -80,7 +85,7 @@ def default_specs(*, threads: int = 4, hash_mb: int = 256, lc0_minibatch: int = 
                            "BackendOptions": f"max_batch={lc0_minibatch}", "MinibatchSize": str(lc0_minibatch),
                            "MaxPrefetch": "0", "Threads": "2", "UCI_ShowWDL": "true"},
                           ("Contempt", "WDLCalibrationElo", "ContemptMode"), gpu_mb=2500, short="Lc0",
-                          derive=lc0_contempt),
+                          derive=lc0_contempt, reset_on=("Contempt", "ContemptMode", "WDLCalibrationElo")),
         "preppy": EngineSpec("preppy", "preppy", [sys.executable, "-m", "tnh.engine.uci"], {},
                              ("MyElo", "OppElo", "Side", "Tempo", "Price", "Cap", "Obvious", "Prepared", "DrawScore"),
                              gpu_mb=2500, short="preppy"),
@@ -93,9 +98,12 @@ def lc0_contempt(settings: dict, me: str) -> dict:
     `white_side_analysis` or `black_side_analysis` for that side, never `play`, which would
     favour whichever side is to move; off, `ContemptMode disable` and an empty `Contempt`.
     `WDLCalibrationElo` passes through (0 = off). `WDLEvalObjectivity` stays at its default.
-    Measured with Lc0 v0.32.1 and BT4 on the Najdorf (2026-11-12): the shown score is not
-    objective under contempt. Contempt 200 for White took White's score from +0.36 to -0.04
-    (and made 6.Bc4 the first move); the same for Black took it to +2.74."""
+    Measured with Lc0 v0.32.1 and BT4 on the Najdorf (2026-11-12), a fresh tree each time and
+    about 42k nodes: off, the lines were 6.f3 +0.34, 6.Be3 +0.25, 6.Be2 +0.24 (White's view);
+    Contempt 200 for White, 6.f3 +0.04, 6.Bg5 0.00, 6.Bc4 0.00; Contempt 200 for Black (the same
+    as -200 for White), 6.Be3 +0.41, 6.Be2 +0.38, 6.f3 +0.45. So the choice of moves changes
+    and the shown score is not fully objective: it moves by about -0.3 and +0.1. (An earlier
+    test kept the tree across settings and showed shifts of over a pawn: that was the reuse.)"""
     raw = str(settings.get("Contempt", "") or "").strip()
     try:
         c = float(raw) if raw else 0.0
@@ -400,6 +408,8 @@ class EngineManager:
                 changed = {k: v for k, v in want.items() if self._applied.get(k) != v}
                 for k, v in changed.items():
                     self._proc.send(f"setoption name {k} value {v}")
+                if any(k in spec.reset_on for k in changed):
+                    self._proc.send("ucinewgame")
                 if changed:
                     self._proc.send("isready")
                     self._proc.wait_for("readyok", self.start_timeout)
