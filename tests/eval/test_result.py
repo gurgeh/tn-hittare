@@ -165,3 +165,22 @@ def test_fit_pairs_removes_a_planted_side_to_move_shift():
     th_p = fit_pairs(Xn, Xc, yn, yc, band, free=free, mu=1000.0)
     gap_p = (1 - es(mlogit_probs(th_p, Xc))) - es(mlogit_probs(th_p, Xn))
     assert all(abs(gap_p[band == b].mean()) < 0.001 for b in (0, 1))
+
+
+def test_root_sources_matches_the_one_ply_expectation():
+    from tnh.eval.lookahead import root_sources
+
+    class FakeSrc(FakeEv):
+        def evaluate(self, queries):
+            m, p, leaf = super().evaluate(queries)
+            self.last_sources = np.tile(leaf, 3)        # n x 9
+            return m, p, leaf
+
+    ev = FakeSrc()
+    b = chess.Board("4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1")
+    root = Node(b, [], 2200, 2100, 0)
+    stats = {k: 0.0 for k in ("root_seconds", "root_evals", "exact1_evals", "exact1_seconds", "exact2_seconds", "exact2_evals")}
+    r = root_sources(ev, [root], stats)[0]
+    v1, _ = exact(ev, [root], evaluate_nodes(ev, [root]), 0.0, stats)
+    assert np.allclose(np.array(r["c_p"]) @ np.array(r["c_wdl"]), v1[0])
+    assert len(r["c_src"]) == len(r["c_p"]) and len(r["root_src"]) == 9 and not any(r["c_terminal"])

@@ -182,6 +182,7 @@ class ModelMover:
              "lc0raw": np.array([p.wdl for p in pol], float)}
         w = {k: v / v.sum(1, keepdims=True) for k, v in w.items()}
         leaf = self.leaf.from_sources(w, queries)
+        self.last_sources = np.column_stack([w["maia0"], w["maia600"], w["lc0raw"]])   # n x 9, side to move
         moves, probs = [], []
         for p in preds:
             e = np.exp(p.logp.astype(np.float64))
@@ -336,6 +337,47 @@ def exact_full(ev, roots: list[Node], root_eval, p_min: float, stats: dict) -> l
     return out
 
 
+def root_sources(ev, roots: list[Node], stats: dict, batch: int = 512) -> list[dict]:
+    """Per root: the root's leaf wdl and sources, and for every legal move its probability, leaf wdl (root's side)
+    and sources (the child's side to move; NaN where the child ends the game, whose wdl is then its result), so a
+    changed result model can be applied offline (``ResultModel.from_sources``). ``ev`` must be a ``ModelMover``."""
+    t = time.perf_counter()
+    moves, probs, leaf = ev.evaluate([n.query() for n in roots])
+    src = ev.last_sources
+    out = [{"static": list(map(float, leaf[i])), "root_src": src[i].tolist(), "c_p": [float(x) for x in probs[i]],
+            "c_wdl": [], "c_src": [], "c_terminal": []} for i in range(len(roots))]
+    kids, owner = [], []
+    for i, n in enumerate(roots):
+        for m in moves[i]:
+            kids.append(n.child(m))
+            owner.append(i)
+    live = []
+    for k, c in enumerate(kids):
+        t_ = terminal(c.board)
+        if t_ is None:
+            live.append(k)
+    res = {}
+    for s0 in range(0, len(live), batch):
+        idx = live[s0:s0 + batch]
+        _, _, lf = ev.evaluate([kids[k].query() for k in idx])
+        for j, k in enumerate(idx):
+            res[k] = (lf[j], ev.last_sources[j])
+    for k, c in enumerate(kids):
+        o = out[owner[k]]
+        if k in res:
+            o["c_wdl"].append(to_root(np.asarray(res[k][0], float), 1).tolist())
+            o["c_src"].append(res[k][1].tolist())
+            o["c_terminal"].append(False)
+        else:
+            o["c_wdl"].append(to_root(terminal(c.board), 1).tolist())
+            o["c_src"].append([float("nan")] * 9)
+            o["c_terminal"].append(True)
+    stats["root_seconds"] += time.perf_counter() - t
+    stats["root_evals"] += len(roots)
+    stats["exact1_evals"] += len(live)
+    return out
+
+
 def monte_carlo(ev, roots: list[Node], root_eval, n_lines: int, depth: int, rng, stats: dict) -> dict:
     """Values at each depth in DEPTHS, per line: array roots x lines x len(DEPTHS) x 3 (root's side)."""
     R = len(roots)
@@ -412,6 +454,17 @@ def cmd_run(a) -> None:
         stats = {k: 0.0 for k in ("root_seconds", "exact1_seconds", "exact2_seconds", "mc_seconds",
                                   "root_evals", "exact1_evals", "exact2_evals", "mc_evals")}
         t = time.perf_counter()
+        if a.root_sources:
+            rs = root_sources(ev, roots, stats)
+            df = pl.DataFrame({"game_id": c.get_column("game_id").to_list(), "ply": c.get_column("ply").to_list(),
+                               **{k: [r[k] for r in rs] for k in rs[0]}})
+            for k, v in stats.items():
+                df = df.with_columns(pl.lit(v / len(qs)).alias(f"per_position_{k}"))
+            prev = pl.read_parquet(out) if out.exists() else None
+            (df if prev is None else pl.concat([prev, df], how="vertical_relaxed")).write_parquet(out)
+            print(f"{start + c.height}/{s.height}: " + ", ".join(f"{k} {v / len(qs):.3f}" for k, v in stats.items())
+                  + f"; peak RSS {peak_gb():.2f} GB", flush=True)
+            continue
         re = evaluate_nodes(ev, roots)
         stats["root_seconds"] += time.perf_counter() - t
         stats["root_evals"] += len(roots)
@@ -722,6 +775,7 @@ def main(argv=None) -> None:
     sp.add_argument("--depth", type=int, default=16)
     sp.add_argument("--p-min", type=float, default=0.02)
     sp.add_argument("--no-exact", action="store_true")
+    sp.add_argument("--root-sources", action="store_true", help="root and every child with their sources (root_sources), nothing else; --mover maia600|trees|combo-trees")
     sp.add_argument("--full-exact", action="store_true", help="per child and reply values (exact_full) instead of the averages")
     sp.add_argument("--limit", type=int)
     sp.add_argument("--chunk", type=int, default=50)

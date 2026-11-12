@@ -98,6 +98,10 @@ def cmd_split(a) -> None:
     n = j.height
     S = es(np.array(j.get_column("static").to_list()))
     rows = {k: [] for k in ("e1", "played", "best", "has_reply", "r_e1", "r_played", "r_best", "r_static")}
+    if "r_p" not in j.columns:                               # a root-only run (lookahead run --root-sources)
+        j = j.with_columns(pl.col("c_p").list.eval(pl.element() < -1.0).alias("c_kept"),
+                           pl.lit([], dtype=pl.List(pl.List(pl.Float64))).alias("r_p"),
+                           pl.lit([], dtype=pl.List(pl.List(pl.List(pl.Float64)))).alias("r_wdl"))
     for fen, played, ply, moves, cp, cw, ck, rp, rw in j.select(
             "fen", "played_uci", "ply", "moves_uci", "c_p", "c_wdl", "c_kept", "r_p", "r_wdl").iter_rows():
         b = chess.Board(fen)
@@ -141,15 +145,19 @@ def cmd_split(a) -> None:
     lam_move = _ratio(R_["e1"] - R_["played"], R_["best"] - R_["e1"], groups, cl, counts)
     lam_total = _ratio(R_["e1"] - S, R_["best"] - R_["e1"], groups, cl, counts)
     hr = R_["has_reply"].astype(bool)
-    Xr = np.column_stack([R_["r_e1"] - R_["r_static"], R_["r_e1"] - R_["r_played"], R_["r_played"] - R_["r_static"],
+    if not hr.any():
+        hr = None
+    Xr = None if hr is None else np.column_stack([R_["r_e1"] - R_["r_static"], R_["r_e1"] - R_["r_played"], R_["r_played"] - R_["r_static"],
                           R_["r_best"] - R_["r_e1"]])[hr]
-    gr = _groups(mean[hr], ply[hr])
-    clr = cluster_codes(j.filter(pl.Series(hr)))
-    cr = boot_counts(clr.max() + 1, a.boot, a.seed)
-    reply = _means(Xr, gr, clr, cr)
-    lam_move_r = _ratio(Xr[:, 1], Xr[:, 3], gr, clr, cr)
+    reply, lam_move_r = {}, {}
+    if hr is not None:
+        gr = _groups(mean[hr], ply[hr])
+        clr = cluster_codes(j.filter(pl.Series(hr)))
+        cr = boot_counts(clr.max() + 1, a.boot, a.seed)
+        reply = _means(Xr, gr, clr, cr)
+        lam_move_r = _ratio(Xr[:, 1], Xr[:, 3], gr, clr, cr)
     names = ["e1 - s(n)", "e1 - s(played)", "s(played) - s(n)", "best - e1"]
-    out = {"positions": n, "with_reply": int(hr.sum()), "columns": names,
+    out = {"positions": n, "with_reply": 0 if hr is None else int(hr.sum()), "columns": names,
            "root": {g: {"n": v[-1], **dict(zip(names, v[:-1])), "lambda_move": lam_move[g], "lambda_total": lam_total[g]}
                     for g, v in root.items()},
            "reply": {g: {"n": v[-1], **dict(zip(names, v[:-1])), "lambda_move": lam_move_r[g]} for g, v in reply.items()}}
@@ -158,7 +166,7 @@ def cmd_split(a) -> None:
         for g, v in tab.items():
             print(f"  {g:>16} n={v[-1]:>4}: " + " | ".join(f_(e) for e in v[:-1])
                   + f" | {lm[g]['est']:+.2f} [{lm[g]['lo']:+.2f}, {lm[g]['hi']:+.2f}]")
-    write_result(a.results, "consistency_split", {"what": "e1 - s(n) = [e1 - s(played child)] + [s(played child) - s(n)], "
+    write_result(a.results, a.name, {"what": "e1 - s(n) = [e1 - s(played child)] + [s(played child) - s(n)], "
                                                   "PolicyTrees per-child run, cheap leaf, expected scores", **out})
 
 
@@ -429,6 +437,7 @@ def main(argv=None) -> None:
     sp = sub.add_parser("split")
     sp.add_argument("--positions", type=Path, default=POS_TEST)
     sp.add_argument("--run", default="trees_full")
+    sp.add_argument("--name", default="consistency_split")
     sp.add_argument("--results", type=Path, default=REPORTS / "step1")
     sp.add_argument("--boot", type=int, default=1000)
     sp.add_argument("--seed", type=int, default=7)
