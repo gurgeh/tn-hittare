@@ -21,7 +21,7 @@ from tnh.models.base import Query, position_key
 
 
 class ModelHub(Protocol):
-    def maia(self, fen: str, moves: list[str], white_elo: int, black_elo: int) -> dict: ...
+    def maia(self, fen: str, moves: list[str], white_elo: int, black_elo: int) -> dict: ...   # FIDE ratings
     def engine(self, fen: str, moves: list[str], nodes: int) -> dict: ...
     def status(self) -> dict: ...
 
@@ -55,6 +55,18 @@ def _board(fen: str, moves: list[str]) -> chess.Board:
     if position_key(b) != position_key(chess.Board(fen)):
         raise ValueError(f"moves lead to {b.fen()}, not {fen}")
     return b
+
+
+# Maia-3 was trained on Lichess blitz ratings. The rating it is given for a FIDE-rated
+# player is this linear map, measured in step 1 (2026-11-12) as the best Maia rating by
+# FIDE rating on classical games. Applied to both players.
+MAIA_INTERCEPT = 1580.0
+MAIA_SLOPE = 0.558
+
+
+def maia_elo(fide: float) -> int:
+    """The rating fed to Maia-3 for a player with this FIDE rating."""
+    return int(round(MAIA_INTERCEPT + MAIA_SLOPE * fide))
 
 
 def _num(x: float) -> float | None:
@@ -93,9 +105,12 @@ class Hub:
         return self._maia
 
     def maia(self, fen: str, moves: list[str], white_elo: int, black_elo: int) -> dict:
+        """Maia-3 for the side to move. `white_elo` and `black_elo` are FIDE ratings; the
+        network gets `maia_elo` of each."""
         from tnh.models.maia3 import Elo
         board = _board(fen, moves)
-        mover, opp = (white_elo, black_elo) if board.turn == chess.WHITE else (black_elo, white_elo)
+        mover_fide, opp_fide = (white_elo, black_elo) if board.turn == chess.WHITE else (black_elo, white_elo)
+        mover, opp = maia_elo(mover_fide), maia_elo(opp_fide)
         # Maia sees the last 8 positions, so the key is the position plus the last 7 moves.
         key = (position_key(board), tuple(moves[-7:]), len(moves) < 7, mover, opp)
         hit = self._maia_cache.get(key)
@@ -111,7 +126,7 @@ class Hub:
         win, draw, loss = pred.wdl
         out = {
             "model": f"Maia-3 {self.maia_size}, blitz scale",
-            "mover_elo": mover, "opp_elo": opp,
+            "mover_fide": mover_fide, "opp_fide": opp_fide, "mover_maia": mover, "opp_maia": opp,
             "history": len(moves),
             "moves": {m: float(x) for m, x in zip(pred.moves, p)},
             "wdl": [win, draw, loss],
@@ -161,3 +176,23 @@ class Hub:
         if self._sf is not None:
             self._sf.close()
             self._sf = None
+
+
+class NoModels:
+    """The hub when the server runs with --no-models: every model call is refused."""
+
+    def maia(self, fen, moves, white_elo, black_elo):
+        raise ModelsOff("models are off (--no-models)")
+
+    def engine(self, fen, moves, nodes):
+        raise ModelsOff("models are off (--no-models)")
+
+    def status(self) -> dict:
+        return {"disabled": True}
+
+    def close(self) -> None:
+        pass
+
+
+class ModelsOff(RuntimeError):
+    pass

@@ -15,7 +15,7 @@ def test_hub_maia_and_engine():
         b = chess.Board()
         b.push_uci("e2e4")
         m = hub.maia(b.fen(), ["e2e4"], 2200, 1800)
-        assert (m["mover_elo"], m["opp_elo"]) == (1800, 2200)
+        assert (m["mover_fide"], m["opp_fide"]) == (1800, 2200) and m["mover_maia"] == 2584
         assert sum(m["moves"].values()) == pytest.approx(1, abs=1e-4)
         assert len(m["moves"]) == 20 and m["cached"] is False
         assert hub.maia(b.fen(), ["e2e4"], 2200, 1800)["cached"] is True

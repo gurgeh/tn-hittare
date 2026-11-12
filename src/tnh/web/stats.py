@@ -1,30 +1,92 @@
-"""The database panel: the interface's seam in front of `tnh.data.edges.EdgeDB`, and the table it shows.
+"""The database panel: the interface's seam in front of `tnh.data.edges.EdgeDB`, and what it shows.
 
-`Stats` wraps an `EdgeDB` (the parquet tables, or `EdgeDB.from_frames` on the output of
-`tables_from_games` for fixtures). The page only ever talks to `Stats`, so a change in the
-read API is absorbed here.
+The page reads position statistics only through `EdgeDB`, opened by table name (`full` or
+`dev`) once per server process: `open_stats` picks the table, `report` turns
+`EdgeDB.panel` and `EdgeDB.parents` into the panel's JSON. Tests pass an
+`EdgeDB.from_frames` over tables built by `tables_from_games`.
 
-One thing `EdgeDB` cannot answer is which positions lead into a position: that needs a
-lookup on `child_hash`, which the tables are not sorted by. `Stats` answers it only when
-it was given the frames in memory (fixtures); otherwise `parents` is None and the panel
-says the source cannot tell.
+Counting, as in docs/DESIGN.md: a position's count is the games that reached it, each
+game once (`EdgeDB.total`, `child_n`); a move's count is the games that played it from
+there. Filters apply to moves only: pos_index has no breakdown by year, band or tempo.
 """
 
 from __future__ import annotations
 
 import math
+import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from statistics import NormalDist
 
 import chess
 import polars as pl
 
 from tnh.data.edges import EdgeDB, pos_hash
+from tnh.web import edgefix
 
 TEMPI = ("classical", "rapid", "blitz", "unknown")
 YEAR_MAX = 32767
-_POOL = ThreadPoolExecutor(5, thread_name_prefix="stats")
+TABLE_ENV = "TNH_WEB_TABLE"
+_POOL = ThreadPoolExecutor(4, thread_name_prefix="stats")
+
+
+# --- which table -------------------------------------------------------------------
+
+
+def table_files(name: str, directory: Path) -> list[Path]:
+    """The files `EdgeDB(name=...)` opens. Only used to see whether a table exists."""
+    suffix = "" if name == "full" else f"_{name}"
+    return [directory / f"{t}{suffix}.parquet" for t in ("edges", "pos_index", "parents")]
+
+
+def choose_table(flag: str | None, directory: Path) -> tuple[str, str]:
+    """(table name, why): the flag, else $TNH_WEB_TABLE, else `full` when its files exist,
+    else `dev`."""
+    if flag:
+        return flag, "--table"
+    if os.environ.get(TABLE_ENV):
+        return os.environ[TABLE_ENV], f"${TABLE_ENV}"
+    if all(p.exists() for p in table_files("full", directory)):
+        return "full", "its files exist"
+    return "dev", "no full table yet"
+
+
+def open_stats(flag: str | None = None, directory: Path | None = None) -> "Stats":
+    from tnh.paths import CORPUS
+    directory = directory or CORPUS
+    name, why = choose_table(flag, directory)
+    missing = [str(p) for p in table_files(name, directory) if not p.exists()]
+    if missing:
+        raise SystemExit(f"table {name!r} ({why}) is missing: {', '.join(missing)}")
+    db = EdgeDB(name=name, directory=directory)
+    edgefix.patch(db)
+    built = max(p.stat().st_mtime for p in table_files(name, directory))
+    return Stats(db, name, why=why, built=datetime.fromtimestamp(built).isoformat(timespec="minutes"))
+
+
+class Stats:
+    """An open `EdgeDB` with the facts about it that the page shows."""
+
+    def __init__(self, db: EdgeDB, name: str, *, why: str = "", built: str | None = None) -> None:
+        self.db = db
+        self.name = name
+        root = db.panel(chess.Board())
+        years = root["by_year"].filter(pl.col("year") > 0)["year"] if root["by_year"].height else pl.Series([], dtype=pl.Int16)
+        # Every game starts from the initial position, so its count is the table's game count.
+        self._info = {
+            "table": name, "why": why, "built": built,
+            "games": root["total"]["n"] if root["total"] else 0,
+            "year_min": int(years.min()) if years.len() else None,
+            "year_max": int(years.max()) if years.len() else None,
+        }
+
+    def info(self) -> dict:
+        return self._info
+
+
+# --- filters ---------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -49,6 +111,10 @@ class Filters:
             if bad:
                 raise ValueError(f"unknown tempo {sorted(bad)}; known: {TEMPI}")
 
+    @property
+    def active(self) -> bool:
+        return bool(self.edgedb())
+
     def edgedb(self) -> dict:
         """The filters as `EdgeDB` keyword arguments."""
         kw: dict = {}
@@ -60,52 +126,8 @@ class Filters:
             kw["tempi"] = list(self.tempi)
         return kw
 
-    def polars(self) -> pl.Expr:
-        """The same filter over raw edges rows, for `parents` on in-memory frames."""
-        e = pl.lit(True)
-        kw = self.edgedb()
-        for col, key in (("year", "years"), ("elo_band", "elo_bands")):
-            if key in kw:
-                e &= pl.col(col).is_between(*kw[key])
-        if "tempi" in kw:
-            e &= pl.col("tempo").is_in(kw["tempi"])
-        return e
 
-
-class Stats:
-    def __init__(self, db: EdgeDB, name: str, frames: tuple[pl.DataFrame, pl.DataFrame] | None = None) -> None:
-        self.db = db
-        self.name = name
-        self._by_child = None
-        self._epd: dict[int, str] = {}
-        self._info = {"source": name}
-        if frames is not None:
-            edges, index = frames
-            self._by_child = edges.select("child_hash", "pos_hash", "move", "year", "elo_band", "tempo", "n").sort("child_hash")
-            self._epd = dict(zip(index["pos_hash"].to_list(), index["epd"].to_list()))
-            years = edges.filter(pl.col("year") > 0)["year"]
-            self._info |= {"positions": index.height, "edge_rows": edges.height,
-                           "year_min": int(years.min()) if years.len() else None,
-                           "year_max": int(years.max()) if years.len() else None}
-
-    @classmethod
-    def from_frames(cls, edges: pl.DataFrame, pos_index: pl.DataFrame, name: str) -> "Stats":
-        return cls(EdgeDB.from_frames(edges, pos_index), name, (edges, pos_index))
-
-    def info(self) -> dict:
-        return self._info
-
-    def parents(self, h: int, f: Filters) -> pl.DataFrame | None:
-        """Edges into the position: `parent_hash`, `parent_epd`, `move`, `n`. None when unknown."""
-        if self._by_child is None:
-            return None
-        s = self._by_child["child_hash"]
-        lo, hi = s.search_sorted(h, side="left"), s.search_sorted(h, side="right")
-        rows = self._by_child.slice(lo, hi - lo).filter(f.polars())
-        out = rows.group_by("pos_hash", "move").agg(pl.col("n").sum()).rename({"pos_hash": "parent_hash"})
-        return out.with_columns(
-            parent_epd=pl.Series([self._epd.get(p) for p in out["parent_hash"].to_list()], dtype=pl.String)
-        ).sort("n", descending=True)
+# --- trends ------------------------------------------------------------------------
 
 
 def two_proportion(x1: int, n1: int, x0: int, n0: int) -> tuple[float, float]:
@@ -122,14 +144,14 @@ def two_proportion(x1: int, n1: int, x0: int, n0: int) -> tuple[float, float]:
 class TrendRule:
     """When a move's share counts as trending.
 
-    The years with data under the filters are split into the last `recent_years`
-    (counted back from the latest year with a game) and everything before. For each move
-    a two-proportion z-test compares its share of the position's games in the two
-    periods. A move is flagged when the two-sided p-value is below `alpha / k`, k being
-    the number of moves tested in the position (Bonferroni). Both periods need at least
-    `min_games` games in the position, and the move `min_move_games`. Games are treated as
-    independent; they are not (one player repeating a line through a tournament), so the
-    test is anti-conservative and the flag is a pointer, not a verdict.
+    The span of years with data under the filters is split into a recent part, the last
+    `recent_years` but at most half the span (so the 2024+ table compares 2026 with
+    2024-2025), and everything before. For each move a two-proportion z-test compares its
+    share of the position's games in the two parts. A move is flagged when the two-sided
+    p-value is below `alpha / k`, k being the number of moves tested (Bonferroni). Both
+    parts need `min_games` games in the position, the move `min_move_games`. Games are
+    treated as independent; they are not (one player repeating a line through a
+    tournament), so the test flags too often.
     """
 
     recent_years: int = 3
@@ -137,54 +159,78 @@ class TrendRule:
     min_games: int = 30
     min_move_games: int = 5
 
+    def recent(self, first: int, last: int) -> int:
+        return max(1, min(self.recent_years, (last - first + 1) // 2))
+
+
+def _trends(rows: list[dict], years: list[int], year_totals: dict[int, int], rule: TrendRule) -> dict | None:
+    if len(years) < 2:
+        return None
+    recent_cut = years[-1] - rule.recent(years[0], years[-1]) + 1
+    n_recent = sum(n for y, n in year_totals.items() if y >= recent_cut)
+    n_early = sum(n for y, n in year_totals.items() if y < recent_cut)
+    meta = {
+        "recent_from": recent_cut, "n_recent": n_recent, "n_early": n_early,
+        "tested": n_recent >= rule.min_games and n_early >= rule.min_games,
+        "test": (f"Two-proportion z-test of the share in {recent_cut}-{years[-1]} against "
+                 f"{years[0]}-{recent_cut - 1}, flagged at p < {rule.alpha:g}/k (Bonferroni over the k moves "
+                 f"tested). Needs {rule.min_games}+ games in each period and {rule.min_move_games}+ of the move. "
+                 "Treats games as independent, so it flags too often"),
+    }
+    if meta["tested"]:
+        tested = [m for m in rows if m["n"] >= rule.min_move_games]
+        k = max(len(tested), 1)
+        for m in tested:
+            x1 = sum(n for y, n in zip(years, m["series"]) if y >= recent_cut)
+            x0 = sum(n for y, n in zip(years, m["series"]) if y < recent_cut)
+            z, p = two_proportion(x1, n_recent, x0, n_early)
+            m["trend"] = {"early": x0 / n_early, "recent": x1 / n_recent, "z": z, "p": p,
+                          "flag": (1 if z > 0 else -1) if p < rule.alpha / k else 0}
+    return meta
+
+
+# --- the panel ---------------------------------------------------------------------
+
 
 def _num(x):
     return None if x is None or (isinstance(x, float) and math.isnan(x)) else x
 
 
+def _san(epd: str | None, uci: str) -> tuple[str, str | None]:
+    if epd is None:
+        return uci, None
+    b = chess.Board()
+    b.set_epd(epd)
+    m = chess.Move.from_uci(uci)
+    return (b.san(m) if b.is_legal(m) else uci), b.fen()
+
+
 def report(stats: Stats, board: chess.Board, f: Filters, rule: TrendRule = TrendRule()) -> dict:
-    """Everything the database panel shows for one position."""
+    """Everything the database panel shows for one position.
+
+    `status` says what the numbers are:
+    - `none`: fewer than two games in the table reach the position, so it is not in it;
+    - `ended`: games reach it but none played a move from it (they ended there or at ply 80);
+    - `filtered`: games played moves from it, but none under the filters;
+    - `ok`.
+    """
     h = pos_hash(board)
-    white = board.turn == chess.WHITE
     kw = f.edgedb()
     db = stats.db
-    # Four independent lookups; polars releases the GIL, so they overlap.
-    calls = {"total": lambda: db.total(h), "moves": lambda: db.moves(h, **kw),
-             "by_year": lambda: db.moves_by_year(h, **kw), "children": lambda: db.children(h, **kw),
-             "parents": lambda: stats.parents(h, f)}
-    futures = {k: _POOL.submit(fn) for k, fn in calls.items()}
-    got = {k: fut.result() for k, fut in futures.items()}
-    total_row, moves = got["total"], got["moves"]
-    by_year = got["by_year"].filter(pl.col("year") > 0) if moves.height else None
-    kids = got["children"] if moves.height else None
-    reach = dict(zip(kids["move"].to_list(), kids["child_n"].to_list())) if kids is not None else {}
-
-    total_n = int(moves["n"].sum()) if moves.height else 0
-    tw, td, tb = (int(moves[c].sum()) if moves.height else 0 for c in ("white_wins", "draws", "black_wins"))
+    fut_panel = _POOL.submit(db.panel, h, **kw)
+    fut_parents = _POOL.submit(db.parents, h, **kw)
+    panel, parents = fut_panel.result(), fut_parents.result()
+    total, moves, by_year = panel["total"], panel["moves"], panel["by_year"]
 
     years: list[int] = []
     year_totals: dict[int, int] = {}
     move_year: dict[tuple[str, int], int] = {}
-    if by_year is not None and by_year.height:
-        yt = by_year.group_by("year").agg(pl.col("n").sum()).sort("year")
+    yrows = by_year.filter(pl.col("year") > 0) if by_year.height else by_year
+    if yrows.height:
+        yt = yrows.group_by("year").agg(pl.col("n").sum()).sort("year")
         years = yt["year"].to_list()
         year_totals = dict(zip(years, yt["n"].to_list()))
-        move_year = {(m, y): n for m, y, n in by_year.select("move", "year", "n").iter_rows()}
-
-    trend_meta = None
-    recent_cut = None
-    if years:
-        recent_cut = max(years) - rule.recent_years + 1
-        n_recent = sum(n for y, n in year_totals.items() if y >= recent_cut)
-        n_early = sum(n for y, n in year_totals.items() if y < recent_cut)
-        trend_meta = {
-            "years": [years[0], years[-1]], "recent_from": recent_cut, "n_recent": n_recent, "n_early": n_early,
-            "tested": n_recent >= rule.min_games and n_early >= rule.min_games,
-            "test": (f"Two-proportion z-test of the share in {recent_cut}-{years[-1]} against "
-                     f"{years[0]}-{recent_cut - 1}, flagged at p < {rule.alpha:g}/k (Bonferroni over the k moves "
-                     f"tested). Needs {rule.min_games}+ games in each period and {rule.min_move_games}+ of the move. "
-                     "Treats games as independent, so it flags too often"),
-        }
+        move_year = {(m, y): n for m, y, n in yrows.select("move", "year", "n").iter_rows()}
 
     rows = []
     for r in moves.iter_rows(named=True):
@@ -193,47 +239,43 @@ def report(stats: Stats, board: chess.Board, f: Filters, rule: TrendRule = Trend
             "uci": r["move"], "san": board.san(mv) if board.is_legal(mv) else r["move"], "n": r["n"],
             "share": r["share"], "score": r["score"],
             "draw": r["draws"] / r["n"] if r["n"] else None,
+            "n_rated": r["n_rated"],
             "elo": _num(r["mover_elo"]), "opp_elo": _num(r["opp_elo"]), "perf": _num(r["performance"]),
             "last_year": r["last_year"],
-            "reach": reach.get(r["move"]),
+            "reach": r["child_n"],
             "series": [move_year.get((r["move"], y), 0) for y in years],
         })
+    trend = _trends(rows, years, year_totals, rule)
 
-    if trend_meta and trend_meta["tested"]:
-        tested = [m for m in rows if m["n"] >= rule.min_move_games]
-        k = max(len(tested), 1)
-        for m in tested:
-            x1 = sum(n for y, n in zip(years, m["series"]) if y >= recent_cut)
-            x0 = sum(n for y, n in zip(years, m["series"]) if y < recent_cut)
-            z, p = two_proportion(x1, trend_meta["n_recent"], x0, trend_meta["n_early"])
-            m["trend"] = {"early": x0 / trend_meta["n_early"], "recent": x1 / trend_meta["n_recent"],
-                          "z": z, "p": p, "flag": (1 if z > 0 else -1) if p < rule.alpha / k else 0}
+    move_orders = []
+    for epd, mv, n in parents.select("epd", "move", "n").iter_rows():
+        san, fen = _san(epd, mv)
+        move_orders.append({"san": san, "uci": mv, "n": n, "parent_fen": fen})
 
-    move_orders = None
-    parents = got["parents"]
-    if parents is not None:
-        move_orders = []
-        for epd, mv, n in parents.select("parent_epd", "move", "n").iter_rows():
-            san, fen = mv, None
-            if epd is not None:
-                pb = chess.Board()
-                pb.set_epd(epd)
-                m = chess.Move.from_uci(mv)
-                san = pb.san(m) if pb.is_legal(m) else mv
-                fen = pb.fen()
-            move_orders.append({"san": san, "uci": mv, "n": n, "parent_fen": fen})
-
+    played = int(moves["n"].sum()) if moves.height else 0
+    if total is None:
+        status = "none"
+    elif played:
+        status = "ok"
+    elif f.active and db.moves(h).height:
+        status = "filtered"
+    else:
+        status = "ended"
+    white = board.turn == chess.WHITE
+    tw, td, tb = (int(moves[c].sum()) if moves.height else 0 for c in ("white_wins", "draws", "black_wins"))
     return {
         "hash": f"{h:016x}",
         "white_to_move": white,
+        "status": status,
         "total": {
-            "n": total_n, "white_wins": tw, "draws": td, "black_wins": tb,
-            "score": ((tw if white else tb) + 0.5 * td) / total_n if total_n else None,
-            "reach": total_row["n"] if total_row else None,
+            "reach": total["n"] if total else None,       # games that reached it, all years/bands/tempi
+            "played": played if total else None,          # sum of the moves' games under the filters
+            "white_wins": tw, "draws": td, "black_wins": tb,
+            "score": ((tw if white else tb) + 0.5 * td) / played if played else None,
         },
         "moves": rows,
         "years": years,
         "year_totals": [year_totals[y] for y in years],
-        "trend": trend_meta,
+        "trend": trend,
         "move_orders": move_orders,
     }

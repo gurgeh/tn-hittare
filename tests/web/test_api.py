@@ -43,7 +43,8 @@ def test_counts_and_white_score(client):
     assert d["white_to_move"] is True
     m = by_move(d)
     assert {k: v["n"] for k, v in m.items()} == {"e2e4": 4, "d2d4": 2, "c2c4": 2}
-    assert d["total"]["n"] == 8
+    assert d["status"] == "ok"
+    assert d["total"]["played"] == 8
     assert d["total"]["reach"] == 8
     # e4: 1-0, 1/2, 0-1, 1/2 -> White scores 2/4
     assert m["e2e4"]["score"] == pytest.approx(0.5)
@@ -97,7 +98,11 @@ def test_filters(client):
     assert {k: v["n"] for k, v in m.items()} == {"e2e4": 1, "d2d4": 1}
 
     # all tempi is the same as no filter
-    assert get(client, START, tempo="classical,rapid,blitz,unknown")["total"]["n"] == 8
+    assert get(client, START, tempo="classical,rapid,blitz,unknown")["total"]["played"] == 8
+
+    # filters that leave nothing: said so, the unfiltered count kept
+    d = get(client, START, y0=2025, tempo="blitz")
+    assert d["status"] == "filtered" and d["moves"] == [] and d["total"]["reach"] == 8
 
 
 def test_filters_bad_tempo(client):
@@ -109,7 +114,7 @@ def test_transposition(client):
     fen = fen_after("d2d4", "g8f6", "c2c4")
     assert fen_after("c2c4", "g8f6", "d2d4").split()[:4] == fen.split()[:4]
     d = get(client, fen)
-    assert d["total"]["n"] == 4
+    assert d["total"]["reach"] == 4 and d["total"]["played"] == 4
     assert by_move(d)["e7e6"]["n"] == 3
     orders = {o["san"]: o["n"] for o in d["move_orders"]}
     assert orders == {"c4": 2, "d4": 2}
@@ -120,8 +125,20 @@ def test_transposition(client):
 
 def test_unknown_position(client):
     d = get(client, "8/8/8/4k3/8/8/4K3/7R w - - 0 1")
-    assert d["moves"] == [] and d["total"]["n"] == 0 and d["total"]["reach"] is None
-    assert d["move_orders"] == []
+    assert d["status"] == "none"
+    assert d["moves"] == [] and d["total"]["played"] is None and d["total"]["reach"] is None
+    assert d["move_orders"] == [] and d["years"] == []
+
+
+def test_position_where_every_game_ended(client):
+    # 1.d4 Nf6 2.c4 e6 (and its transposition) is where three games stop
+    d = get(client, fen_after("d2d4", "g8f6", "c2c4", "e7e6"))
+    assert d["status"] == "ended" and d["total"]["reach"] == 3 and d["moves"] == []
+
+
+def test_maia_rating_map():
+    from tnh.web.models import maia_elo
+    assert maia_elo(2200) == 2808 and maia_elo(0) == 1580
 
 
 def test_bad_fen(client):
@@ -180,7 +197,8 @@ def test_models_get_ratings_by_side(client):
     r = client.get("/api/maia", params={"fen": fen, "moves": "e2e4", "white": 2300, "black": 1900})
     assert r.status_code == 200, r.text
     d = r.json()
-    assert (d["mover_elo"], d["opp_elo"]) == (1900, 2300)   # Black to move
+    assert (d["mover_fide"], d["opp_fide"]) == (1900, 2300)   # Black to move
+    assert d["mover_maia"] == round(1580 + 0.558 * 1900)
     assert sum(d["moves"].values()) == pytest.approx(1)
     assert client.hub.calls[-1] == ("maia", fen, ("e2e4",), 2300, 1900)
 
@@ -195,3 +213,21 @@ def test_engine(client):
     assert r.status_code == 200, r.text
     assert len(r.json()["moves"]) == 20
     assert client.get("/api/engine", params={"fen": START, "nodes": 10}).status_code == 422
+
+
+def test_models_off():
+    from tnh.web.models import NoModels
+    c = TestClient(create_app(stats(), NoModels()))
+    assert c.get("/api/info").json()["models"] == {"disabled": True}
+    r = c.get("/api/maia", params={"fen": START})
+    assert r.status_code == 503 and "--no-models" in r.json()["detail"]
+    assert c.get("/api/engine", params={"fen": START}).status_code == 503
+    assert c.get("/api/stats", params={"fen": START}).status_code == 200
+
+
+def test_trend_split_fits_short_tables():
+    from tnh.web.stats import TrendRule
+    r = TrendRule()
+    assert r.recent(2024, 2026) == 1      # the 2024+ dev table: 2026 against 2024-2025
+    assert r.recent(1998, 2026) == 3
+    assert r.recent(2025, 2026) == 1

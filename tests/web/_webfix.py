@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import polars as pl
 
@@ -32,10 +34,24 @@ def games() -> pl.DataFrame:
     })
 
 
-def stats() -> Stats:
-    from tnh.data.edges import tables_from_games
+def tables():
+    from tnh.data.edges import parents_from_edges, tables_from_games
     edges, index = tables_from_games(games())
-    return Stats.from_frames(edges, index, "test fixture")
+    return edges, index, parents_from_edges(edges)
+
+
+def stats() -> Stats:
+    from tnh.data.edges import EdgeDB
+    edges, index, parents = tables()
+    return Stats(EdgeDB.from_frames(edges, index, parents), "test", why="fixture")
+
+
+def write_tables(corpus: Path, name: str = "dev") -> None:
+    """The fixture tables as parquet files where `EdgeDB(name=...)` looks for them."""
+    corpus.mkdir(parents=True, exist_ok=True)
+    suffix = "" if name == "full" else f"_{name}"
+    for t, df in zip(("edges", "pos_index", "parents"), tables()):
+        df.write_parquet(corpus / f"{t}{suffix}.parquet", row_group_size=4, statistics=True)
 
 
 class FakeHub:
@@ -51,9 +67,11 @@ class FakeHub:
         self.calls.append(("maia", fen, tuple(moves), white_elo, black_elo))
         legal = [m.uci() for m in board.legal_moves]
         p = Prediction(legal, np.full(len(legal), -np.log(len(legal)), np.float32), (0.4, 0.3, 0.3))
+        from tnh.web.models import maia_elo
         mover = white_elo if board.turn == chess.WHITE else black_elo
         opp = black_elo if board.turn == chess.WHITE else white_elo
-        return {"model": "fake", "mover_elo": mover, "opp_elo": opp, "history": len(moves),
+        return {"model": "fake", "mover_fide": mover, "opp_fide": opp, "mover_maia": maia_elo(mover),
+                "opp_maia": maia_elo(opp), "history": len(moves),
                 "moves": {m: float(np.exp(x)) for m, x in zip(p.moves, p.logp)}, "wdl": list(p.wdl), "ms": 0.0}
 
     def engine(self, fen, moves, nodes):

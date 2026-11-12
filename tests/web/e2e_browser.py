@@ -21,7 +21,7 @@ SHOTS = sys.argv[2] if len(sys.argv) > 2 else None
 
 def counts(page) -> dict[str, int]:
     out = {}
-    for tr in page.locator("#tbl tbody tr[data-uci]").all():
+    for tr in page.locator("#tbl tbody tr[data-uci]:not(.nodb)").all():
         n = tr.locator("td").nth(1).inner_text().strip()
         if n:
             out[tr.get_attribute("data-uci")] = int(n)
@@ -104,7 +104,9 @@ def main() -> None:
         page.wait_for_function("location.hash.includes('fen=')")
         settle(page)
         assert counts(page) == {}, counts(page)
+        expect(page.locator("#totals")).to_contain_text("No games.")
         expect(page.locator("#models")).to_contain_text("no move history")
+        expect(page.locator("#models")).to_contain_text("2200→2808")
         if SHOTS:
             page.screenshot(path=f"{SHOTS}/e2e_fen.png")
         browser.close()

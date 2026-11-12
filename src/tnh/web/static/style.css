@@ -95,7 +95,7 @@ main {
     border-radius: 3px;
     line-height: 1.6;
 }
-.mv { cursor: pointer; padding: 0 2px; border-radius: 2px; margin-right: 2px; white-space: nowrap; }
+.mv { display: inline-block; cursor: pointer; padding: 0 2px; border-radius: 2px; margin-right: 2px; white-space: nowrap; }
 .mv:hover { background: var(--hover); }
 .mv.cur { background: var(--cur); color: #fff; }
 .var { color: var(--dim); }

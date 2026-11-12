@@ -13,7 +13,8 @@ from pathlib import Path
 import httpx
 import pytest
 
-from _webfix import games
+from _webfix import write_tables
+from tnh.paths import DATA_ROOT
 
 STATIC = Path(__file__).parents[2] / "src" / "tnh" / "web" / "static"
 
@@ -42,12 +43,16 @@ def listening(port: int) -> list[str]:
 
 @pytest.fixture(scope="module")
 def server(tmp_path_factory):
-    path = tmp_path_factory.mktemp("web") / "games.parquet"
-    games().write_parquet(path)
+    """The server on the fixture tables written as `corpus/*_dev.parquet` under a temporary TNH_DATA."""
+    data = tmp_path_factory.mktemp("web")
+    write_tables(data / "corpus", "dev")
+    (data / "weights").symlink_to(DATA_ROOT / "weights")   # Maia's weights live under TNH_DATA
     port = free_port()
+    env = {**os.environ, "PYTHONUNBUFFERED": "1", "TNH_DATA": str(data)}
+    env.pop("TNH_WEB_TABLE", None)
     proc = subprocess.Popen(
-        [sys.executable, "-m", "tnh.web", "--port", str(port), "--data", f"games:{path}"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        [sys.executable, "-m", "tnh.web", "--port", str(port)],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
     )
     base = f"http://127.0.0.1:{port}"
     deadline = time.monotonic() + 60
@@ -92,8 +97,10 @@ def test_every_module_import_resolves(server):
 def test_api_through_the_server(server):
     base, _ = server
     d = httpx.get(base + "/api/stats", params={"fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"}).json()
-    assert d["total"]["n"] == 8
-    assert httpx.get(base + "/api/info").json()["stats"]["source"].startswith("games: 8 games")
+    assert d["total"]["played"] == 8
+    info = httpx.get(base + "/api/info").json()["stats"]
+    assert (info["table"], info["games"], info["year_min"], info["year_max"]) == ("dev", 8, 2019, 2024)
+    assert info["why"] == "no full table yet"
 
 
 def test_binds_to_localhost_only(server):
@@ -105,6 +112,43 @@ def test_binds_to_localhost_only(server):
 
 def test_refuses_a_taken_port(server):
     _, port = server
-    r = subprocess.run([sys.executable, "-m", "tnh.web", "--port", str(port), "--data", "games:/nonexistent"],
+    r = subprocess.run([sys.executable, "-m", "tnh.web", "--port", str(port)],
                        capture_output=True, text=True, timeout=60)
     assert r.returncode != 0 and "taken" in r.stderr
+
+
+def test_table_choice(tmp_path, monkeypatch):
+    from tnh.web.stats import choose_table, open_stats
+    monkeypatch.delenv("TNH_WEB_TABLE", raising=False)
+    write_tables(tmp_path, "dev")
+    assert choose_table(None, tmp_path) == ("dev", "no full table yet")
+    write_tables(tmp_path, "full")
+    assert choose_table(None, tmp_path) == ("full", "its files exist")
+    assert choose_table("dev", tmp_path) == ("dev", "--table")
+    monkeypatch.setenv("TNH_WEB_TABLE", "dev")
+    assert choose_table(None, tmp_path)[0] == "dev"
+    assert open_stats(None, tmp_path).info()["table"] == "dev"
+    with pytest.raises(SystemExit, match="missing"):
+        open_stats("nosuch", tmp_path)
+
+
+def _played_at_start(db) -> int:
+    import chess
+    return int(db.panel(chess.Board())["moves"]["n"].sum())
+
+
+@pytest.mark.xfail(strict=True, reason="EdgeDB drops rows of a position that straddles row groups; "
+                   "when this passes, delete tnh/web/edgefix.py")
+def test_edgedb_reads_a_position_across_row_groups(tmp_path):
+    from tnh.data.edges import EdgeDB
+    write_tables(tmp_path, "dev")
+    assert _played_at_start(EdgeDB(name="dev", directory=tmp_path)) == 8
+
+
+def test_edgefix_reads_a_position_across_row_groups(tmp_path):
+    from tnh.data.edges import EdgeDB
+    from tnh.web import edgefix
+    write_tables(tmp_path, "dev")
+    db = EdgeDB(name="dev", directory=tmp_path)
+    assert edgefix.patch(db) == 3
+    assert _played_at_start(db) == 8

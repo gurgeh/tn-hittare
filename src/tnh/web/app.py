@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from tnh.web.models import ModelHub
+from tnh.web.models import ModelHub, ModelsOff
 from tnh.web.stats import TEMPI, Filters, Stats, TrendRule, report
 
 STATIC = Path(__file__).parent / "static"
@@ -109,6 +109,10 @@ def create_app(stats: Stats, hub: ModelHub, *, trend_rule: TrendRule = TrendRule
     @app.post("/api/pgn")
     async def pgn(request: Request):
         return _pgn_tree((await request.body()).decode("utf-8", errors="replace"))
+
+    @app.exception_handler(ModelsOff)
+    async def models_off(_request, exc: ModelsOff):
+        return JSONResponse({"detail": str(exc)}, status_code=503)
 
     @app.exception_handler(Exception)
     async def unhandled(_request, exc: Exception):
