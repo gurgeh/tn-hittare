@@ -35,9 +35,13 @@ from pathlib import Path
 import numpy as np
 
 BINS = [(1, 1), (2, 2), (3, 3), (4, 5), (6, 10), (11, 20), (21, 50), (51, 100), (101, 10**12)]
-FORMS = ("none", "prior", "nk", "bins", "hill", "logistic", "share_hill", "share_logistic")
+SMALL = BINS[:6]          # the table forms: one weight per bin up to 20 games
+TABLE_MAX = 20
+TABLE_FORMS = ("tbl_hill", "tbl_logistic", "share_tbl_hill", "share_tbl_logistic")
+FORMS = ("none", "prior", "nk", "bins", "hill", "logistic", "share_hill", "share_logistic") + TABLE_FORMS
 N_PARAMS = {"none": 0, "prior": 0, "nk": 1, "bins": len(BINS), "hill": 2, "logistic": 4,
-            "share_hill": 5, "share_logistic": 7}
+            "share_hill": 5, "share_logistic": 7,
+            "tbl_hill": 8, "tbl_logistic": 10, "share_tbl_hill": 11, "share_tbl_logistic": 13}
 RULES_FILE = Path(__file__).parent / "shrink_rules.json"
 
 
@@ -59,8 +63,25 @@ def _logs(n, pos_n, spread, s):
     return np.log(n), np.log(pos_n), np.log1p(np.asarray(spread, float) / s)
 
 
+def table_weights(t) -> np.ndarray:
+    """The six weights of a table form from its parameters: a logit for n = 1, then
+    non-negative steps (exp), so the table rises with n."""
+    t = np.asarray(t, float)
+    return _sigmoid(np.cumsum(np.concatenate([t[:1], np.exp(t[1:6])])))
+
+
+def _tail_form(form: str) -> str:
+    return "hill" if form.endswith("hill") else "logistic"
+
+
 def weight(form: str, p: np.ndarray, n, pos_n, spread, s: float = 1.0) -> np.ndarray:
     n = np.asarray(n, float)
+    if form in TABLE_FORMS:
+        p = np.asarray(p, float)
+        q = p[3:] if form.startswith("share_") else p          # table (6), then the tail's parameters
+        tail = weight(_tail_form(form), q[6:], n, pos_n, spread, s)
+        small = table_weights(q[:6])[np.minimum(bin_index(n), 5)]
+        return np.where(n <= TABLE_MAX, small, tail)
     if form == "none":
         return np.ones_like(n)
     if form == "prior":
@@ -115,6 +136,15 @@ class Rule:
     def describe(self) -> str:
         """One line for a tooltip."""
         p = self.params
+        if self.form in TABLE_FORMS:
+            q = p[3:] if self.form.startswith("share_") else p
+            w = table_weights(q[:6])
+            table = "w by games: " + ", ".join(f"{lo if lo == hi else f'{lo}-{hi}'}: {x:.2f}" for (lo, hi), x in zip(SMALL, w))
+            tail = Rule(_tail_form(self.form), list(q[6:]), self.spread_scale).describe()
+            out = f"{table}; above {TABLE_MAX}: {tail}"
+            if self.form.startswith("share_"):
+                out = f"prior = base {p[0]:+.3g} {p[1]:+.3g} ln share {p[2]:+.3g} ln N; " + out
+            return out
         if self.form == "none":
             return "no shrinkage"
         if self.form == "prior":

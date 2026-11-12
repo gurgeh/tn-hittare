@@ -81,3 +81,26 @@ def test_collect_and_pairs_on_the_fixture():
     assert (p["base"] == 0).all()
     p = shrinkfit.pairs(raw, "score")
     assert p.height >= 1 and ((p["base"] >= 0) & (p["base"] <= 1)).all()
+
+
+def test_table_forms():
+    # the table rises with n and is used up to 20 games; above, the tail rule
+    t = [np.log(0.1 / 0.9)] + [np.log(0.2)] * 5
+    w = sr.table_weights(t)
+    assert w[0] == pytest.approx(0.1) and np.all(np.diff(w) > 0)
+    p = t + [0.0, np.log(4.0)]
+    n = np.array([1.0, 3.0, 20.0, 21.0, 100.0])
+    got = sr.weight("tbl_hill", p, n, n, n)
+    assert np.allclose(got[:3], w[[0, 2, 5]]) and np.allclose(got[3:], n[3:] / (n[3:] + 4))
+    r = sr.Rule("share_tbl_hill", [0.0, 0.5, 0.0] + p)
+    assert r.describe().startswith("prior = base") and "w by games: 1: 0.10" in r.describe() and "above 20" in r.describe()
+
+
+def test_a_planted_table_is_found():
+    p = planted(k=4.0, seed=2)
+    a = shrinkfit._arrays(p)
+    prm = shrinkfit.fit_form("tbl_hill", a, 1.0)
+    w = sr.table_weights(prm[:6])
+    assert abs(w[0] - 0.2) < 0.08 and abs(w[4] - 10 / 14) < 0.12     # n = 1 and n = 10 (bin 6-10)
+    res = shrinkfit.compare(p, forms=("nk", "hill", "tbl_hill"), boot=30)
+    assert "table" in res["groups"]["all"] and res["groups"]["all"]["chosen"] == "tbl_hill"

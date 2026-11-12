@@ -186,8 +186,12 @@ def fit_form(form: str, a: dict, s: float) -> np.ndarray:
         return np.array([r.x])
     if form == "bins":
         return bin_weights(a)
+    tbl = [-2.0] + [np.log(0.3)] * 5
     inits = {"hill": [0.0, np.log(5)], "logistic": [0.0, 1.0, 0.0, 0.0],
-             "share_hill": [0.0, 0.0, 0.0, 0.0, np.log(5)], "share_logistic": [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]}
+             "share_hill": [0.0, 0.0, 0.0, 0.0, np.log(5)], "share_logistic": [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+             "tbl_hill": tbl + [0.0, np.log(5)], "tbl_logistic": tbl + [0.0, 1.0, 0.0, 0.0],
+             "share_tbl_hill": [0.0, 0.0, 0.0] + tbl + [0.0, np.log(5)],
+             "share_tbl_logistic": [0.0, 0.0, 0.0] + tbl + [0.0, 1.0, 0.0, 0.0]}
     r = minimize(lambda x: _mse(form, x, a, s) / scale, np.array(inits[form]), method="L-BFGS-B")
     return r.x
 
@@ -249,6 +253,18 @@ def compare(p: pl.DataFrame, forms=sr.FORMS, folds: int = 5, boot: int = 200, se
         tied = [f for f in order if f == order[0] or np.percentile(bs[f] - bs[order[0]], 2.5) <= 0]
         res["chosen"] = min(tied, key=lambda f: (sr.N_PARAMS[f], res[f]["mse"]))
         res["tied_with_winner"] = tied
+        # The owner prefers a rule whose weight for few games is a table in n alone, so one
+        # game cannot look like evidence: the best table form is used when its paired
+        # difference to the best reaches zero or it loses by less than 1 % of the MSE.
+        tbls = [f for f in order if f in sr.TABLE_FORMS]
+        if tbls:
+            t = tbls[0]
+            d = bs[t] - bs[order[0]]
+            res["table"] = {"form": t, "mse": res[t]["mse"], "vs_best": res[t]["mse"] - res[order[0]]["mse"],
+                            "rel": (res[t]["mse"] - res[order[0]]["mse"]) / res[order[0]]["mse"],
+                            "lo": float(np.percentile(d, 2.5)), "hi": float(np.percentile(d, 97.5))}
+            if res["table"]["lo"] <= 0 or res["table"]["rel"] < 0.01:
+                res["chosen"] = t
         out["groups"][g] = res
     out["fold_params"] = fitted
     return out
@@ -285,7 +301,10 @@ def _table(q: str, res: dict, bins_all: list[float], w_curve: dict) -> str:
     a = res["groups"]["all"]
     lines += ["", f"Winner {a['winner']}, runner-up {a['runner_up']}: lead {a['lead']['mse']:.4g} "
               f"[{a['lead']['lo']:.4g}, {a['lead']['hi']:.4g}]. Not distinguishable from the winner: "
-              f"{', '.join(a['tied_with_winner'])}. Used: {a['chosen']} (fewest parameters among those).",
+              f"{', '.join(a['tied_with_winner'])}.",
+              (f"Best table form {a['table']['form']}: {a['table']['vs_best']:+.4g} against the best "
+               f"({100 * a['table']['rel']:+.2f} %) [{a['table']['lo']:.4g}, {a['table']['hi']:.4g}]." if "table" in a else ""),
+              f"Used: {a['chosen']}.",
               "Least-squares weight per bin of n (all pairs): " + ", ".join(
                   f"{lo if lo == hi else f'{lo}-{hi}' if hi < 10**12 else f'{lo}+'}: {w:.3f}"
                   for (lo, hi), w in zip(sr.BINS, bins_all)),
