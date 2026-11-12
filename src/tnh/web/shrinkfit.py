@@ -340,6 +340,9 @@ def main(argv: list[str] | None = None) -> None:
             "fitted": date.today().isoformat(), "commit": _commit(), "sample": meta,
             "pairs": res["pairs"],
             "prior": a.prior_column or "0: the move's mean against the position's mean in the same period",
+            "collect": ("python -m tnh.web.shrinkfit collect --table {table} --walks {walks} --seed {seed} "
+                        "--tempi {t} --split-year {split_year} --out <file>").format(
+                            t=",".join(meta["tempi"]) if meta.get("tempi") else "all", **meta) if meta else None,
             "command": "python -m tnh.web.shrinkfit fit --data <collect output>"
                        + (f" --prior-file {a.prior_file} --prior-column {a.prior_column}" if a.prior_file else "")
                        + " --write-rules",
