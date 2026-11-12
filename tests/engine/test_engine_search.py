@@ -248,7 +248,7 @@ def test_deterministic():
 
 def test_result_reports_masses_and_history():
     g = random_game(np.random.default_rng(4), depth=6, branching=(2, 3))
-    eng = Engine(SynthEvaluator(g), Settings(my_side="white", kappa=INF, price=0.002, solve_every=10))
+    eng = Engine(SynthEvaluator(g), Settings(my_side="white", kappa=INF, price=0.002, solve_every=10, solve_ratio=0.0))
     r = eng.search(nodes=40)
     m = r.mass
     assert m["stand_in"] > 0 and sum(m.values()) == pytest.approx(1.0)

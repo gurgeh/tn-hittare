@@ -222,15 +222,30 @@ def solve_price(game: Game, mu: float, *, ascent: bool = True, keep_W: bool = Fa
     return Priced(mu, learned, v, c, f, steps, W if keep_W else None)
 
 
-def solve_cap(game: Game, N: int, *, mu_hi: float = 1.0, iters: int = 40, ascent: bool = True) -> Priced:
-    """The repertoire at the smallest price that learns at most N non-obvious moves."""
-    best = solve_price(game, mu_hi, ascent=ascent)
-    if best.cost > N:
-        raise ValueError(f"even at price {mu_hi} the repertoire costs {best.cost} > {N}")
+def solve_cap(game: Game, N: int, *, mu_hi: float = 1.0, iters: int = 40, ascent: bool = True,
+              hint: float | None = None) -> Priced:
+    """The repertoire at the smallest price that learns at most N non-obvious moves. With
+    `hint` (the price found last time) the search brackets around it first. The result can
+    hold fewer than N moves: the price reaches only the points of the concave hull."""
     lo_sol = solve_price(game, 0.0, ascent=ascent)
     if lo_sol.cost <= N:
         return lo_sol
-    lo, hi = 0.0, mu_hi
+    if hint is not None and 0 < hint < mu_hi:
+        hi = hint
+        best = solve_price(game, hi, ascent=ascent)
+        while best.cost > N and hi < mu_hi:
+            hi = min(2 * hi, mu_hi)
+            best = solve_price(game, hi, ascent=ascent)
+        lo = hi / 2
+        while lo > 1e-7 and solve_price(game, lo, ascent=ascent).cost <= N:
+            hi, lo = lo, lo / 2
+        best = solve_price(game, hi, ascent=ascent)
+        iters = min(iters, 14)
+    else:
+        lo, hi = 0.0, mu_hi
+        best = solve_price(game, mu_hi, ascent=ascent)
+    if best.cost > N:
+        raise ValueError(f"even at price {hi} the repertoire costs {best.cost} > {N}")
     for _ in range(iters):
         mid = 0.5 * (lo + hi)
         s = solve_price(game, mid, ascent=ascent)

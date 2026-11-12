@@ -89,7 +89,7 @@ class Settings:
     prepared: float = 0.0             # share of the opponent's probability on his best reply, per position
     mix: str = "fitted"               # the opponent's database mix: "fitted" (tnh.movemix) or "kappa"
     kappa: float = 100.0              # with mix="kappa": the model's weight in games
-    db_filter: Hashable = None        # passed to the evaluator's counts
+    db_filter: Hashable = "auto"      # passed to the evaluator's counts; "auto" = the tempo's own
     lines: int = 3
     c_puct: float = 1.5
     fpu: float = 0.05
@@ -98,9 +98,12 @@ class Settings:
     explore_uniform: float = 0.0      # share of a uniform prior mixed into PUCT's (tests: reach every move)
     blunder: float = 0.15             # safety net: a learned move's child at most this far below the position
     batch: int = 12
-    solve_every: int = 120            # expansions between full solves
+    solve_every: int = 120            # at least this many expansions between full solves
+    solve_ratio: float = 4.0          # and evaluation time since the last solve >= this x its duration
+    expand_root: bool = True          # every legal move at the root is expanded once
 
     EVAL_KEYS = ("my_elo", "opp_elo", "my_side", "tempo")
+    TEMPI = ("classical", "blitz", "fake")
 
 
 @dataclass
@@ -148,6 +151,9 @@ class Result:
     history: list                 # (expanded positions, root value, root net) at every solve
 
 
+PENDING = ("?",)        # a position's moves before it is first expanded (not read yet)
+
+
 class Engine:
     def __init__(self, evaluator: Evaluator, settings: Settings | None = None,
                  update: Callable[[Node, np.ndarray, dict], np.ndarray] = identity_update) -> None:
@@ -173,6 +179,9 @@ class Engine:
         self.since_solve = 0
         self.root_moves: list[str] = []
         self.history: list[tuple[int, float, float]] = []
+        self.eval_since_solve = 0.0
+        self.last_solve_seconds = 0.0
+        self.cap_mu: float | None = None
         self._node(self.ev.start(), None)
         self.graph.root = 0
         self._refresh()
@@ -183,7 +192,8 @@ class Engine:
         if hit is not None:
             self.stats["transpositions merged"] += 1
             return hit
-        n = self.graph.add(k, ply, True, self.ev.moves(pos), value=math.nan)
+        n = self.graph.add(k, ply, True, [], value=math.nan)
+        n.moves = PENDING
         self.pos[n.id] = pos
         return n
 
@@ -207,6 +217,8 @@ class Engine:
         new = replace(old, **changes)
         self.s = new
         evals_changed = any(getattr(old, k) != getattr(new, k) for k in Settings.EVAL_KEYS)
+        if old.cap != new.cap:
+            self.cap_mu = None
         if evals_changed:
             self.visits.clear()
         self._refresh()
@@ -232,18 +244,23 @@ class Engine:
         """Fill every position's fields from the caches under the current settings."""
         g = self.graph
         g.me_white = self._my_white()
+        need = []
         for n in g.nodes:
-            pos = self.pos[n.id]
-            n.me_to_move = self.ev.white_to_move(pos) == g.me_white
+            n.me_to_move = self.ev.white_to_move(self.pos[n.id]) == g.me_white
+            if n.moves is not PENDING and n.moves and not n.me_to_move:
+                e = self._evals.get(self._ekey(n.id))
+                if e is not None:
+                    need.append(n)
+        self._fetch_counts(need)
+        for n in g.nodes:
             n.engine, n.counts = None, None
             n.info.pop("stand_in", None)
-            t = self.ev.terminal(pos)
-            if t is not None:
+            if "result_mover" in n.info:
+                t = n.info["result_mover"]
                 n.value = t if n.me_to_move else 1.0 - t
-                n.children = None
-                n.p_model = None
+                n.children, n.p_model = None, None
                 continue
-            e = self._evals.get(self._ekey(n.id))
+            e = None if n.moves is PENDING else self._evals.get(self._ekey(n.id))
             if e is None:
                 n.children, n.p_model = None, None
                 n.value = math.nan
@@ -267,6 +284,32 @@ class Engine:
         self.game = None
         self.since_solve = 10 ** 9
 
+    def _filter(self) -> Hashable:
+        if self.s.db_filter != "auto":
+            return self.s.db_filter
+        return "blitz" if self.s.tempo == "blitz" else "classical"
+
+    def _ckey(self, n: Node) -> tuple:
+        return (n.key, self._elos(self.pos[n.id])[0], self._filter())
+
+    def _fetch_counts(self, nodes: list[Node]) -> None:
+        """Database counts for the opponent's positions, in one call where the evaluator can."""
+        todo = [n for n in nodes if not n.me_to_move and self._ckey(n) not in self._counts]
+        if not todo:
+            return
+        t = time.perf_counter()
+        items = [(self.pos[n.id], list(n.moves), self._elos(self.pos[n.id])[0]) for n in todo]
+        many = getattr(self.ev, "counts_many", None)
+        if many is not None:
+            out = many(items, self._filter())
+        else:
+            out = [self.ev.counts(p, ms, e, self._filter()) for p, ms, e in items]
+        for n, c in zip(todo, out):
+            self._counts[self._ckey(n)] = c
+        self.stats["count lookups"] += len(todo)
+        self.stats["count calls"] += 1
+        self.seconds["counts"] += time.perf_counter() - t
+
     def _apply(self, n: Node, e: Eval) -> None:
         idx = {m: j for j, m in enumerate(e.moves)}
         if set(idx) != set(n.moves):
@@ -278,57 +321,67 @@ class Engine:
         n.info["policy"] = None if e.policy is None else np.asarray(e.policy, dtype=np.float64)[order]
         n.value = e.value if n.me_to_move else 1.0 - e.value
         if not n.me_to_move:
-            mover_elo = self._elos(self.pos[n.id])[0]
-            ck = (n.key, mover_elo, self.s.db_filter)
-            if ck not in self._counts:
-                self._counts[ck] = self.ev.counts(self.pos[n.id], n.moves, mover_elo, self.s.db_filter)
-                self.stats["count lookups"] += 1
-            n.counts = self._counts[ck]
+            n.counts = self._counts.get(self._ckey(n))
 
     # -- expansion ------------------------------------------------------------------------------
 
     def _expand(self, ids: list[int]) -> None:
-        todo, seen = [], set()
+        t0 = time.perf_counter()
+        g = self.graph
+        live = []
         for i in ids:
-            n = self.graph.nodes[i]
-            if self.ev.terminal(self.pos[i]) is not None:
+            n = g.nodes[i]
+            if n.moves is PENDING:
+                pos = self.pos[i]
+                t = self.ev.terminal(pos)
+                if t is not None:
+                    n.info["result_mover"] = t
+                    n.moves = []
+                    n.value = t if n.me_to_move else 1.0 - t
+                    n.children = None
+                    n.info.pop("stand_in", None)
+                    self.stats["finished games"] += 1
+                    continue
+                n.moves = self.ev.moves(pos)
+            if not n.moves:
                 continue
+            live.append(i)
+        todo, seen = [], set()
+        for i in live:
             k = self._ekey(i)
             if k in self._evals or k in seen:
                 self.stats["evaluation cache hits"] += 1
                 continue
             seen.add(k)
             todo.append((i, k))
+        self.seconds["expand"] += time.perf_counter() - t0
         if todo:
             t = time.perf_counter()
             out = self.ev.evaluate([(self.pos[i], *self._elos(self.pos[i])) for i, _ in todo], self.s.tempo)
-            self.seconds["evaluate"] += time.perf_counter() - t
+            dt = time.perf_counter() - t
+            self.seconds["evaluate"] += dt
+            self.eval_since_solve += dt
             self.stats["evaluations"] += len(todo)
             for (i, k), e in zip(todo, out):
                 self._evals[k] = e
-        for i in ids:
-            n = self.graph.nodes[i]
-            if self.ev.terminal(self.pos[i]) is not None:
-                continue
+        self._fetch_counts([g.nodes[i] for i in live])
+        t0 = time.perf_counter()
+        for i in live:
+            n = g.nodes[i]
             e = self._evals[self._ekey(i)]
-            was_stand_in = n.info.pop("stand_in", False)
+            n.info.pop("stand_in", None)
             self._apply(n, e)
             if i not in self.kids:
                 self.kids[i] = [self._node(self.ev.child(self.pos[i], m), n.value).id for m in n.moves]
             for c in self.kids[i]:
-                cn = self.graph.nodes[c]
-                if cn.children is None and (math.isnan(cn.value) or cn.info.get("stand_in")):
-                    if self.ev.terminal(self.pos[c]) is not None:
-                        t = self.ev.terminal(self.pos[c])
-                        cn.me_to_move = self.ev.white_to_move(self.pos[c]) == self.graph.me_white
-                        cn.value = t if cn.me_to_move else 1.0 - t
-                    else:
-                        cn.me_to_move = self.ev.white_to_move(self.pos[c]) == self.graph.me_white
-                        cn.value = n.value
-                        cn.info["stand_in"] = True
+                cn = g.nodes[c]
+                if cn.children is None and "result_mover" not in cn.info and (math.isnan(cn.value) or cn.info.get("stand_in")):
+                    cn.me_to_move = self.ev.white_to_move(self.pos[c]) == g.me_white
+                    cn.value = n.value
+                    cn.info["stand_in"] = True
             n.children = self.kids[i]
             self.stats["expanded"] += 1
-            del was_stand_in
+        self.seconds["expand"] += time.perf_counter() - t0
 
     # -- the solve ------------------------------------------------------------------------------
 
@@ -403,25 +456,40 @@ class Engine:
             self._rule = movemix.load()
         return self._rule.mix
 
-    def solve(self) -> Priced:
+    def solve(self, final: bool = True) -> Priced:
+        """The exact solve of the current graph. With a cap, `final` bisects for the price
+        (warm-started at the last one); otherwise the last price is reused."""
         t = time.perf_counter()
         self._prepare()
         game = Game(self.graph, self.params())
         if self.s.cap > 0:
-            res = solve_cap(game, self.s.cap)
+            if final or self.cap_mu is None:
+                found = solve_cap(game, self.s.cap, hint=self.cap_mu)
+                self.cap_mu = found.mu
+                self.stats["cap bisections"] += 1
+            res = solve_price(game, self.cap_mu, keep_W=True)
         else:
             res = solve_price(game, self.s.price, keep_W=True)
-        if res.W is None:
-            res = solve_price(game, res.mu, keep_W=True)
         Vs = game.values(res.learned)
         self.V = {i: float(Vs[i]) for i in game.order}
         self.R = game.reach(res.learned)
         self.history.append((self.stats["expanded"], res.value, res.net))
         self.game, self.last = game, res
         self.since_solve = 0
-        self.seconds["solve"] += time.perf_counter() - t
+        self.eval_since_solve = 0.0
+        self.last_solve_seconds = time.perf_counter() - t
+        self.seconds["solve"] += self.last_solve_seconds
         self.stats["solves"] += 1
         return res
+
+    def _due(self) -> bool:
+        """Solve when enough has been evaluated since the last solve that solving stays a small
+        share of the time, and at least `solve_every` expansions have been made."""
+        if self.since_solve < self.s.solve_every:
+            return False
+        if self.since_solve >= 10 * self.s.solve_every:
+            return True
+        return self.eval_since_solve >= self.s.solve_ratio * self.last_solve_seconds
 
     # -- selection ------------------------------------------------------------------------------
 
@@ -478,8 +546,9 @@ class Engine:
         stalled = 0
         if self.graph.nodes[self.graph.root].children is None:
             self._expand([self.graph.root])
+        self._expand_root()
         if self.last is None:
-            self.solve()
+            self.solve(final=False)
         while True:
             done = self.stats["expanded"] - start_exp
             if nodes is not None and done >= nodes:
@@ -491,6 +560,7 @@ class Engine:
             pending: Counter = Counter()
             leaves, paths, ended = [], [], 0
             want = self.s.batch if nodes is None else min(self.s.batch, nodes - done)
+            ts = time.perf_counter()
             while len(leaves) < want and ended <= 4 * self.s.batch:
                 path = self._select(pending)
                 if path is None:
@@ -512,13 +582,14 @@ class Engine:
                 paths.append(path)
                 for i in path:
                     pending[i] += 1
+            self.seconds["select"] += time.perf_counter() - ts
             if not leaves:
                 for path in paths:
                     for i in path:
                         self.visits[i] += 1
                 stalled += 1
                 if self.since_solve > 0 and (self.since_solve >= self.s.batch or stalled >= 10):
-                    self.solve()              # selection must not run long on stale values
+                    self.solve(final=False)   # selection must not run long on stale values
                 if stalled >= 1000:
                     # selection keeps ending in finished games or collisions: what is left
                     # unexpanded has no weight in the descent
@@ -531,8 +602,8 @@ class Engine:
                 for i in path:
                     self.visits[i] += 1
             self.since_solve += len(leaves)
-            if self.since_solve >= self.s.solve_every:
-                self.solve()
+            if self._due():
+                self.solve(final=False)
             now = time.perf_counter()
             if on_info is not None and now - last_info >= info_every:
                 self.solve()
@@ -540,6 +611,17 @@ class Engine:
                 last_info = now
         self.solve()
         return self.result(t0, start_exp)
+
+    def _expand_root(self) -> None:
+        """Every legal move at the root once, so that each has a value of its own."""
+        g = self.graph
+        root = g.nodes[g.root]
+        if not self.s.expand_root or root.children is None:
+            return
+        todo = [c for c in root.children if g.nodes[c].children is None and "result_mover" not in g.nodes[c].info]
+        if todo:
+            self._expand(todo)
+            self.since_solve += len(todo)
 
     def _fully_expanded(self) -> bool:
         g = self.graph
