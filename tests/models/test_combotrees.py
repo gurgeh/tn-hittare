@@ -72,12 +72,53 @@ def test_live_trees_combo():
     for mv in ["e2e4", "c7c5", "g1f3", "d7d6", "d2d4"]:
         qs.append(Query(b.fen(), [x.uci() for x in b.move_stack], 2200, 2100))
         b.push_uci(mv)
-    lin, tr = Combo(prune="p0.5"), Combo(prune="p0.5", trees=True)
-    for a, c in zip(lin.predict(qs), tr.predict(qs)):
+    lin = Combo(prune="p0.5")
+    got = lin.predict(qs)
+    del lin            # one model on the GPU at a time: the GPU is shared
+    import gc
+
+    import torch
+    gc.collect()
+    torch.cuda.empty_cache()
+    for a, c in zip(got, Combo(prune="p0.5", trees=True).predict(qs)):
         assert sorted(a.moves) == sorted(c.moves)
         assert abs(np.exp(c.logp.astype(np.float64)).sum() - 1) < 1e-5
         pa = dict(zip(a.moves, np.exp(a.logp))); pc = dict(zip(c.moves, np.exp(c.logp)))
         assert 0.5 * sum(abs(pa[m] - pc[m]) for m in pa) < 0.2
+
+
+@pytest.mark.slow
+def test_default_move_model_is_policy_trees():
+    from tnh.models import DEFAULT_MOVE_MODEL, default_move_model, lc0
+    from tnh.models.combo import Combo
+
+    if not lc0.binary().exists() or not (ct.MODEL_DIR / "+pol.json").exists():
+        pytest.skip("no Lc0 or no stored model")
+    b = chess.Board()
+    qs = []
+    for mv in ["e2e4", "c7c5", "g1f3", "d7d6", "d2d4"]:
+        qs.append(Query(b.fen(), [x.uci() for x in b.move_stack], 2200, 2100))
+        b.push_uci(mv)
+    model = default_move_model()
+    assert model.name == DEFAULT_MOVE_MODEL
+    got = model.predict(qs)
+    del model          # one model on the GPU at a time: the GPU is shared
+    import gc
+
+    import torch
+    gc.collect()
+    torch.cuda.empty_cache()
+    for a, c in zip(got, Combo(prune="p0.5", trees=True).predict(qs)):
+        assert sorted(a.moves) == sorted(c.moves)
+        assert abs(np.exp(a.logp.astype(np.float64)).sum() - 1) < 1e-5
+        assert a.wdl is not None and abs(sum(a.wdl) - 1) < 1e-5
+        pa = dict(zip(a.moves, np.exp(a.logp))); pc = dict(zip(c.moves, np.exp(c.logp)))
+        assert 0.5 * sum(abs(pa[m] - pc[m]) for m in pa) < 0.2
+
+
+def test_fit_refuses_to_overwrite_stored_models():
+    with pytest.raises(SystemExit, match="--overwrite"):
+        ct.main(["fit", "--configs", ct.MAIN])
 
 
 def _synthetic(n_pos=400, n_moves=6, seed=0):

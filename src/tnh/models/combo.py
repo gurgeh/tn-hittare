@@ -22,6 +22,11 @@ legal moves, mixed with a uniform `eps`: `p' = (1 - eps) p + eps / n`. That is t
 conditional logit of `tnh.eval.logit` (step 1's linear logit had no rating terms), fitted
 on the window rows of the fitting subsample's feature files.
 
+`PolicyTrees` (`tnh.models.default_move_model()`, the default) drops the child values:
+Maia-3 79M at +0 and +600 and the BT4 policy, scored by the stored trees of
+`tnh.models.combotrees` (configuration `+pol`), `wdl` from the policy call's value head.
+`Combo(prune="p0.5", trees=True)` is the more accurate, slower option.
+
 `FrontierValue` gives a position's win, draw and loss for the side to move given both
 FIDE ratings: Lc0 BT4, 50 nodes, `WDLCalibrationElo` = mover + 400, `Contempt` = mover
 minus opponent, then step 1's five-parameter recalibration (`value_recal.json`).
@@ -223,6 +228,50 @@ class Combo:
         for ms, x, w in zip(moves, X, wdl):
             out.append(Prediction(ms, self.combine(x) if ms else np.zeros(0, dtype=np.float32), w))
         return out
+
+
+class PolicyTrees:
+    """The default move model: Maia-3 79M (+0 and +600) and Lc0 BT4's policy, scored by the
+    stored boosted trees of `tnh.models.combotrees` (configuration `+pol`). No child values,
+    so it is about 4 times faster than `Combo(prune="p0.5", trees=True)` at +0.024 test log
+    loss (1.1583 against 1.1340).
+
+    `wdl` is Lc0's raw value head from the same policy call; wrap in `WithValue` for the
+    calibrated frontier value.
+    """
+
+    CONFIG = "+pol"
+    NAME = "maia3-79m-lc0pol-trees"
+
+    def __init__(self, *, maia_batch: int = 512) -> None:
+        from tnh.models.combotrees import CONFIGS, FrontModel
+        from tnh.models.lc0 import Lc0Policy
+        from tnh.models.maia3 import Elo, Maia3
+
+        self.front = FrontModel(self.CONFIG)
+        if self.front.cfg != CONFIGS[self.CONFIG]:
+            raise ValueError(f"stored {self.CONFIG} is {self.front.cfg}, the code expects {CONFIGS[self.CONFIG]}")
+        src = self.front.meta["sources"]
+        if not (src["m0"].endswith("offset+0") and src["mbest"].endswith("offset+600")):
+            raise ValueError(f"stored {self.CONFIG} was fitted on {src}, this model computes Maia at +0 and +600")
+        self.elos = [Elo.offset(0.0), Elo.offset(600.0)]
+        self.maia = Maia3(self.front.cfg["maia"], batch_size=maia_batch)
+        self.policy = Lc0Policy()
+        self.name = self.NAME
+        self.seconds: Counter = Counter()
+
+    def predict(self, queries: list[Query]) -> list[Prediction]:
+        t = time.perf_counter()
+        m0, mb = self.maia.predict_many(queries, self.elos)
+        self.seconds["maia"] += time.perf_counter() - t
+        t = time.perf_counter()
+        pol = self.policy.predict(queries)
+        self.seconds["lc0 policy"] += time.perf_counter() - t
+        t = time.perf_counter()
+        feats = self.front.features(queries, (m0, mb), pol, None, None)
+        lps = self.front.logp(feats, "trees")
+        self.seconds["trees"] += time.perf_counter() - t
+        return [Prediction(ms, lp, p.wdl) for ms, lp, p in zip(feats[0], lps, pol)]
 
 
 # -- the frontier value -----------------------------------------------------------------------

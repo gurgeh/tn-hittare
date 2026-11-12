@@ -1,6 +1,6 @@
 """The move model on top of Maia and Lc0: a linear logit and boosted trees, per point of the front.
 
-    uv run python -m tnh.models.combotrees fit [--configs ...] [--threads 3]   # fit, store, report
+    uv run python -m tnh.models.combotrees fit [--configs ...] [--threads 3] [--out DIR | --overwrite]   # fit, store, report
     uv run python -m tnh.models.combotrees analyse [--threads 3]               # main model: bias, reliability
     uv run python -m tnh.models.combotrees report                              # print the stored tables
 
@@ -305,17 +305,18 @@ def mix_all(lp: np.ndarray, offsets: np.ndarray, eps: float) -> np.ndarray:
     return np.log((1 - eps) * np.exp(lp) + eps / n)
 
 
-def store(name: str, cfg: dict, lin_beta, lin_cols, lin_eps, tr: dict, tr_eps: float, test: dict, fit_info: dict) -> None:
-    MODEL_DIR.mkdir(exist_ok=True)
-    tr["booster"].save_model(str(MODEL_DIR / f"{name}.txt"), num_iteration=tr["booster"].best_iteration)
+def store(name: str, cfg: dict, lin_beta, lin_cols, lin_eps, tr: dict, tr_eps: float, test: dict, fit_info: dict,
+          model_dir: Path = MODEL_DIR) -> None:
+    model_dir.mkdir(parents=True, exist_ok=True)
+    tr["booster"].save_model(str(model_dir / f"{name}.txt"), num_iteration=tr["booster"].best_iteration)
     meta = {"config": name, "spec": cfg, "base_columns": lin_cols,
             "linear": {"beta": np.asarray(lin_beta).tolist(), "eps": lin_eps},
             "trees": {"init_beta": np.asarray(tr["init_beta"]).tolist(), "eps": tr_eps, "settings": tr["settings"],
                       "n_trees": tr["booster"].best_iteration, "design_names": tr["names"], "tried": tr["tried"]},
             "sources": {k: str(v) for k, v in sources(cfg).items()}, "fit": fit_info, "test": test,
             "date": dt.datetime.now().isoformat(timespec="seconds"), "commit": _git_commit(),
-            "refit": f"uv run python -m tnh.models.combotrees fit --configs '{name}'"}
-    (MODEL_DIR / f"{name}.json").write_text(json.dumps(meta, indent=1) + "\n")
+            "refit": f"uv run python -m tnh.models.combotrees fit --configs '{name}' --overwrite"}
+    (model_dir / f"{name}.json").write_text(json.dumps(meta, indent=1) + "\n")
 
 
 def est_paired(loss: np.ndarray, ref: np.ndarray, w, clusters, boot: int) -> tuple[dict, dict]:
@@ -329,6 +330,12 @@ def cmd_fit(a) -> None:
     """Every configuration: linear and trees, stored; test log loss paired against linear Combo p0.5."""
     from tnh.eval import trees as T
 
+    model_dir = a.out.resolve()
+    if model_dir == MODEL_DIR.resolve() and not a.overwrite:
+        stored = [n for n in a.configs if (MODEL_DIR / f"{n}.json").exists() or (MODEL_DIR / f"{n}.txt").exists()]
+        if stored:
+            raise SystemExit(f"{MODEL_DIR} already holds {', '.join(stored)}: pass --out DIR to write elsewhere, "
+                             "or --overwrite to replace the stored models")
     ref = None
     out = {}
     settings = T.grid(a.leaves, a.rates, a.min_leaf)
@@ -361,7 +368,9 @@ def cmd_fit(a) -> None:
               f"{tr['booster'].best_iteration} trees", flush=True)
         store(name, fz.cfg, beta, cols, e_lin, tr, e_tr, res,
               {"sample": str(a.fit), "rows": int(len(fz.F.D.w)), "train_rows": int(len(fz.rows_train)),
-               "validation_rows": int(len(fz.rows_val)), "test_sample": str(a.test), "test_rows": int(len(Dt.w))})
+               "validation_rows": int(len(fz.rows_val)), "test_sample": str(a.test), "test_rows": int(len(Dt.w))},
+              model_dir)
+        print(f"stored {model_dir / name}.json and .txt", flush=True)
         del fz
     print("\n| configuration | linear | minus linear Combo p0.5 | trees | minus linear Combo p0.5 |\n|---|---|---|---|---|")
     for n, r in out.items():
@@ -460,43 +469,64 @@ def fit_temperature(score: np.ndarray, offsets, y, w, groups=None, n_groups=1) -
     return out
 
 
-def cmd_analyse(a) -> None:
-    from tnh.eval import trees as T
+def move_labels(L: "Loaded") -> dict:
+    """Per move of a loaded sample: Stockfish 10k and 100k losses, Lc0's full child loss and policy."""
     from tnh.eval.common import attach, ragged
     from tnh.eval.logit import nanmax_segments
+
+    out = {}
+    for k, d in (("sf10k", FEATURES / "stockfish" / "nodes10000"), ("sf100k", FEATURES / "stockfish" / "nodes100000")):
+        j = attach(L.rows, d, ["value"])
+        r = ragged(j, "value")
+        best = nanmax_segments(r, r.values)
+        out[f"{k}_best"] = best
+        out[f"{k}_L"] = np.repeat(best, np.diff(r.offsets)) - r.values
+        out[f"{k}_nan_row"] = np.add.reduceat(np.isnan(r.values).astype(int), r.offsets[:-1]) > 0
+    j = attach(L.rows, FEATURES / "lc0-bt4" / "children", ["value"])
+    drop_cache(FEATURES / "stockfish" / "nodes10000", FEATURES / "stockfish" / "nodes100000",
+               FEATURES / "lc0-bt4" / "children")
+    r = ragged(j, "value")
+    out["lc0_L"] = np.repeat(np.maximum.reduceat(r.values, r.offsets[:-1]), np.diff(r.offsets)) - r.values
+    out["lc0pol_p"] = np.exp(L.D.X[:, L.base.index("lc0pol")])
+    return out
+
+
+def move_classes(lab: dict) -> dict:
+    Ld, Ls = np.nan_to_num(lab["sf100k_L"], nan=0.0), np.nan_to_num(lab["sf10k_L"], nan=0.0)
+    mist = Ld > 0.03
+    return {"sound (deep loss <= 0.03)": ~mist, "mistake visible at 10k": mist & (Ls > 0.03),
+            "mistake only deep": mist & ~(Ls > 0.03), "large mistake (> 0.25)": Ld > 0.25,
+            "looks bad to Lc0's raw child value (> 0.03)": lab["lc0_L"] > 0.03,
+            "looks fine to Lc0's raw child value": lab["lc0_L"] <= 0.03,
+            "Lc0 policy < 5 %": lab["lc0pol_p"] < 0.05, "Lc0 policy >= 5 %": lab["lc0pol_p"] >= 0.05}
+
+
+def bias_tables(models: dict, lab: dict, D, rows, boot: int) -> tuple[dict, dict]:
+    """Mass / observed per move class and the expected loss per move; the rows used."""
+    bands = band_codes(rows.get_column("mover_elo").to_numpy())
+    decided = (lab["sf100k_best"] > 0.97) | (lab["sf100k_best"] < 0.03)
+    ok = ~decided & ~lab["sf100k_nan_row"] & ~lab["sf10k_nan_row"]
+    bias = {}
+    for cname, mask in move_classes(lab).items():
+        obs = mask[D.y].astype(float)
+        masses = {k: np.add.reduceat(np.exp(lp) * mask, D.offsets[:-1]) for k, lp in models.items()}
+        bias[cname] = ratio_table(obs, masses, D.w, D.clusters, bands, ok, boot)
+    L100 = np.nan_to_num(lab["sf100k_L"], nan=0.0)
+    masses = {k: np.add.reduceat(np.exp(lp) * L100, D.offsets[:-1]) for k, lp in models.items()}
+    bias["expected loss per move (Stockfish 100k)"] = ratio_table(L100[D.y], masses, D.w, D.clusters, bands, ok, boot)
+    return bias, {"rows_in_bias_tables": int(ok.sum()), "rows_dropped_decided": int(decided.sum())}
+
+
+def cmd_analyse(a) -> None:
+    from tnh.eval import trees as T
+    from tnh.eval.common import attach
 
     fz = Fitter(MAIN, a.fit, a.test, a.seed, a.threads)
     Df, Dt = fz.F.D, fz.T_.D
     settings = [json.loads((MODEL_DIR / f"{MAIN}.json").read_text())["trees"]["settings"]] \
         if (MODEL_DIR / f"{MAIN}.json").exists() else T.grid([15], [0.05], [2000])
 
-    # labels per move on both samples: Stockfish 10k and 100k losses, Lc0's full child loss and policy
-    def labels(L: "Loaded"):
-        out = {}
-        for k, d in (("sf10k", FEATURES / "stockfish" / "nodes10000"), ("sf100k", FEATURES / "stockfish" / "nodes100000")):
-            j = attach(L.rows, d, ["value"])
-            r = ragged(j, "value")
-            best = nanmax_segments(r, r.values)
-            out[f"{k}_best"] = best
-            out[f"{k}_L"] = np.repeat(best, np.diff(r.offsets)) - r.values
-            out[f"{k}_nan_row"] = np.add.reduceat(np.isnan(r.values).astype(int), r.offsets[:-1]) > 0
-        j = attach(L.rows, FEATURES / "lc0-bt4" / "children", ["value"])
-        drop_cache(FEATURES / "stockfish" / "nodes10000", FEATURES / "stockfish" / "nodes100000",
-                   FEATURES / "lc0-bt4" / "children")
-        r = ragged(j, "value")
-        out["lc0_L"] = np.repeat(np.maximum.reduceat(r.values, r.offsets[:-1]), np.diff(r.offsets)) - r.values
-        out["lc0pol_p"] = np.exp(L.D.X[:, L.base.index("lc0pol")])
-        return out
-    labf, labt = labels(fz.F), labels(fz.T_)
-
-    def classes(lab):
-        Ld, Ls = np.nan_to_num(lab["sf100k_L"], nan=0.0), np.nan_to_num(lab["sf10k_L"], nan=0.0)
-        mist = Ld > 0.03
-        return {"sound (deep loss <= 0.03)": ~mist, "mistake visible at 10k": mist & (Ls > 0.03),
-                "mistake only deep": mist & ~(Ls > 0.03), "large mistake (> 0.25)": Ld > 0.25,
-                "looks bad to Lc0's raw child value (> 0.03)": lab["lc0_L"] > 0.03,
-                "looks fine to Lc0's raw child value": lab["lc0_L"] <= 0.03,
-                "Lc0 policy < 5 %": lab["lc0pol_p"] < 0.05, "Lc0 policy >= 5 %": lab["lc0pol_p"] >= 0.05}
+    labf, labt = move_labels(fz.F), move_labels(fz.T_)
 
     # the models: Maia +600, linear Combo p0.5, trees; then the debiasing candidates
     models_t, models_f = {}, {}
@@ -559,20 +589,7 @@ def cmd_analyse(a) -> None:
 
     # bias by class: mass on the class against how often the played move is in it (raw probabilities)
     bands = band_codes(fz.T_.rows.get_column("mover_elo").to_numpy())
-    decided = (labt["sf100k_best"] > 0.97) | (labt["sf100k_best"] < 0.03)
-    ok = ~decided & ~labt["sf100k_nan_row"] & ~labt["sf10k_nan_row"]
-    cls = classes(labt)
-    raw_t = {k: (lp if k == "Maia +600" else lp) for k, lp in models_t.items()}
-    bias = {}
-    for cname, mask in cls.items():
-        obs = mask[Dt.y].astype(float)
-        masses = {k: np.add.reduceat(np.exp(lp) * mask, Dt.offsets[:-1]) for k, lp in raw_t.items()}
-        bias[cname] = ratio_table(obs, masses, Dt.w, Dt.clusters, bands, ok, a.boot)
-    # expected loss per move against the realised loss, Stockfish 100k
-    L100 = np.nan_to_num(labt["sf100k_L"], nan=0.0)
-    obs = L100[Dt.y]
-    masses = {k: np.add.reduceat(np.exp(lp) * L100, Dt.offsets[:-1]) for k, lp in raw_t.items()}
-    bias["expected loss per move (Stockfish 100k)"] = ratio_table(obs, masses, Dt.w, Dt.clusters, bands, ok, a.boot)
+    bias, counts = bias_tables(models_t, labt, Dt, fz.T_.rows, a.boot)
 
     # reliability, before and after a temperature (global, and per rating band), for linear and trees
     rel = {}
@@ -591,10 +608,68 @@ def cmd_analyse(a) -> None:
             t_, d_ = est_paired(-lp_[Dt.y], ref, Dt.w, Dt.clusters, a.boot)
             loss_tab[lab_] = {"test": t_, "minus_linear": d_}
 
-    out = {"config": MAIN, "test_rows": int(len(Dt.w)), "rows_in_bias_tables": int(ok.sum()),
-           "rows_dropped_decided": int(decided.sum()), "log_loss": loss_tab, "bias": bias,
+    out = {"config": MAIN, "test_rows": int(len(Dt.w)), **counts, "log_loss": loss_tab, "bias": bias,
            "reliability": rel, "debias_features": list(cf), "date": dt.datetime.now().isoformat(timespec="seconds"),
            "commit": _git_commit()}
+    a.out.parent.mkdir(parents=True, exist_ok=True)
+    a.out.write_text(json.dumps(out, indent=1) + "\n")
+    print(f"wrote {a.out}")
+    print_analysis(out)
+
+
+def stored_logp(name: str, L: "Loaded", kind: str, model_dir: Path = MODEL_DIR) -> np.ndarray:
+    """A stored model (linear or trees) on a loaded sample's feature-file rows."""
+    import lightgbm as lgb
+    from tnh.eval import trees as T
+
+    meta = json.loads((model_dir / f"{name}.json").read_text())
+    if meta["base_columns"] != L.base:
+        raise ValueError(f"{name}: stored base columns {meta['base_columns']}, loaded {L.base}")
+    D = L.D
+    if kind == "linear":
+        s, eps = D.X @ np.array(meta["linear"]["beta"]), meta["linear"]["eps"]
+    else:
+        Xd, names = design(D.X, L.base, L.Xe, L.en, L.C, L.cn, D.offsets)
+        if names != meta["trees"]["design_names"]:
+            raise ValueError(f"{name}: design columns differ from the stored model's")
+        booster = lgb.Booster(model_file=str(model_dir / f"{name}.txt"))
+        s = D.X @ np.array(meta["trees"]["init_beta"]) + booster.predict(Xd, raw_score=True)
+        eps = meta["trees"]["eps"]
+    return mix_all(T.group_logp(s, D.offsets), D.offsets, eps)
+
+
+def cmd_calib(a) -> None:
+    """Bias by move class and reliability of stored models on the test sample (no fitting)."""
+    from tnh.eval import trees as T
+
+    models, ref, lab, D0, rows0, bands = {}, None, None, None, None, None
+    for name in a.configs:
+        L = Loaded(a.test, CONFIGS[name])
+        key = L.rows.select("game_id", "ply")
+        if D0 is None:
+            D0, rows0, keys0 = L.D, L.rows, key
+            lab = move_labels(L) if "lc0pol" in L.base else None
+            models["Maia +600"] = T.group_logp(L.D.X[:, L.base.index("mbest")], L.D.offsets)
+        elif not key.equals(keys0) or not np.array_equal(L.D.offsets, D0.offsets):
+            raise ValueError(f"{name}: test rows differ from {a.configs[0]}'s")
+        for kind in ("linear", "trees"):
+            models[f"{kind} {name}"] = stored_logp(name, L, kind)
+        if name == MAIN:
+            ref = models[f"linear {name}"][D0.y]
+        del L
+    if lab is None:
+        raise ValueError("the first configuration must have the Lc0 policy (the classes use it)")
+    loss_tab = {}
+    for k, lp in models.items():
+        if k == "Maia +600" or ref is None:
+            continue
+        t_, d_ = est_paired(-lp[D0.y], -ref, D0.w, D0.clusters, a.boot)
+        loss_tab[k] = {"test": t_, "minus_linear": d_}
+    bias, counts = bias_tables(models, lab, D0, rows0, a.boot)
+    bands = band_codes(rows0.get_column("mover_elo").to_numpy())
+    rel = {k: reliability(lp, D0.offsets, D0.y, D0.w, bands) for k, lp in models.items() if k != "Maia +600"}
+    out = {"configs": a.configs, "test_rows": int(len(D0.w)), **counts, "log_loss": loss_tab, "bias": bias,
+           "reliability": rel, "date": dt.datetime.now().isoformat(timespec="seconds"), "commit": _git_commit()}
     a.out.parent.mkdir(parents=True, exist_ok=True)
     a.out.write_text(json.dumps(out, indent=1) + "\n")
     print(f"wrote {a.out}")
@@ -656,9 +731,21 @@ def main(argv=None) -> None:
         sp.add_argument("--patience", type=int, default=50)
         sp.add_argument("--threads", type=int, default=1)
         sp.add_argument("--configs", nargs="+", default=[MAIN])
-        sp.add_argument("--out", type=Path,
-                        default=Path.home() / "out" / "tn-hittare" / "scratch" / "models" / "combotrees" / "analyse.json")
+        if name == "fit":
+            sp.add_argument("--out", type=Path, default=MODEL_DIR,
+                            help="directory for the stored models (default: the repo's, which needs --overwrite)")
+            sp.add_argument("--overwrite", action="store_true", help="replace models stored in the repo")
+        else:
+            sp.add_argument("--out", type=Path,
+                            default=Path.home() / "out" / "tn-hittare" / "scratch" / "models" / "combotrees" / "analyse.json")
         sp.set_defaults(fn=fn)
+    sp = sub.add_parser("calib", help="bias and reliability of stored models on the test sample")
+    sp.add_argument("--test", type=Path, default=TEST_SAMPLE)
+    sp.add_argument("--boot", type=int, default=1000)
+    sp.add_argument("--configs", nargs="+", default=["+pol", MAIN])
+    sp.add_argument("--out", type=Path,
+                    default=Path.home() / "out" / "tn-hittare" / "scratch" / "models" / "combotrees" / "calib.json")
+    sp.set_defaults(fn=cmd_calib)
     sp = sub.add_parser("report")
     sp.add_argument("--out", type=Path,
                     default=Path.home() / "out" / "tn-hittare" / "scratch" / "models" / "combotrees" / "analyse.json")
@@ -787,7 +874,7 @@ def cmd_front(a) -> None:
     for size in a.maia_sizes:
         m = Maia3(size, batch_size=512)
         m.predict_many(qs[:64], elos)
-        maia[size] = timed(f"maia {size}", lambda: m.predict_many(qs, elos))
+        maia[size] = timed(f"maia {size}", lambda m=m: m.predict_many(qs, elos))
         del m
     pols = {}
     for net, file in (("bt4", "BT4-1024x15x32h-swa-6147500.pb.gz"), ("t3", "t3-512x15x16h-distill2-swa-03477500.pb.gz")):
@@ -795,7 +882,7 @@ def cmd_front(a) -> None:
             continue
         p = Lc0Policy(file)
         p.predict(qs[:24])
-        pols[net] = timed(f"lc0 {net} policy", lambda: p.predict(qs))
+        pols[net] = timed(f"lc0 {net} policy", lambda p=p: p.predict(qs))
         del p
     names = [n for n in a.configs if (MODEL_DIR / f"{n}.json").exists()]
     children = {}
@@ -810,7 +897,7 @@ def cmd_front(a) -> None:
         only = None if cfg["rule"] == "all" else keep_sets(maia[cfg["maia"]], pols[cfg["pol"]], cfg["rule"])
         ch = Lc0Children(net_file)
         ch.evaluate(qs[:8], None if only is None else only[:8])
-        children[key] = (timed(f"lc0 {cfg['ch']} children {cfg['rule']}", lambda: ch.evaluate(qs, only)), only)
+        children[key] = (timed(f"lc0 {cfg['ch']} children {cfg['rule']}", lambda ch=ch, only=only: ch.evaluate(qs, only)), only)
         del ch
     losses = {}
     for n in names:
@@ -854,33 +941,56 @@ def cmd_front(a) -> None:
                                  "points": {f"{n} {k}": v for (n, k), v in out.items()}}, indent=1) + "\n")
 
 
+def gpu_mib(pid: int) -> int | None:
+    """GPU memory this process holds (nvidia-smi), MiB; None where nvidia-smi does not list it."""
+    import subprocess
+    out = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
+                         capture_output=True, text=True, check=True).stdout
+    for line in out.splitlines():
+        p, _, mib = line.partition(",")
+        if p.strip() == str(pid):
+            return int(mib)
+    return None
+
+
+def live_model(config: str):
+    """The live model of a stored configuration: `PolicyTrees` for +pol, `Combo(..., trees=True)` for the main one."""
+    from tnh.models.combo import Combo, PolicyTrees
+    if config == PolicyTrees.CONFIG:
+        return PolicyTrees()
+    if config == MAIN:
+        return Combo(prune=RULE_MAIN, trees=True)
+    raise ValueError(f"no live model for {config!r} (live: {PolicyTrees.CONFIG}, {MAIN})")
+
+
 def cmd_check_live(a) -> None:
-    """The live main model (Combo(prune='p0.5', trees=True)) against the same rows from the feature files."""
-    from tnh.models.combo import Combo, _queries
-    from tnh.eval import trees as T
+    """A live model against the same rows scored by its stored model from the feature files."""
+    import os
+
+    from tnh.models.combo import _GpuSampler, _queries
 
     s, qs = _queries(a.test, a.n, a.seed)
-    L = Loaded(a.test, CONFIGS[MAIN])
-    fm = FrontModel(MAIN)
+    L = Loaded(a.test, CONFIGS[a.config])
     key = {(g, p): i for i, (g, p) in enumerate(L.rows.select("game_id", "ply").iter_rows())}
     idx = [key[(g, p)] for g, p in s.select("game_id", "ply").iter_rows()]
     D = L.D
-    # offline: the stored trees on the feature-file rows
-    Xd, _ = design(D.X, L.base, L.Xe, L.en, L.C, L.cn, D.offsets)
-    sc = D.X @ np.array(fm.meta["trees"]["init_beta"]) + fm.booster.predict(Xd, raw_score=True)
-    lp_off = mix_all(T.group_logp(sc, D.offsets), D.offsets, fm.meta["trees"]["eps"])
-    model = Combo(prune=RULE_MAIN, trees=True)
-    t = time.perf_counter()
-    preds = model.predict(qs)
-    dt_ = time.perf_counter() - t
+    lp_off = stored_logp(a.config, L, "trees")
+    model = live_model(a.config)
+    model.predict(qs[:16])          # warm-up: CUDA contexts, kernels
+    model.seconds.clear()
+    with _GpuSampler() as g:
+        t = time.perf_counter()
+        preds = model.predict(qs)
+        dt_ = time.perf_counter() - t
+    mib = gpu_mib(os.getpid())
     worst, worst_p, worst_big, ll_live, ll_off = 0.0, 0.0, 0.0, [], []
     worst_at = None
     moves_all = D.moves.to_list()
     played = s.get_column("played_uci").to_list()
     for q, p, i, pl_ in zip(qs, preds, idx, played):
-        ms_off = moves_all[i]
-        off = lp_off[D.offsets[i]:D.offsets[i + 1]]
-        o = {m: x for m, x in zip(ms_off, off)}
+        if p.wdl is None:
+            raise ValueError(f"{model.name} gave no wdl at {q.fen}")
+        o = dict(zip(moves_all[i], lp_off[D.offsets[i]:D.offsets[i + 1]]))
         for m, x in zip(p.moves, p.logp):
             d = abs(float(x) - o[m])
             if d > worst:
@@ -891,9 +1001,11 @@ def cmd_check_live(a) -> None:
         ll_live.append(-float(p.logp[p.moves.index(pl_)]))
         ll_off.append(-float(o[pl_]))
     w = s.get_column("weight").to_numpy()
-    print(f"{len(qs)} test positions in {dt_:.1f} s ({len(qs) / dt_:.1f} positions/s; {dict((k, round(v, 1)) for k, v in model.seconds.items())}): "
-          f"max |log p live - offline| {worst:.4f} (move {worst_at[1]} in {worst_at[0]}: p offline {worst_at[2]:.2e}, live {worst_at[3]:.2e}); "
-          f"over moves with p >= 0.01 {worst_big:.4f}; max |p live - p offline| {worst_p:.4f}; "
+    print(f"{model.name}: {len(qs)} test positions in {dt_:.1f} s ({len(qs) / dt_:.1f} positions/s; "
+          f"{dict((k, round(v, 1)) for k, v in model.seconds.items())}); GPU busy {g.mean:.0f} %, "
+          f"this process {mib} MiB on the GPU; load {os.getloadavg()}")
+    print(f"max |log p live - offline| {worst:.4f} (move {worst_at[1]} in {worst_at[0]}: p offline {worst_at[2]:.2e}, "
+          f"live {worst_at[3]:.2e}); over moves with p >= 0.01 {worst_big:.4f}; max |p live - p offline| {worst_p:.4f}; "
           f"log loss live {np.average(ll_live, weights=w):.4f}, offline {np.average(ll_off, weights=w):.4f}")
 
 
@@ -920,6 +1032,7 @@ def _front_main(argv=None):
     sp.add_argument("--test", type=Path, default=TEST_SAMPLE)
     sp.add_argument("--n", type=int, default=500)
     sp.add_argument("--seed", type=int, default=1)
+    sp.add_argument("--config", default=MAIN, help="+pol (PolicyTrees, the default model) or +ch-p0.5 (Combo trees)")
     sp.set_defaults(fn=cmd_check_live)
     a = p.parse_args(argv)
     a.fn(a)
