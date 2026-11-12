@@ -15,15 +15,17 @@ from __future__ import annotations
 import math
 import os
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from statistics import NormalDist
 
 import chess
+import numpy as np
 import polars as pl
 
 from tnh.data.edges import EdgeDB, pos_hash
+from tnh.web.shrinkrule import Rule, load_rules
 
 TEMPI = ("classical", "rapid", "blitz", "unknown")
 YEAR_MAX = 32767
@@ -126,31 +128,46 @@ class Filters:
 
 @dataclass(frozen=True)
 class Shrink:
-    """The weights, in games, with which the move table shrinks the database toward a prior.
+    """How the move table shrinks the database toward a prior.
 
+    - `rules`: the fitted rule per quantity (`tnh.web.shrinkrule`), from `shrink_rules.json`,
+      chosen by `python -m tnh.web.shrinkfit fit --write-rules` as the rule that best
+      predicts each move's 2024-26 figure from the years before, out of fold. The file holds
+      each rule's provenance; the comparison is in that module's docstring.
     - `kappa`: move probability, `(count + kappa * p_model) / (n + kappa)`, as the
       repertoire builder mixes the opponent's moves. 100 is the builder study's default;
-      nothing has been fitted for it yet (it needs model 1 on a sample).
-    - `kappa_v`: White's score and the draw rate, `(n * db + kappa_v * model2) / (n + kappa_v)`.
-      `python -m tnh.web.calibrate` on the 3,000 most common positions of the full table,
-      classical games, with the position's own mean as the prior: predicting each move's
-      2024-26 figure from the years before, the error is lowest at 10-22 (rare moves 10,
-      all moves 22; flat between). Method of moments (DerSimonian-Laird) says 105-116, but
-      it assumes one between-move variance for all moves and rare moves vary more. Model 2
-      should deserve more weight than the position mean, so 20, at the top of the
-      out-of-sample range. Refit when model 2's values exist for a sample.
-    - `k_elo`: W-Elo and B-Elo, `n_rated / (n_rated + k_elo) * (move mean - position mean)`.
-      Method of moments gives 21-22 (within-move variance 83,692, SD 289, from one row group
-      of games.parquet, an upper bound since edges hold no sums of squares; between-move
-      variance 3,760-3,963 by DerSimonian-Laird). Out of sample it is wrong: on rare moves
-      k = 22 raises the squared error of the 2024-26 mean from 35,746 to 52,279, and the
-      error falls all the way to k = 1. Players repeat their moves, so a move's own mean
-      predicts the next player well. 1.
+      not fitted yet (`shrinkfit fit --quantities prob` needs model 1 as the prior column).
+    - `k_elo`, `kappa_v`: the fallback `n / (n + k)` for a quantity without a fitted rule,
+      at the one-constant fits of 2026-11-12 (`nk` in the comparison): 5.6 for the rating
+      deltas, 34 for Score and Draw.
+
+    Round 3 had set `k_elo` = 1 from a hold-out that compared raw rating means across the
+    two periods; ratings drift between them, and that comparison favoured trusting the move.
+    Within-period deltas, as fitted now, show that shrinkage helps (`none` is 15 % worse).
     """
 
     kappa: float = 100.0
-    kappa_v: float = 20.0
-    k_elo: float = 1.0
+    kappa_v: float = 34.0
+    k_elo: float = 5.6
+    # Fitted rules per quantity (w_elo, b_elo, chooser, gap, score, draw) from
+    # shrink_rules.json, written by `python -m tnh.web.shrinkfit fit --write-rules`. A
+    # quantity without one falls back to n / (n + k_elo) or n / (n + kappa_v).
+    rules: dict = field(default_factory=load_rules)
+
+    def rule(self, q: str) -> Rule:
+        r = self.rules.get(q)
+        if r is not None:
+            return r
+        k = self.kappa_v if q in ("score", "draw") else self.k_elo
+        return Rule("nk", [math.log(k)], 1.0, {"fallback": True})
+
+    def describe(self) -> dict:
+        out = {"kappa": self.kappa, "kappa_v": self.kappa_v, "k_elo": self.k_elo}
+        for q in ("w_elo", "b_elo", "chooser", "gap", "score", "draw"):
+            r = self.rule(q)
+            out[q] = {"form": r.form, "text": r.describe(), "fallback": bool(r.provenance.get("fallback")),
+                      "fitted": r.provenance.get("fitted")}
+        return out
 
     def mix(self, n: float, db: float | None, model: float | None, kappa: float) -> float | None:
         if model is None:
@@ -238,6 +255,45 @@ def _san(epd: str | None, uci: str) -> tuple[str, str | None]:
     return (b.san(m) if b.is_legal(m) else uci), b.fen()
 
 
+def _spread(values: list, counts: list) -> float:
+    """Count-weighted standard deviation of the moves' values (None skipped)."""
+    v = np.array([x for x, c in zip(values, counts) if x is not None and c], float)
+    c = np.array([c for x, c in zip(values, counts) if x is not None and c], float)
+    if not len(v):
+        return 0.0
+    m = np.sum(c * v) / c.sum()
+    return float(np.sqrt(np.sum(c * (v - m) ** 2) / c.sum()))
+
+
+def shrink_rows(rows: list[dict], shrink: Shrink, played: int, rated: int) -> None:
+    """Adds the shrunk figures to each move row, by the fitted rules (`tnh.web.shrinkrule`):
+    the four rating deltas (prior 0) and White's score and the draw rate (prior: the
+    position's mean; `model_table` puts model 2 there when it has answered)."""
+    for r in rows:
+        r["db_score"] = (r["white_wins"] + 0.5 * r["draws"]) / r["n"] if r["n"] else None
+        r["db_draw"] = r["draws"] / r["n"] if r["n"] else None
+    for q, raw, out in (("w_elo", "w_elo_raw", "w_elo_delta"), ("b_elo", "b_elo_raw", "b_elo_delta"),
+                        ("chooser", "mover_elo_raw", "mover_elo_delta"), ("gap", "gap_raw", "gap_delta")):
+        spread = _spread([r[raw] for r in rows], [r["n_rated"] for r in rows])
+        rule = shrink.rule(q)
+        for r in rows:
+            if r[raw] is None:
+                r[out] = None
+                continue
+            r[out] = float(rule.predict(np.array([r[raw]]), np.zeros(1), np.array([float(r["n_rated"])]),
+                                        np.array([float(rated)]), np.array([spread]))[0])
+    for q, raw in (("score", "db_score"), ("draw", "db_draw")):
+        vals = [r[raw] for r in rows]
+        tot = sum(r["n"] * v for r, v in zip(rows, vals) if v is not None)
+        base = tot / played if played else None
+        spread = _spread(vals, [r["n"] for r in rows])
+        rule = shrink.rule(q)
+        for r in rows:
+            r[f"{q}_shrunk"] = None if r[raw] is None or base is None else float(rule.predict(
+                np.array([r[raw]]), np.array([base]), np.array([float(r["n"])]), np.array([float(played)]),
+                np.array([spread]))[0])
+
+
 def _white_black(r: dict, white_to_move: bool) -> tuple[float | None, float | None]:
     """A move row's mean ratings of White and Black (its mover and opponent are given)."""
     m, o = _num(r["mover_elo"]), _num(r["opp_elo"])
@@ -286,17 +342,17 @@ def report(stats: Stats, board: chess.Board, f: Filters, rule: TrendRule = Trend
         mv = chess.Move.from_uci(r["move"])
         w_elo, b_elo = _white_black(r, white)
         nr = r["n_rated"] or 0
-        weight = nr / (nr + shrink.k_elo) if nr else 0.0
         m_elo, o_elo = _num(r["mover_elo"]), _num(r["opp_elo"])
         rows.append({
             "white_elo": w_elo, "black_elo": b_elo,
-            "w_elo_delta": weight * (w_elo - pos_w) if nr else None,
-            "b_elo_delta": weight * (b_elo - pos_b) if nr else None,
-            # The alternative form: the chooser's delta, and the move's rating gap (chooser
-            # minus opponent) against the position's gap, both shrunk the same way.
-            "mover_elo_delta": weight * (m_elo - pos_m) if nr else None,
+            # Raw deltas against the position; `shrink_rows` adds the shrunk ones. The
+            # alternative form: the chooser's delta, and the move's rating gap (chooser minus
+            # opponent) against the position's gap.
+            "w_elo_raw": w_elo - pos_w if nr else None,
+            "b_elo_raw": b_elo - pos_b if nr else None,
+            "mover_elo_raw": m_elo - pos_m if nr else None,
             "gap": m_elo - o_elo if nr else None,
-            "gap_delta": weight * ((m_elo - o_elo) - pos_gap) if nr else None,
+            "gap_raw": (m_elo - o_elo) - pos_gap if nr else None,
             "white_wins": r["white_wins"], "draws": r["draws"], "black_wins": r["black_wins"],
             "uci": r["move"], "san": board.san(mv) if board.is_legal(mv) else r["move"], "n": r["n"],
             "share": r["share"], "score": r["score"],
@@ -307,6 +363,7 @@ def report(stats: Stats, board: chess.Board, f: Filters, rule: TrendRule = Trend
             "reach": r["child_n"],
             "series": [move_year.get((r["move"], y), 0) for y in years],
         })
+    shrink_rows(rows, shrink, played=int(moves["n"].sum()) if moves.height else 0, rated=rated)
     trend = _trends(rows, years, year_totals, rule)
 
     move_orders = []
@@ -334,10 +391,12 @@ def report(stats: Stats, board: chess.Board, f: Filters, rule: TrendRule = Trend
             "white_wins": tw, "draws": td, "black_wins": tb,
             "score": ((tw if white else tb) + 0.5 * td) / played if played else None,
             "white_score": (tw + 0.5 * td) / played if played else None,
+            "score_spread": _spread([r["db_score"] for r in rows], [r["n"] for r in rows]),
+            "draw_spread": _spread([r["db_draw"] for r in rows], [r["n"] for r in rows]),
             "draw": td / played if played else None,
             "white_elo": pos_w, "black_elo": pos_b, "n_rated": rated, "gap": pos_gap,
         },
-        "shrink": {"kappa": shrink.kappa, "kappa_v": shrink.kappa_v, "k_elo": shrink.k_elo},
+        "shrink": shrink.describe(),
         "moves": rows,
         "years": years,
         "year_totals": [year_totals[y] for y in years],
@@ -364,10 +423,20 @@ def model_table(rep: dict, probs: dict[str, float], position_wdl: tuple | None,
     child. Everything is from White's side; the page chooses how to show it.
 
     - `p_mix = (count + kappa * p_model) / (n + kappa)`, n the moves' games under the filters;
-    - `score_mix`, `draw_mix` = `(n * db + kappa_v * model) / (n + kappa_v)`, n the move's games.
+    - `score_mix`, `draw_mix`: the fitted rule for Score and Draw (`Shrink.rule`) with model 2
+      as the prior; the position's own line uses the same rule with its share at 1.
     """
+    def mixed(q: str, x, model, count, pos_n, spread):
+        if model is None:
+            return x if count else None
+        if not count or x is None:
+            return model
+        return float(shrink.rule(q).predict(np.array([x]), np.array([model]), np.array([float(count)]),
+                                            np.array([float(pos_n)]), np.array([spread]))[0])
+
     db = {m["uci"]: m for m in rep["moves"]}
     n = (rep["total"]["played"] or 0) if rep["status"] == "ok" else 0
+    t = rep["total"]
     out = {}
     for uci in set(probs) | set(db) | set(child_wdl):
         p = probs.get(uci)
@@ -382,17 +451,16 @@ def model_table(rep: dict, probs: dict[str, float], position_wdl: tuple | None,
             "delta": p_mix - p if p is not None else None,
             "score_model": model[0] if model else None, "draw_model": model[1] if model else None,
             "score_db": db_score, "draw_db": db_draw, "n": count,
-            "score_mix": shrink.mix(count, db_score, model[0] if model else None, shrink.kappa_v),
-            "draw_mix": shrink.mix(count, db_draw, model[1] if model else None, shrink.kappa_v),
+            "score_mix": mixed("score", db_score, model[0] if model else None, count, n, t["score_spread"] or 0.0),
+            "draw_mix": mixed("draw", db_draw, model[1] if model else None, count, n, t["draw_spread"] or 0.0),
         }
     pos_model = _white_view(position_wdl, rep["white_to_move"])
-    t = rep["total"]
     position = {
         "score_model": pos_model[0] if pos_model else None, "draw_model": pos_model[1] if pos_model else None,
         "wdl_white": None if position_wdl is None else (
             list(position_wdl) if rep["white_to_move"] else [position_wdl[2], position_wdl[1], position_wdl[0]]),
         "score_db": t["white_score"], "draw_db": t["draw"], "n": n,
-        "score_mix": shrink.mix(n, t["white_score"], pos_model[0] if pos_model else None, shrink.kappa_v),
-        "draw_mix": shrink.mix(n, t["draw"], pos_model[1] if pos_model else None, shrink.kappa_v),
+        "score_mix": mixed("score", t["white_score"], pos_model[0] if pos_model else None, n, n, t["score_spread"] or 0.0),
+        "draw_mix": mixed("draw", t["draw"], pos_model[1] if pos_model else None, n, n, t["draw_spread"] or 0.0),
     }
     return {"moves": out, "position": position}

@@ -26,7 +26,7 @@ def fen_after(*uci: str) -> str:
 @pytest.fixture()
 def client():
     hub = fake_hub()
-    c = TestClient(create_app(stats(), hub))
+    c = TestClient(create_app(stats(), hub, shrink=Shrink(rules={})))   # the fixed fallback rules
     c.hub = hub
     return c
 
@@ -191,3 +191,27 @@ def test_unrated_moves_have_no_delta(client):
     for m in d["moves"]:
         if m["n_rated"] == 0:
             assert m["w_elo_delta"] is None and m["gap_delta"] is None
+
+
+def test_fitted_rules_are_applied():
+    """With a rule per quantity, the deltas and the Score mix follow it, not the fallback."""
+    import numpy as np
+    from tnh.web.shrinkrule import Rule
+    rules = {q: Rule("hill", [np.log(2.0), np.log(9.0)]) for q in ("w_elo", "b_elo", "chooser", "gap")}
+    rules["score"] = Rule("share_hill", [0.01, 0.02, 0.0, 0.0, np.log(3.0)])
+    shrink = Shrink(rules=rules)
+    c = TestClient(create_app(stats(), fake_hub(), shrink=shrink))
+    d = c.get("/api/stats", params={"fen": START}).json()
+    e4 = {m["uci"]: m for m in d["moves"]}["e2e4"]
+    w = 4 ** 2 / (4 ** 2 + 9)
+    assert e4["w_elo_delta"] == pytest.approx(w * e4["w_elo_raw"])
+    assert e4["gap_delta"] == pytest.approx(w * e4["gap_raw"])
+    assert d["shrink"]["w_elo"]["text"].startswith("w = n^2.00")
+    # Score before the models: toward the position's mean moved by the share term
+    base = d["total"]["white_score"]
+    pr = base + 0.01 + 0.02 * np.log(4 / 8)
+    assert e4["score_shrunk"] == pytest.approx(pr + 4 / 7 * (0.5 - pr))
+    # Score with model 2: the same rule with model 2 as the base
+    m = c.get("/api/model", params={"fen": START, "white": 2300, "black": 2100}).json()["moves"]["e2e4"]
+    pr2 = m["score_model"] + 0.01 + 0.02 * np.log(4 / 8)
+    assert m["score_mix"] == pytest.approx(pr2 + 4 / 7 * (0.5 - pr2))

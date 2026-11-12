@@ -115,7 +115,7 @@ def create_app(stats: Stats, hub: ModelHub, *, trend_rule: TrendRule = TrendRule
     def info():
         return {"api": API_VERSION, "stats": stats.info(), "models": hub.status(), "tempi": list(TEMPI),
                 "p_list": P_LIST,
-                "shrink": {"kappa": shrink.kappa, "kappa_v": shrink.kappa_v, "k_elo": shrink.k_elo},
+                "shrink": shrink.describe(),
                 "trend": {"recent_years": trend_rule.recent_years, "alpha": trend_rule.alpha,
                           "min_games": trend_rule.min_games}}
 

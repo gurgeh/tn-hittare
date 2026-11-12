@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from _webfix import fake_hub, stats
 from tnh.web.app import create_app
+from tnh.web.stats import Shrink
 from tnh.web.stats import Filters, two_proportion
 
 START = chess.STARTING_FEN
@@ -23,7 +24,7 @@ def fen_after(*uci: str) -> str:
 @pytest.fixture(scope="module")
 def client():
     hub = fake_hub()
-    c = TestClient(create_app(stats(), hub))
+    c = TestClient(create_app(stats(), hub, shrink=Shrink(rules={})))   # the fixed fallback rules
     c.hub = hub
     return c
 
