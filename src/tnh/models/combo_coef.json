@@ -1,0 +1,153 @@
+{
+ "what": "conditional logit over the legal moves (tnh.eval.logit), window rows of the fitting subsample",
+ "columns": [
+  "m0",
+  "mbest",
+  "lc0pol",
+  "lc0ch_eloss",
+  "lc0ch_cploss"
+ ],
+ "beta": [
+  0.20637079575464612,
+  0.39501463539922055,
+  0.3039479267244724,
+  -4.24790638304691,
+  -0.29303011274551766
+ ],
+ "eps": 0.00026263616330106745,
+ "newton_iterations": 9,
+ "maia_best": "offset+600",
+ "sources": {
+  "m0": {
+   "dir": "/home/gurgeh/out/tn-hittare/features/maia3-79m/offset+0",
+   "meta": {
+    "amp": true,
+    "elo_clamp": [
+     0.0,
+     5000.0
+    ],
+    "model": "maia3-79m",
+    "mover_offset": 0.0,
+    "opp_offset": 0.0,
+    "oppo_elo": null,
+    "self_elo": null,
+    "variant": "offset+0"
+   }
+  },
+  "mbest": {
+   "dir": "/home/gurgeh/out/tn-hittare/features/maia3-79m/offset+600",
+   "meta": {
+    "amp": true,
+    "elo_clamp": [
+     0.0,
+     5000.0
+    ],
+    "model": "maia3-79m",
+    "mover_offset": 600.0,
+    "opp_offset": 600.0,
+    "oppo_elo": null,
+    "self_elo": null,
+    "variant": "offset+600"
+   }
+  },
+  "lc0pol": {
+   "dir": "/home/gurgeh/out/tn-hittare/features/lc0-bt4/policy",
+   "meta": {
+    "backend": "cuda-auto",
+    "model": "lc0-bt4",
+    "network": "BT4-1024x15x32h-swa-6147500.pb.gz",
+    "variant": "policy"
+   }
+  },
+  "lc0ch": {
+   "dir": "/home/gurgeh/out/tn-hittare/features/lc0-bt4/children",
+   "meta": {
+    "backend": "cuda-auto",
+    "batch_size": 12,
+    "model": "lc0-bt4",
+    "network": "BT4-1024x15x32h-swa-6147500.pb.gz",
+    "variant": "children"
+   }
+  }
+ },
+ "fit": {
+  "sample": "/home/gurgeh/out/tn-hittare/corpus/samples/fit_sub100k.parquet",
+  "window_rows": 100000,
+  "moves": 3609874,
+  "tournaments": 2846
+ },
+ "test": {
+  "sample": "/home/gurgeh/out/tn-hittare/corpus/samples/test_sub100k.parquet",
+  "window_rows": 100000,
+  "mixed": {
+   "est": 1.1475307303533602,
+   "lo": 1.1389036687419858,
+   "hi": 1.1562252498682384
+  },
+  "boot": 1000
+ },
+ "step1_reproduced": {
+  "M+ch": {
+   "columns": [
+    "m0",
+    "mbest",
+    "lc0ch_eloss",
+    "lc0ch_cploss"
+   ],
+   "beta": [
+    0.16182954332518174,
+    0.552060939899176,
+    -7.563018764452362,
+    -0.4100629243878342
+   ],
+   "eps": 0.0005666119068337139,
+   "test_mixed": {
+    "est": 1.1639096653671552,
+    "lo": 1.1562933211937971,
+    "hi": 1.1722130645816422
+   },
+   "step1_beta": [
+    0.16182954332518174,
+    0.552060939899176,
+    -7.563018764452362,
+    -0.4100629243878342
+   ],
+   "step1_test_mixed": {
+    "est": 1.1639096653671552,
+    "lo": 1.1562933211937965,
+    "hi": 1.1722130645816424
+   }
+  },
+  "M+pol": {
+   "columns": [
+    "m0",
+    "mbest",
+    "lc0pol"
+   ],
+   "beta": [
+    0.20234148493904985,
+    0.3841087062029338,
+    0.5369488864601789
+   ],
+   "eps": 0.0,
+   "test_mixed": {
+    "est": 1.1719024983536093,
+    "lo": 1.1634859734846765,
+    "hi": 1.1803036329112429
+   },
+   "step1_beta": [
+    0.20234148493904985,
+    0.3841087062029338,
+    0.5369488864601789
+   ],
+   "step1_test_mixed": {
+    "est": 1.1719024983536093,
+    "lo": 1.1634859734846767,
+    "hi": 1.1803036329112429
+   }
+  }
+ },
+ "date": "2026-11-12T09:22:43",
+ "commit": "b42983faef21273d1a2f0da7bcfe35de9e661c0c",
+ "refit": "uv run python -m tnh.models.combo fit"
+}

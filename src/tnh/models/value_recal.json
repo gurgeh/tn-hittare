@@ -1,0 +1,33 @@
+{
+ "what": "Lc0 BT4 WDL at 50 nodes with WDLCalibrationElo, then step 1's recalibration q = (1-eps) softmax(t log p + b + [draw] k (mean rating - 2200)/100) + eps/3",
+ "nodes": 50,
+ "wdl_elo": "offset+400",
+ "recal": {
+  "t": 0.8506368180773901,
+  "b_win": -0.08952480699731165,
+  "b_draw": -0.2533776499340872,
+  "k_draw_per_100": -0.06445810722230028,
+  "eps": 0.025583022989835752
+ },
+ "test_logloss": {
+  "raw": {
+   "est": 0.8479338327455607,
+   "lo": 0.8315333871980379,
+   "hi": 0.8640498692092744
+  },
+  "recalibrated": {
+   "est": 0.8345622201310311,
+   "lo": 0.820294310306548,
+   "hi": 0.84828829402113
+  }
+ },
+ "games": {
+  "test": 10000,
+  "fit": 10000
+ },
+ "source": "/home/gurgeh/out/tn-hittare/reports/step1/value_wdl.json",
+ "feature_dir": "/home/gurgeh/out/tn-hittare/features/lc0-bt4/nodes50-wdl-offset+400",
+ "date": "2026-11-12T09:22:44",
+ "commit": "b42983faef21273d1a2f0da7bcfe35de9e661c0c",
+ "refit": "uv run python -m tnh.eval.value (step 1), then uv run python -m tnh.models.combo value-params"
+}
