@@ -10,9 +10,10 @@ import {MoveTree, START_FEN} from "./tree.js"
 const $ = id => document.getElementById(id)
 const LAST_MOVE = {class: "marker-last", slice: "markerSquare"}
 const CURSOR_ARROW = {class: "arrow-cursor"}
-// Open choices the owner has not decided; each is one switch here.
+// Choices of presentation; each is one switch here. `view` was decided by the owner on
+// 2026-11-12: always from White. The other two are still open.
 const CHOICES = {
-    view: "mover",          // "mover": scores, ratings, performance, engine and W/D/L from the side to move; "white": from White
+    view: "white",          // "white": scores, ratings, performance, engine and W/D/L from White; "mover": from the side to move
     defaultTempi: null,     // tempi when the URL names none: null = all, ["classical"] = classical only
     ratings: "both",        // the Maia line: "both" (FIDE -> Maia), "fide" or "maia"
 }
@@ -79,6 +80,8 @@ function writeUrl() {
 // ---------------------------------------------------------------- formatting
 
 const pct = (x, d = 0) => x == null ? "" : (100 * x).toFixed(d)
+// A share in whole percent; a share that is not zero but rounds to it shows as "<1".
+const pctShare = x => x == null ? "" : x > 0 && x < 0.005 ? "<1" : (100 * x).toFixed(0)
 const int = x => x == null ? "" : Math.round(x).toString()
 const esc = s => String(s).replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]))
 
@@ -137,7 +140,7 @@ function initBoard() {
         assetsUrl: "/static/vendor/cm-chessboard/assets/",
         style: {
             cssClass: "default", showCoordinates: true, animationDuration: 100,
-            pieces: {file: "/static/vendor/chessnut/pieces.svg", tileSize: 40},
+            pieces: {file: "/pieces.svg", tileSize: 40},
         },
         extensions: [
             {class: Markers, props: {autoMarkers: null, sprite: "/static/markers.svg"}},
@@ -472,7 +475,7 @@ function render() {
         return `<tr data-uci="${r.uci}" class="${cls}">` +
             `<td class="san">${esc(r.san)}</td>` +
             `<td class="num${r.db ? "" : " dim"}">${r.n ?? ""}</td>` +
-            `<td class="num${r.db ? "" : " dim"}">${r.share == null ? "" : pct(r.share, 1)}</td>` +
+            `<td class="num${r.db ? "" : " dim"}">${pctShare(r.share)}</td>` +
             `<td class="num">${pct(r.score)}</td>` +
             `<td class="num">${pct(r.draw)}</td>` +
             `<td class="num" title="${r.n_rated == null ? "" : r.n_rated + " games with both ratings"}">${int(r.elo)}</td>` +
@@ -481,7 +484,7 @@ function render() {
             `<td class="num">${r.last_year ?? ""}</td>` +
             `<td class="num dim">${r.reach ?? ""}</td>` +
             `<td>${trendCell(r, s)}</td>` +
-            `<td class="num maia">${r.maia == null ? "" : pct(r.maia, 1)}</td>` +
+            `<td class="num maia">${pctShare(r.maia)}</td>` +
             `<td class="num">${deltaCell(r)}</td>` +
             `<td class="num ${r.best ? "best" : ""}" title="${sfTitle}">${cpText(r.sfv)}</td>` +
             `</tr>`

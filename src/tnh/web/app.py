@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import io
+import re
 import time
 from pathlib import Path
 
 import chess
 import chess.pgn
+import chess.svg
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from tnh.web.models import ModelHub, ModelsOff
@@ -63,6 +65,22 @@ def _pgn_tree(text: str) -> dict:
     return {"root_fen": root.fen(), "tree": walk(game), "headers": dict(game.headers)}
 
 
+def piece_sprite(tile: int = 40) -> str:
+    """The standard piece drawings (Colin M.L. Burnett's, as on Lichess and Wikipedia) as one sprite
+    for cm-chessboard: a group per piece with the ids wk, wq, ... bp, on tiles of `tile` units.
+
+    Taken at run time from python-chess (`chess.svg.PIECES`, drawn on 45 units), so the
+    drawings are not copied into this repository.
+    """
+    parts = []
+    for symbol, body in chess.svg.PIECES.items():
+        name = ("w" if symbol.isupper() else "b") + symbol.lower()
+        body = re.sub(r'^<g id="[^"]*"', "<g", body)
+        parts.append(f'<g id="{name}" transform="scale({tile / chess.svg.SQUARE_SIZE:.6f})">{body}</g>')
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{tile}" height="{tile}" viewBox="0 0 {tile} {tile}">\n'
+            + "\n".join(parts) + "\n</svg>\n")
+
+
 def create_app(stats: Stats, hub: ModelHub, *, trend_rule: TrendRule = TrendRule()) -> FastAPI:
     app = FastAPI(title="tn-hittare", docs_url=None, redoc_url=None, openapi_url=None)
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
@@ -70,6 +88,12 @@ def create_app(stats: Stats, hub: ModelHub, *, trend_rule: TrendRule = TrendRule
     @app.get("/")
     def index():
         return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-cache"})
+
+    sprite = piece_sprite()
+
+    @app.get("/pieces.svg")
+    def pieces():
+        return Response(sprite, media_type="image/svg+xml", headers={"Cache-Control": "no-cache"})
 
     @app.get("/api/info")
     def info():

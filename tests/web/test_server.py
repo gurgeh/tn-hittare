@@ -78,10 +78,15 @@ def test_serves_page_and_static(server):
     assert r.status_code == 200 and '<div id="board">' in r.text
     for src in re.findall(r'(?:href|src)="(/static/[^"]+)"', r.text):
         assert httpx.get(base + src).status_code == 200, src
-    for path in ["app.js", "tree.js", "style.css", "markers.svg", "vendor/chessnut/pieces.svg",
+    for path in ["app.js", "tree.js", "style.css", "markers.svg",
                  "vendor/chess.js/chess.js", "vendor/cm-chessboard/src/Chessboard.js"]:
         r = httpx.get(f"{base}/static/{path}")
         assert r.status_code == 200, path
+    # the piece sprite: one group per piece under the ids cm-chessboard asks for
+    r = httpx.get(base + "/pieces.svg")
+    assert r.status_code == 200 and r.headers["content-type"].startswith("image/svg+xml")
+    assert all(f'<g id="{c}{p}"' in r.text for c in "wb" for p in "kqrbnp")
+    assert '"/pieces.svg"' in httpx.get(base + "/static/app.js").text
     assert "javascript" in httpx.get(base + "/static/app.js").headers["content-type"]
 
 
