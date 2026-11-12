@@ -187,6 +187,7 @@ def test_batched_build_matches_in_memory(tmp_path, monkeypatch, batch_games):
     assert par2.equals(edges_mod.parents_from_edges(e))
     db = EdgeDB(name="t", directory=tmp_path / "out")
     assert db.moves(chess.Board()).equals(EdgeDB.from_frames(e, p).moves(chess.Board()))
+    assert list((tmp_path / "scratch" / "edges").iterdir()) == []  # the run's own work directory is gone
 
 
 def test_moves_by_year_and_last_year():

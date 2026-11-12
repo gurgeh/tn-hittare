@@ -49,6 +49,7 @@ import argparse
 import multiprocessing
 import os
 import shutil
+import tempfile
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -875,11 +876,21 @@ def build(*, name: str, out_dir: Path, fraction: float | None, since_year: int |
     by one game, about 9 GB for the full corpus; after pass A only the kept
     positions' rows are written.
     """
+    root = DATA_ROOT / "scratch" / "edges"
+    root.mkdir(parents=True, exist_ok=True)
+    # this run's own directory, removed also on an error: a fixed path is shared with any other run
+    work = Path(tempfile.mkdtemp(prefix=f"work_{name}-", dir=root))
+    try:
+        _build(work, name=name, out_dir=out_dir, fraction=fraction, since_year=since_year, batch_games=batch_games,
+               workers=workers, max_ply=max_ply, min_games=min_games, polars_threads=polars_threads)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _build(work: Path, *, name: str, out_dir: Path, fraction: float | None, since_year: int | None,
+           batch_games: int, workers: int, max_ply: int, min_games: int, polars_threads: int) -> None:
     t0 = time.time()
     games_path = CORPUS / "games.parquet"
-    work = DATA_ROOT / "scratch" / "edges" / f"work_{name}"
-    if work.exists():
-        shutil.rmtree(work)
     (work / "kept").mkdir(parents=True)
     # Workers are spawned, so they read this before polars starts its thread pool. One thread
     # each: the process count is the CPU budget, and every polars thread keeps its own arena.
@@ -982,7 +993,6 @@ def build(*, name: str, out_dir: Path, fraction: float | None, since_year: int |
         _drop_cache(path)
     for path, k in ((edges_out, "pos_hash"), (pos_out, "pos_hash"), (par_out, "child_hash")):
         log(f"checked the reader on {check_lookups(path, k):,} row-group boundary keys of {path.name}")
-    shutil.rmtree(work)
     log(f"wrote {edges_out} ({edges_out.stat().st_size / 1e9:.3f} GB, {kept_edges:,} rows), "
         f"{pos_out} ({pos_out.stat().st_size / 1e9:.3f} GB, {kept_pos:,} rows) and "
         f"{par_out} ({par_out.stat().st_size / 1e9:.3f} GB, {pq.ParquetFile(par_out).metadata.num_rows:,} rows)")

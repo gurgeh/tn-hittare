@@ -139,3 +139,21 @@ def test_bucket_counts_merge_as_they_come():
     expect = np.zeros((len(uk), 2), np.uint32)
     np.add.at(expect, (inv, s), c)
     assert np.array_equal(keys, uk) and np.array_equal(counts, expect)
+
+
+def test_build_keeps_to_its_own_scratch(tmp_path, monkeypatch):
+    """A build must not touch another run's files in scratch/, and leaves nothing of its own behind.
+
+    On 2026-11-12 a test's tiny build removed the fixed scratch/positions/parts of a full build running
+    at the same time, and the full build failed at chunk 550 of 676.
+    """
+    monkeypatch.setattr(positions, "CORPUS", tmp_path)
+    monkeypatch.setattr(positions, "DATA_ROOT", tmp_path)
+    other = tmp_path / "scratch" / "positions" / "parts"  # where the old builds kept their parts
+    other.mkdir(parents=True)
+    (other / "part-00000.parquet").write_bytes(b"another run's part")
+    pl.DataFrame([game("g1", ["e4", "e5"], 2000, 2000)], schema=GAMES_SCHEMA).write_parquet(tmp_path / "games.parquet")
+    positions.build(max_ply=80, workers=1, chunk=2)
+    assert (other / "part-00000.parquet").read_bytes() == b"another run's part"
+    assert sorted(p.name for p in (tmp_path / "scratch" / "positions").iterdir()) == ["parts"]
+    assert pl.read_parquet(tmp_path / "positions.parquet").height == 2

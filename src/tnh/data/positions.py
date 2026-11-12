@@ -30,6 +30,7 @@ import hashlib
 import multiprocessing
 import os
 import shutil
+import tempfile
 import time
 from pathlib import Path
 
@@ -308,13 +309,21 @@ def build(max_ply: int, workers: int, chunk: int, out_dir: Path | None = None, f
     buckets (8 bytes plus 4 per source each, about 2.9 GB for the 179 M
     positions of the 2026-11 corpus), and one part at a time. Disk: the parts (the rows without pos_count), each
     deleted as soon as it is written out.
+
+    The parts go in a directory of this run's own under scratch/positions/, removed at the end, also on
+    an error: a fixed path let a test's tiny build delete a full build's parts (2026-11-12).
     """
+    root = DATA_ROOT / "scratch" / "positions"
+    root.mkdir(parents=True, exist_ok=True)
+    parts_dir = Path(tempfile.mkdtemp(prefix="build-", dir=root))
+    try:
+        _build(parts_dir, max_ply, workers, chunk, out_dir or CORPUS, fraction)
+    finally:
+        shutil.rmtree(parts_dir, ignore_errors=True)
+
+
+def _build(parts_dir: Path, max_ply: int, workers: int, chunk: int, out_dir: Path, fraction: float | None) -> None:
     t0 = time.time()
-    out_dir = out_dir or CORPUS
-    parts_dir = DATA_ROOT / "scratch" / "positions" / "parts"
-    if parts_dir.exists():
-        shutil.rmtree(parts_dir)
-    parts_dir.mkdir(parents=True)
     os.environ["POLARS_MAX_THREADS"] = "1"  # read by the spawned workers; the worker count is the CPU budget
 
     def log(msg: str) -> None:
@@ -413,7 +422,6 @@ def build(max_ply: int, workers: int, chunk: int, out_dir: Path | None = None, f
     tmp.replace(out)
     _drop_cache(out)
     pl.concat(exits).sort("game_id").write_parquet(out_dir / "book_exit.parquet")
-    shutil.rmtree(parts_dir)
     log(f"wrote {written:,} rows to {out} ({out.stat().st_size / 1e9:.2f} GB), "
         f"{n_null_mt:,} rows with a clock after the move but no move time "
         f"(each side's first move among them: no clock before it, by design)")
