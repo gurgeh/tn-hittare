@@ -28,6 +28,20 @@ settings only: neither extra positions in the graph nor the order of expansion c
 **Depths.** theta_k = 2 ** (-k / 2). Depth k is complete when every position inside the
 horizon and every relevant child of one (my candidates, all his moves) has been
 evaluated; its values are then final. Evaluations and the graph are the priced mode's.
+
+**Experiment switches** (Settings; off by default, not in UCI). Each keeps a value at a depth a
+function of the models, the settings and the earlier completed depths:
+
+- A, `his_anchor`: at an inside position of his only the replies inside the horizon (rho >= theta,
+  "searched") are evaluated, and
+  `V(n) = (1 - Prepared) * (s(n) + sum_searched q_a (V(child_a) - s(child_a))) + Prepared * min_searched V(child_a)`,
+  s the static value, V(n) = s(n) with no searched reply. MistakeFix's best move is the searched
+  reply with the highest static value for him (the other replies have no value).
+- B, `widen` = beta > 0: at an inside position of mine with weight rho (not the root) candidate a
+  only if rho * w_a >= theta / beta, w_a its horizon factor; the top candidate always.
+- C, `reduce_margin` > 0: at depth k, a candidate of mine (not at the root) whose value at depth
+  k - 1 was more than the margin below the best candidate's there gets its horizon factor times
+  `reduce_penalty`.
 """
 
 from __future__ import annotations
@@ -57,6 +71,7 @@ class Depth:
     positions_inside: int = 0
     pass_seconds: float = 0.0
     V: dict[int, float] = field(default_factory=dict)
+    mine: dict[int, dict[int, float]] = field(default_factory=dict)   # my inside positions: candidate -> value
 
 
 class BestMove:
@@ -65,6 +80,9 @@ class BestMove:
         self.completed: dict[int, Depth] = {}       # for the current root and settings
         self._root = None
         self._key = None
+        self._prev: Depth | None = None             # the completed depth before the one in progress (C)
+        self._rho_last: dict[int, float] = {}       # the last values pass's horizon (A's searched replies)
+        self._th_last = 1.0
 
     # -- the models' quantities ---------------------------------------------------------------
 
@@ -87,11 +105,23 @@ class BestMove:
         so the horizon depends on the move model alone)."""
         return self._mix(n, n.info["p_first"])
 
-    def _q(self, n: Node) -> np.ndarray:
+    def _q(self, n: Node, searched: list[int] | None = None) -> np.ndarray:
         """For the values: his mix over the corrected probabilities, the correction's best move
         being the child with the highest static value for him among all his evaluated
-        children (all of them, once the position is inside a completed depth)."""
-        return self._mix(n, self.e.fixed(n.id, self.e.best_valued(n.id)))
+        children (all of them, once the position is inside a completed depth); with A among
+        the searched replies only (the most likely move when none is searched)."""
+        if not self.e.s.his_anchor:
+            return self._mix(n, self.e.fixed(n.id, self.e.best_valued(n.id)))
+        if searched is None:
+            searched = self._searched(n, self._rho_last, self._th_last)
+        g = self.e.graph
+        best = max(searched, key=lambda j: 1.0 - g.nodes[n.children[j]].value) if searched else None
+        return self._mix(n, self.e.fixed(n.id, best))
+
+    def _searched(self, n: Node, rho: dict[int, float], th: float) -> list[int]:
+        """A: his replies inside the horizon and evaluated."""
+        g = self.e.graph
+        return [j for j, c in enumerate(n.children) if rho.get(c, 0.0) >= th and self._evaluated(g.nodes[c])]
 
     def _candidates(self, i: int) -> list[int]:
         """My candidate move indices at an evaluated position: the prior gate, then the
@@ -111,15 +141,30 @@ class BestMove:
             out = [int(np.argmax(prior))]
         return out
 
-    def _factors(self, i: int, at_root: bool) -> list[tuple[int, float]]:
+    def _my_moves(self, i: int, at_root: bool, rho_i: float = 1.0, th: float = 0.0) -> list[tuple[int, float]]:
+        """(move index, rho factor) for my candidates considered at an inside position with
+        weight rho_i at horizon th: the reduction (C) and the widening (B) applied."""
+        s, n = self.e.s, self.e.graph.nodes[i]
+        prior = self.e._prior(n)
+        cand = self._candidates(i)
+        if at_root:
+            return [(j, 1.0) for j in cand]
+        top = max(prior[j] for j in cand)
+        f = {j: (prior[j] / top) ** s.alpha for j in cand}
+        prev = self._prev.mine.get(i) if (s.reduce_margin > 0 and self._prev is not None) else None
+        if prev:
+            best = max(prev.values())
+            for j, v in prev.items():
+                if j in f and v < best - s.reduce_margin:
+                    f[j] *= s.reduce_penalty
+        out = [(j, w) for j, w in f.items() if s.widen <= 0 or rho_i * w >= th / s.widen]
+        return out or [max(f.items(), key=lambda t: (t[1], -t[0]))]
+
+    def _factors(self, i: int, at_root: bool, rho_i: float = 1.0, th: float = 0.0) -> list[tuple[int, float]]:
         """(child id, rho factor) for the children that matter at an inside position."""
         g, n = self.e.graph, self.e.graph.nodes[i]
         if n.me_to_move:
-            prior = self.e._prior(n)
-            cand = self._candidates(i)
-            top = max(prior[j] for j in cand)
-            a = self.e.s.alpha
-            return [(n.children[j], 1.0 if at_root else (prior[j] / top) ** a) for j in cand]
+            return [(n.children[j], f) for j, f in self._my_moves(i, at_root, rho_i, th)]
         q = self._q_rho(n)
         return [(c, float(q[j])) for j, c in enumerate(n.children) if q[j] > 0]
 
@@ -152,11 +197,12 @@ class BestMove:
             if n.children is None:                       # inside, valued only: its children come now
                 kids.append(i)
                 continue
-            for c, f in self._factors(i, i == root):
+            anchor = self.e.s.his_anchor and not n.me_to_move
+            for c, f in self._factors(i, i == root, rho[i], th):
                 r = rho[i] * f
                 if r > rho.get(c, -1.0):
                     rho[c] = r
-                if not self._evaluated(g.nodes[c]):
+                if not self._evaluated(g.nodes[c]) and (not anchor or r >= th):
                     need[c] = max(need.get(c, 0.0), r)       # children of inside positions are valued
                 if c not in done:
                     heapq.heappush(heap, (g.nodes[c].ply, c))
@@ -174,6 +220,8 @@ class BestMove:
                   and not self._finished(g.nodes[i])]
         inside.sort(key=lambda i: -g.nodes[i].ply)
         V: dict[int, float] = {}
+        self.mine = {}
+        self._rho_last, self._th_last = rho, th
 
         def val(c: int, parent: Node) -> float:
             if c in V:
@@ -184,7 +232,18 @@ class BestMove:
         for i in inside:
             n = g.nodes[i]
             if n.me_to_move:
-                V[i] = max(val(n.children[j], n) for j in self._candidates(i))
+                cv = {j: val(n.children[j], n) for j, _ in self._my_moves(i, i == g.root, rho[i], th)}
+                self.mine[i] = cv
+                V[i] = max(cv.values())
+            elif self.e.s.his_anchor:
+                sj = self._searched(n, rho, th)
+                if not sj:
+                    V[i] = n.value
+                    continue
+                q = self._q(n, sj)
+                vs = np.array([val(n.children[j], n) for j in sj])
+                ss = np.array([g.nodes[n.children[j]].value for j in sj])
+                V[i] = (1 - P) * (n.value + float(q[sj] @ (vs - ss))) + P * float(vs.min())
             else:
                 q = self._q(n)
                 vs = np.array([val(c, n) for c in n.children])
@@ -207,7 +266,7 @@ class BestMove:
         inside = self._inside_per_root_move(rho, th)
         v_root = V.get(g.root, root.value)
         return Depth(k, th, complete, rv, inside, v_root if root.me_to_move else 1 - v_root,
-                     time.perf_counter() - t0, sum(1 for r in rho.values() if r >= th), pass_s, V)
+                     time.perf_counter() - t0, sum(1 for r in rho.values() if r >= th), pass_s, V, self.mine)
 
     def _inside_per_root_move(self, rho, th) -> dict[str, int]:
         g = self.e.graph
@@ -251,6 +310,7 @@ class BestMove:
         self._reset_if_moved()
         last_info = t0
         k = max(self.completed) + 1 if self.completed else 0
+        self._prev = self.completed.get(k - 1)
         if on_info is not None:                         # provisional lines from what is known
             rho, _, _ = self.rho(theta(k))
             on_info(self.result(t0, start_exp, self.depth_result(k, theta(k), rho, False, t0), provisional=True))
@@ -258,8 +318,9 @@ class BestMove:
             th = theta(k)
             while True:
                 rho, need, kids = self.rho(th)
-                if kids:
-                    e._materialize(kids)                # no model calls; then the horizon grows from them
+                if kids:                                # no model calls; then the horizon grows from them
+                    for s in range(0, len(kids), 256):  # in pieces: one database lookup for thousands of
+                        e._materialize(kids[s : s + 256])   # positions took 2 GB (A+B4, depth 14)
                     continue
                 if not need:
                     break
@@ -290,6 +351,7 @@ class BestMove:
                 on_info(self.result(t0, start_exp, d))
                 last_info = time.perf_counter()
             k += 1
+            self._prev = d
             if (stop is not None and stop.is_set()) or (seconds is not None and time.perf_counter() - t0 >= seconds) \
                     or (nodes is not None and e.stats["evaluations"] - start_ev >= nodes) \
                     or (depth is not None and k > depth) or theta(k) < 1e-9:
@@ -334,11 +396,14 @@ class BestMove:
         while i in V and len(moves) < 40:
             n = g.nodes[i]
             if n.me_to_move:
-                cand = self._candidates(i)
-                j = max(cand, key=lambda j: V.get(n.children[j], g.nodes[n.children[j]].value))
+                cv = show.mine.get(i)
+                if cv:
+                    j = max(cv, key=lambda j: (cv[j], -j))
+                else:
+                    j = max(self._candidates(i), key=lambda j: V.get(n.children[j], g.nodes[n.children[j]].value))
                 probs.append(None); flags.append(True)
             else:
-                q = self._q(n)
+                q = self._q(n, [j for j, c in enumerate(n.children) if c in V] if self.e.s.his_anchor else None)
                 j = int(np.argmax(q))
                 probs.append(float(q[j])); flags.append(None); reach *= float(q[j])
             moves.append(n.moves[j])

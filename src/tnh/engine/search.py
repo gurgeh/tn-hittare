@@ -108,6 +108,11 @@ class Settings:
     lines: int = 3
     mode: str = "repertoire"          # "repertoire" (priced, PUCT) or "bestmove" (expectimax to a reach horizon)
     alpha: float = 1.0                # bestmove: my candidates' horizon weight (P_a / max P) ** alpha
+    # bestmove experiment switches (off by default; not in UCI yet), see tnh.engine.bestmove
+    his_anchor: bool = False          # A: his unsearched replies stay at the position's static value
+    widen: float = 0.0                # B: beta; my candidate a only if rho * w_a >= theta / beta (0 = all)
+    reduce_margin: float = 0.0        # C: a candidate this far below the best at the previous depth ... (0 = off)
+    reduce_penalty: float = 0.5       # C: ... gets its horizon weight times this
     c_puct: float = 1.5
     fpu: float = 0.05
     policy_weight: float = 0.5        # Lc0's raw policy in my prior

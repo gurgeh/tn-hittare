@@ -188,3 +188,135 @@ def test_info_during_a_depth_in_progress():
     eng2.set_position(C4)
     eng2.search(depth=5)
     assert final == {k: d.value for k, d in eng2.bm.completed.items()}
+
+
+# -- experiment switches A (his_anchor), B (widen), C (reduce) ---------------------------------------------------
+
+def reference_switches(g, ev, s, th, prev_mine):
+    """Brute force with the switches, independent of the engine. prev_mine: the previous depth's
+    candidate values per my inside position (C). Returns root value, root move values, candidate values."""
+    static = lambda i: (g.nodes[i].value if not g.nodes[i].moves else float(ev.static[i]))  # noqa: E731
+
+    def my_moves(i, r):
+        n = g.nodes[i]
+        p = n.p_model
+        cand = [j for j in range(len(n.moves)) if p[j] >= s.prior_min and static(n.children[j]) >= static(i) - s.blunder] \
+            or [int(np.argmax(p))]
+        if i == g.root:
+            return [(j, 1.0) for j in cand]
+        top = max(p[j] for j in cand)
+        f = {j: (p[j] / top) ** s.alpha for j in cand}
+        if s.reduce_margin > 0 and i in prev_mine:
+            best = max(prev_mine[i].values())
+            for j, v in prev_mine[i].items():
+                if j in f and v < best - s.reduce_margin:
+                    f[j] *= s.reduce_penalty
+        out = [(j, w) for j, w in f.items() if s.widen <= 0 or r * w >= th / s.widen]
+        return out or [max(f.items(), key=lambda t: (t[1], -t[0]))]
+
+    rho = {g.root: 1.0}
+    for i in sorted(range(len(g.nodes)), key=lambda i: g.nodes[i].ply):
+        n = g.nodes[i]
+        if i not in rho or rho[i] < th or not n.moves:
+            continue
+        if n.me_to_move:
+            facs = [(n.children[j], f) for j, f in my_moves(i, rho[i])]
+        else:
+            facs = [(c, float(n.p_model[j])) for j, c in enumerate(n.children) if n.p_model[j] > 0]
+        for c, f in facs:
+            rho[c] = max(rho.get(c, 0.0), rho[i] * f)
+    mine = {}
+
+    def V(i):
+        n = g.nodes[i]
+        if rho.get(i, 0.0) < th or not n.moves:
+            return static(i)
+        if n.me_to_move:
+            cv = {j: V(n.children[j]) for j, _ in my_moves(i, rho[i])}
+            mine[i] = cv
+            return max(cv.values())
+        q = n.p_model
+        if s.his_anchor:
+            sj = [j for j, c in enumerate(n.children) if rho.get(c, 0.0) >= th]
+            if not sj:
+                return static(i)
+            vs = [V(n.children[j]) for j in sj]
+            dev = sum(q[j] * (v - static(n.children[j])) for j, v in zip(sj, vs))
+            return (1 - s.prepared) * (static(i) + dev) + s.prepared * min(vs)
+        vs = [V(c) for c in n.children]
+        return (1 - s.prepared) * float(np.dot(q, vs)) + s.prepared * min(v for v, x in zip(vs, q) if x > 0)
+    root = g.nodes[g.root]
+    return V(g.root), {m: V(c) for m, c in zip(root.moves, root.children)}, mine
+
+
+SWITCHES = [dict(his_anchor=True), dict(widen=2.0), dict(widen=4.0), dict(his_anchor=True, widen=4.0),
+            dict(his_anchor=True, widen=4.0, reduce_margin=0.03, reduce_penalty=0.5),
+            dict(reduce_margin=0.02, reduce_penalty=0.3)]
+
+
+@pytest.mark.parametrize("seed", range(8))
+@pytest.mark.parametrize("sw", range(len(SWITCHES)))
+def test_switches_equal_brute_force_on_small_trees(seed, sw):
+    g = random_game(np.random.default_rng(seed), depth=7, branching=(2, 3))
+    ev = SynthEvaluator(g)
+    for prepared in (0.0, 0.25):
+        s = settings(prepared=prepared, **SWITCHES[sw])
+        eng = Engine(ev, s)
+        eng.search(depth=8)
+        prev = {}
+        for k in sorted(eng.bm.completed):
+            d = eng.bm.completed[k]
+            v, moves, mine = reference_switches(g, ev, s, theta(k), prev)
+            assert d.value == pytest.approx(v, abs=1e-12)
+            for m, x in d.root_values.items():
+                assert x == pytest.approx(moves[m], abs=1e-12)
+            prev = mine
+
+
+def test_anchor_evaluates_only_searched_replies_and_has_static_value_without_any():
+    # his position O: replies x (q 0.9, to my position X) and y (q 0.1, a leaf)
+    X = me(("x2", 1.0, 0.5, leaf(0.9)), key="X", static=0.6)
+    O = opp(("x", 0.9, 0.5, X), ("y", 0.1, 0.5, leaf(0.3)), key="O", static=0.5)
+    g = build(me(("toO", 1.0, 0.5, O), key="root", static=0.5))
+    ev = SynthEvaluator(g)
+    eng = Engine(ev, settings(prior_min=0.0, his_anchor=True))
+    eng.search(depth=0)                                   # theta 1: O inside, neither reply searched
+    assert eng.bm.completed[0].root_values["toO"] == pytest.approx(0.5)
+    eng.search(depth=1)                                   # theta 0.71: x searched (0.9), y not (0.1)
+    assert eng.bm.completed[1].root_values["toO"] == pytest.approx(0.5 + 0.9 * (0.9 - 0.6))
+    gO = next(n for n in eng.graph.nodes if n.children is not None and not n.me_to_move)
+    y = eng.graph.nodes[gO.children[gO.moves.index("y")]]
+    assert not eng.bm._evaluated(y)                       # the unsearched reply was never evaluated
+
+
+def test_switches_values_do_not_depend_on_what_else_was_expanded_or_the_order():
+    g = random_game(np.random.default_rng(42), depth=7, branching=(2, 3))
+    ev = SynthEvaluator(g)
+    sw = dict(his_anchor=True, widen=2.0, reduce_margin=0.03, reduce_penalty=0.5)
+    a = Engine(ev, settings(**sw))
+    a.search(depth=6)
+    b = Engine(ev, settings(**sw))
+    rng = np.random.default_rng(1)
+    b.search(depth=0)
+    for _ in range(40):
+        cand = [n.id for n in b.graph.nodes if n.children is None and "result_mover" not in n.info]
+        if not cand:
+            break
+        b._expand(list(rng.choice(cand, size=min(5, len(cand)), replace=False)))
+    b.search(depth=6)
+    for k in range(7):
+        assert b.bm.completed[k].value == pytest.approx(a.bm.completed[k].value, abs=1e-12)
+        assert b.bm.completed[k].root_values == pytest.approx(a.bm.completed[k].root_values, abs=1e-12)
+
+
+def test_switches_cut_evaluations_on_the_fake_c4_position():
+    from tnh.engine.chess_eval import ChessEvaluator, FakeBundle
+    C4 = "c2c4 g8f6 g2g3 e7e6 f1g2 d7d5".split()
+    ev = {}
+    for name, sw in (("today", {}), ("A", dict(his_anchor=True)), ("B", dict(widen=2.0))):
+        eng = Engine(ChessEvaluator({"fake": FakeBundle()}),
+                     Settings(tempo="fake", my_side="white", mode="bestmove", **sw))
+        eng.set_position(C4)
+        eng.search(depth=5)
+        ev[name] = eng.stats["evaluations"]
+    assert ev["A"] < ev["today"] and ev["B"] <= ev["today"]
