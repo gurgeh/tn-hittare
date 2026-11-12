@@ -517,6 +517,24 @@ is a bootstrap over tournaments.
   [-0.0003, +0.0004] on `test_sub100k`). `p1` and `p2` cost 0.0008 and 0.0020.
   Coefficients per rule in `combo_coef_<rule>.json`. The default is still all
   children.
+- **Boosted trees on top**, `tnh.models.combotrees` (LightGBM, 15 leaves,
+  rate 0.05, at least 2000 rows per leaf, early stopping on held-out
+  tournaments of the fitting sample; the linear logit's inputs plus both
+  ratings, ply, the number of legal moves and each model's rank of the move).
+  Offline on `test_sub100k`, linear / trees: Maia 5M 1.433 / 1.428, 23M 1.332
+  / 1.327, 79M 1.282 / 1.277; + Lc0 policy 1.172 / 1.158; + children at p2
+  1.150 / 1.136, p1 1.148 / 1.135, p0.5 1.148 / 1.134. The trees cost almost
+  no time. The top move's probability is reliable as it stands (0.850
+  predicted, 0.849 played in the 0.8-0.9 bin) and the classes Lc0 can see are
+  unbiased in every rating band; what remains is mistakes only Stockfish
+  sees, overweighted by 1.18 overall and 1.34 at 2400 and above for large
+  ones (Maia +600: 2.17 and 3.20). A T3 network in place of BT4 is worse at
+  every step.
+- **The default move model** (the user, 2026-11-12): Maia-3 79M at +0 and
+  +600 and Lc0's policy under the trees, without child values (1.158). It is
+  about four times as fast as with children at p0.5, and in the search the
+  likely children are expanded anyway, so their values come in that way.
+  `Combo(prune="p0.5", trees=True)` (1.134) is the accurate option.
 - **Batch size stays at 12.** Lc0 0.32.1's own benchmark on BT4 peaks at
   1,720 evaluations per second at batch 48 against 1,461 at 12, and above 12
   a few positions per thousand come out wrong (up to 6 in a policy logit) and
