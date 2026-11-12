@@ -169,3 +169,21 @@ def test_valued_positions_get_children_only_inside_and_values_do_not_care():
     eng.search(depth=5)
     for k, (v, rv) in before.items():
         assert eng.bm.completed[k].value == v and eng.bm.completed[k].root_values == rv
+
+
+def test_info_during_a_depth_in_progress():
+    from tnh.engine.chess_eval import ChessEvaluator, FakeBundle
+    C4 = "c2c4 g8f6 g2g3 e7e6 f1g2 d7d5".split()
+    eng = Engine(ChessEvaluator({"fake": FakeBundle()}), Settings(tempo="fake", my_side="white", mode="bestmove",
+                                                                  batch=4))
+    eng.set_position(C4)
+    seen = []
+    eng.search(depth=5, on_info=seen.append, info_every=0.0)   # an info line after every batch
+    assert any(not r.complete or r.depth_in_progress > r.depth for r in seen)
+    first = next(i for i, r in enumerate(seen) if r.lines)   # none before the root has children
+    assert all(r.lines for r in seen[first:])
+    final = {k: d.value for k, d in eng.bm.completed.items()}
+    eng2 = Engine(ChessEvaluator({"fake": FakeBundle()}), Settings(tempo="fake", my_side="white", mode="bestmove"))
+    eng2.set_position(C4)
+    eng2.search(depth=5)
+    assert final == {k: d.value for k, d in eng2.bm.completed.items()}

@@ -154,7 +154,10 @@ class BestMove:
         """One bottom-up pass over the inside set. Positions not evaluated yet (only while a
         depth is in progress) stand in with their parent's own value."""
         g, P = self.e.graph, self.e.s.prepared
-        inside = [i for i, r in rho.items() if r >= th and self._evaluated(g.nodes[i]) and not self._finished(g.nodes[i])]
+        # inside and with children; while a depth is in progress a position that came inside
+        # but has no children yet counts with its own static value
+        inside = [i for i, r in rho.items() if r >= th and g.nodes[i].children is not None
+                  and not self._finished(g.nodes[i])]
         inside.sort(key=lambda i: -g.nodes[i].ply)
         V: dict[int, float] = {}
 
@@ -181,7 +184,7 @@ class BestMove:
         pass_s = time.perf_counter() - tp
         root = g.nodes[g.root]
         rv = {}
-        for c, _ in self._factors(g.root, True) if self._evaluated(root) and not self._finished(root) else []:
+        for c, _ in self._factors(g.root, True) if root.children is not None and not self._finished(root) else []:
             j = root.children.index(c)
             cn = g.nodes[c]
             v = V.get(c, cn.value)
@@ -195,7 +198,7 @@ class BestMove:
     def _inside_per_root_move(self, rho, th) -> dict[str, int]:
         g = self.e.graph
         root = g.nodes[g.root]
-        if not self._evaluated(root) or self._finished(root):
+        if root.children is None or self._finished(root):
             return {}
         counts = {}
         for j, c in enumerate(root.children):
@@ -205,7 +208,7 @@ class BestMove:
             while stack:
                 i = stack.pop()
                 n = g.nodes[i]
-                if rho.get(i, 0.0) < th or not self._evaluated(n) or self._finished(n):
+                if rho.get(i, 0.0) < th or n.children is None or self._finished(n):
                     continue
                 cnt += 1
                 for cc in n.children:
