@@ -398,7 +398,7 @@ def parse_file(args: tuple[str, str, int, str | None]) -> tuple[str, pl.DataFram
     df, drops, examples = parse_texts(texts, SOURCES[source_name], path.name)
     if out is None:
         return path_s, df, drops, examples, encoding
-    with_ids(df, part).write_parquet(out, compression="lz4")
+    with_ids(df, part).write_parquet(out, compression="zstd")
     _drop_cache(Path(out))
     return path_s, len(df), drops, examples, encoding
 
@@ -795,7 +795,7 @@ def build(sources: list[str], workers: int, limit_files: int | None, merge_near_
     for k, part_path in enumerate(parts, 1):
         part = int(part_path.stem.split("-")[1])
         g, e = apply_plan(pl.read_parquet(part_path), planned.filter(pl.col("_part") == part).drop("_part"))
-        _drop_cache(part_path)
+        part_path.unlink()  # disk: the parts and the streams must not both be whole at once
         b = g["game_id"].str.slice(0, 1)
         for key, df in (("games", g), ("extra", e)):
             df = df.with_columns(_b=b)
@@ -803,7 +803,8 @@ def build(sources: list[str], workers: int, limit_files: int | None, merge_near_
                 t = sub.drop("_b").to_arrow()
                 if (key, bk) not in streams:
                     fh = open(bdir / f"{key}_{bk}.arrows", "wb")  # noqa: SIM115 (closed below)
-                    streams[(key, bk)] = (fh, pa.ipc.new_stream(fh, t.schema))
+                    streams[(key, bk)] = (fh, pa.ipc.new_stream(
+                        fh, t.schema, options=pa.ipc.IpcWriteOptions(compression="zstd")))
                 streams[(key, bk)][1].write_table(t)
         counts["source"].update(g["source"].to_list())
         counts["tempo"].update(g["tempo"].to_list())
