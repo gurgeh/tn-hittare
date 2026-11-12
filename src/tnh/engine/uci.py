@@ -50,14 +50,16 @@ the side to move's at the root. **Score mapping:** `score cp X` with
 `X = round(400 * log10(E / (1 - E)))` for that expected score E, clipped to +-2000
 (0 = even, +200 = 0.76, +400 = 0.91). No `wdl`: the search keeps expected scores only.
 
-At most about one round of info per second. Per line, in order of `multipv`:
+A round of info goes out at once when a search starts from a root the last solve
+covered (provisional), again right after the first solve at the new root, and then at
+most about once per second. Per line, in order of `multipv`:
 
     info depth D multipv K score cp X nodes N nps S time MS pv m1 m2 ...
-    info string preppy multipv=K value=V net=NET nonobvious=C reach=R moves=m1:F1,m2:F2,...
+    info string preppy multipv=K value=V net=NET nonobvious=C reach=R provisional=0|1 moves=m1:F1,m2:F2,...
 
 and once per round:
 
-    info string preppy root value=V net=NET price=P cost=C cap=X stand_in=S frontier=F finished=G expanded=E
+    info string preppy root value=V net=NET price=P cost=C cap=X stand_in=S frontier=F finished=G expanded=E provisional=0|1
 
 - `value`: the line's expected score for the side to move at the root (6 decimals).
 - `net` (me to move): value minus price times the non-obvious moves the line's repertoire
@@ -68,6 +70,10 @@ and once per round:
   likely); a number: the opponent's probability of the move.
 - With me to move the lines are my candidate moves by net value; with the opponent to
   move, his most likely replies.
+- `provisional=1`: the round comes from the last solve made at another root or with
+  other settings (sent at once after `position` or `setoption`, so the page has lines
+  while the new root is solved); the next round with `provisional=0` replaces it. Only
+  `provisional=0` values are exact for the current root and settings.
 - `root`: the repertoire's value and net value, the price in force (with a cap, the one
   found), the non-obvious moves it learns, `cap=-` without a cap, the probability mass
   that ends on stand-ins (positions not yet expanded, valued by their parent),
@@ -82,6 +88,7 @@ import math
 import os
 import sys
 import threading
+import time
 
 for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "POLARS_MAX_THREADS"):
     os.environ.setdefault(_v, "1")
@@ -130,6 +137,9 @@ class UCI:
         self.lock = threading.Lock()
         self.fake = fake
         self.loaded = False
+        self.trace: list[dict] = []          # per go: where the time went until the first lines
+        self._t_position = None
+        self._stop_wait = 0.0
 
     def send(self, line: str) -> None:
         with self.lock:
@@ -141,6 +151,12 @@ class UCI:
     def report(self, r: Result | None) -> None:
         if r is None or r.solve is None:
             return
+        if self.trace and r.lines:
+            tr = self.trace[-1]
+            key = "first_provisional" if r.provisional else "first_info"
+            if key not in tr:
+                tr[key] = time.perf_counter() - tr["t_position"]
+                tr.update({k: v for k, v in self.engine.timing.items()})
         eng = self.engine
         nodes = eng.stats["expanded"]
         ms = max(int(r.seconds * 1000), 1)
@@ -152,14 +168,15 @@ class UCI:
                              for m, p, l in zip(line.moves, line.probs, line.learned))
             net = "-" if line.net is None else f"{line.net:.6f}"
             self.send(f"info string preppy multipv={k} value={line.value:.6f} net={net} "
-                      f"nonobvious={line.nonobvious} reach={line.reach:.6f} moves={flags}")
+                      f"nonobvious={line.nonobvious} reach={line.reach:.6f} provisional={int(r.provisional)} "
+                      f"moves={flags}")
         s, m = r.solve, r.mass
         root = eng.graph.nodes[eng.graph.root]
         v = s.value if root.me_to_move else 1 - s.value
         cap = "-" if eng.s.cap == 0 else str(eng.s.cap)
         self.send(f"info string preppy root value={v:.6f} net={s.net:.6f} price={s.mu:.6g} cost={s.cost} cap={cap} "
                   f"stand_in={m['stand_in']:.4f} frontier={m['frontier']:.4f} finished={m['finished']:.4f} "
-                  f"expanded={nodes}")
+                  f"expanded={nodes} provisional={int(r.provisional)}")
 
     def bestmove(self, r: Result | None) -> None:
         if r is not None and r.lines:
@@ -174,7 +191,9 @@ class UCI:
     def idle(self) -> None:
         """Stop a running search first (its bestmove is sent by the search thread)."""
         if self.handle.busy:
+            t = time.perf_counter()
             self.handle.stop()
+            self._stop_wait = time.perf_counter() - t
 
     def load(self) -> None:
         if not self.loaded:
@@ -208,7 +227,10 @@ class UCI:
             self.loaded = False
 
     def cmd_position(self, args: list[str]) -> None:
+        self._stop_wait = 0.0
+        t_pos = time.perf_counter()
         self.idle()
+        self.trace.append({"t_position": t_pos, "moves": len(args), "stop_wait": self._stop_wait})
         moves = args[args.index("moves") + 1 :] if "moves" in args else []
         fen = None
         if args and args[0] == "fen":

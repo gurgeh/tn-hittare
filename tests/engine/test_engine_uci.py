@@ -196,3 +196,85 @@ def test_uci_real_models_smoke():
         assert info and info[0]["pv"]
     finally:
         eng.quit()
+
+
+def test_a_root_move_keeps_node_fields_and_evaluations():
+    eng, fb = fake_engine(price=0.002, my_side="white")
+    eng.set_position(C4)
+    eng.search(nodes=150)
+    line = eng.lines(1)[0].moves
+    snap = {n.id: (n.p_model, n.value, n.me_to_move, n.children) for n in eng.graph.nodes}
+    calls, refreshes = fb.calls, eng.stats["refreshes"]
+    eng.set_position(C4 + line[:2])
+    for n in eng.graph.nodes:
+        if n.id in snap:
+            p, v, m, c = snap[n.id]
+            assert n.p_model is p and n.me_to_move == m and n.children is c
+            if n.id != eng.graph.root:
+                assert n.value == v or (np.isnan(n.value) and np.isnan(v))
+    assert fb.calls == calls and eng.stats["refreshes"] == refreshes
+    assert eng.provisional
+
+
+def test_provisional_lines_come_at_once_and_are_replaced():
+    eng, _ = fake_engine(price=0.002, my_side="white")
+    eng.set_position(C4)
+    eng.search(nodes=300)
+    line = eng.lines(1)[0].moves
+    eng.set_position(C4 + line[:1])
+    seen = []
+    eng.search(nodes=40, on_info=seen.append)
+    assert seen[0].provisional and seen[0].lines
+    assert not seen[1].provisional
+    assert eng.timing["provisional_info"] < 0.05
+    assert not eng.provisional
+
+
+def test_a_price_change_re_solves_without_refreshing():
+    eng, fb = fake_engine(price=0.002, my_side="white")
+    eng.set_position(C4)
+    eng.search(nodes=100)
+    r0, calls = eng.stats["refreshes"], fb.calls
+    eng.set_settings(price=0.004)
+    assert eng.stats["refreshes"] == r0 and eng.provisional
+    s = eng.solve()
+    assert not eng.provisional and s.mu == 0.004 and fb.calls == calls
+    eng.set_settings(my_elo=2100)                    # node fields depend on it: a refresh
+    assert eng.stats["refreshes"] == r0 + 1
+
+
+def test_first_info_after_a_position_change_is_prompt_on_fake_models():
+    import io
+    from tnh.engine.uci import UCI
+    eng, _ = fake_engine(price=0.002, my_side="white")      # the page sends white or black
+    out = io.StringIO()
+    u = UCI(eng, out=out, fake=True)
+    run = lambda line: u.dispatch(line.split()[0], line.split()[1:])  # noqa: E731
+    run("position startpos moves " + " ".join(C4))
+    run("go nodes 300")
+    u.handle.wait()
+    line = eng.lines(1)[0].moves
+    run("position startpos moves " + " ".join(C4 + line[:1]))
+    run("go infinite")
+    import time
+    t0 = time.perf_counter()
+    while "first_info" not in u.trace[-1] and time.perf_counter() - t0 < 10:
+        time.sleep(0.005)
+    run("stop")
+    tr = u.trace[-1]
+    assert tr["first_provisional"] < 0.1
+    assert tr["first_info"] < 1.0
+    assert "provisional=1" in out.getvalue() and "provisional=0" in out.getvalue()
+
+
+def test_stepping_back_shows_the_last_result_of_that_root_provisionally():
+    eng, _ = fake_engine(price=0.002, my_side="white")
+    eng.set_position(C4)
+    eng.search(nodes=200)
+    line = eng.lines(1)[0].moves
+    eng.set_position(C4 + line[:2])
+    eng.search(nodes=50)
+    eng.set_position(C4)                               # back: C4 is not in the deeper root's solve
+    seen = []
+    eng.search(nodes=10, on_info=seen.append)
+    assert seen[0].provisional and seen[0].lines and not seen[-1].provisional

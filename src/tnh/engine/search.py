@@ -56,7 +56,7 @@ from typing import Any, Protocol
 import numpy as np
 
 from tnh.builder.game import Game, Graph, Node, Params, blend
-from tnh.engine.pricing import PL, Priced, solve_cap, solve_price
+from tnh.engine.pricing import PL, Priced, solve_cap, solve_price, w_at
 
 
 def identity_update(node: Node, first: np.ndarray, facts: dict) -> np.ndarray:
@@ -103,6 +103,7 @@ class Settings:
     expand_root: bool = True          # every legal move at the root is expanded once
 
     EVAL_KEYS = ("my_elo", "opp_elo", "my_side", "tempo")
+    FIELD_KEYS = ("db_filter",)               # change node fields (counts) without new evaluations
     TEMPI = ("classical", "blitz", "fake")
 
 
@@ -149,6 +150,7 @@ class Result:
     stats: dict
     mass: dict                    # where the root value rests: stand-ins, frontier values, finished games
     history: list                 # (expanded positions, root value, root net) at every solve
+    provisional: bool = False     # lines from the last solve at another root or other settings
 
 
 PENDING = ("?",)        # a position's moves before it is first expanded (not read yet)
@@ -179,6 +181,9 @@ class Engine:
         self.since_solve = 0
         self.root_moves: list[str] = []
         self.history: list[tuple[int, float, float]] = []
+        self.timing: dict = {}
+        self.provisional = False
+        self.root_results: dict[int, Result] = {}   # the last exact result per root, for provisional lines
         self.transposed: list = []              # (first path's position, another path's) for the history check
         self.eval_since_solve = 0.0
         self.last_solve_seconds = 0.0
@@ -196,7 +201,7 @@ class Engine:
             if len(self.transposed) < 400 and self.pos[hit.id] is not pos:
                 self.transposed.append((self.pos[hit.id], pos))
             return hit
-        n = self.graph.add(k, ply, True, [], value=math.nan)
+        n = self.graph.add(k, ply, self.ev.white_to_move(pos) == self.graph.me_white, [], value=math.nan)
         n.moves = PENDING
         self.pos[n.id] = pos
         return n
@@ -204,14 +209,29 @@ class Engine:
     def set_position(self, moves: list[str]) -> None:
         """The root after `moves` from the start position. Positions already in the graph are
         reused with what was learned about them."""
+        t = time.perf_counter()
+        self._set_position(moves)
+        self.timing = {"set_position": time.perf_counter() - t}
+
+    def _set_position(self, moves: list[str]) -> None:
         p = self.ev.start()
         node = self.graph.nodes[0]
         for m in moves:
             p = self.ev.child(p, m)
             node = self._node(p, None)
+        flips = self.s.my_side == "to_move" and self.ev.white_to_move(self.pos[node.id]) != self.graph.me_white
         self.graph.root = node.id
         self.root_moves = list(moves)
-        self._refresh()
+        if flips:
+            self._refresh()                   # with Side = to move, a new side to move changes who I am
+            return
+        # Only the root moves: every node keeps its fields and cached evaluations. The last
+        # solve was for another root; it stays as a provisional source of lines until the
+        # first solve at this root.
+        if math.isnan(node.value):
+            node.value = 0.5
+            node.info["stand_in"] = True
+        self._stale()
 
     # -- settings -------------------------------------------------------------------------------
 
@@ -225,7 +245,11 @@ class Engine:
             self.cap_mu = None
         if evals_changed:
             self.visits.clear()
-        self._refresh()
+        if evals_changed or any(getattr(old, k) != getattr(new, k) for k in Settings.FIELD_KEYS):
+            self._refresh()
+            self.stats["refreshes"] += 1
+        elif old != new:
+            self._stale()                     # a re-solve is enough
         lost = sum(1 for i in self.graph.reachable() if i in self.kids and self.graph.nodes[i].children is None)
         return {"evaluations_keyed_anew": evals_changed, "positions_back_to_frontier": lost}
 
@@ -286,6 +310,12 @@ class Engine:
         self.V = {}
         self.last = None
         self.game = None
+        self.since_solve = 10 ** 9
+
+    def _stale(self) -> None:
+        """The last solve no longer answers for the current root or settings: keep it for
+        provisional lines and solve at the next search."""
+        self.provisional = self.last is not None
         self.since_solve = 10 ** 9
 
     def _filter(self) -> Hashable:
@@ -416,7 +446,7 @@ class Engine:
         """The per-position fields the exact game reads: which of my moves can be learned, and
         the opponent's best reply for the prepared share."""
         g = self.graph
-        for i in g.reachable():
+        for i in self.kids:                   # the expanded positions (fields elsewhere are not read)
             n = g.nodes[i]
             if n.children is None or not n.moves:
                 continue
@@ -479,6 +509,7 @@ class Engine:
         self.R = game.reach(res.learned)
         self.history.append((self.stats["expanded"], res.value, res.net))
         self.game, self.last = game, res
+        self.provisional = False
         self.since_solve = 0
         self.eval_since_solve = 0.0
         self.last_solve_end = time.perf_counter()
@@ -548,11 +579,30 @@ class Engine:
         start_exp = self.stats["expanded"]
         last_info = t0
         stalled = 0
+        tm = self.timing = getattr(self, "timing", {})
+        if on_info is not None and self.provisional:
+            # lines at once, marked provisional: from the last solve if it covered this root
+            # (at my position a move counts only once it has been expanded), else the last
+            # result this root had (stepping back to a position searched before)
+            r = None
+            if self.game is not None and self.graph.root in self.game.dist:
+                r = self.result(t0, start_exp)
+            if (r is None or not r.lines) and self.graph.root in self.root_results:
+                r = replace(self.root_results[self.graph.root], provisional=True, expansions=0, seconds=0.0)
+            if r is not None and r.lines:
+                on_info(r)
+                tm["provisional_info"] = time.perf_counter() - t0
         if self.graph.nodes[self.graph.root].children is None:
             self._expand([self.graph.root])
         self._expand_root()
-        if self.last is None:
+        tm["root_expansion"] = time.perf_counter() - t0
+        t1 = time.perf_counter()
+        if self.last is None or self.provisional:
             self.solve(final=False)
+        tm["first_solve"] = time.perf_counter() - t1
+        if on_info is not None:
+            on_info(self.result(t0, start_exp))   # the first exact lines, without waiting a second
+            last_info = time.perf_counter()
         while True:
             done = self.stats["expanded"] - start_exp
             if nodes is not None and done >= nodes:
@@ -618,7 +668,12 @@ class Engine:
                 last_info = time.perf_counter()
         if not (stop is not None and stop.is_set() and self.last is not None):
             self.solve()              # a stop answers at once with the last solve
-        return self.result(t0, start_exp)
+        r = self.result(t0, start_exp)
+        if not r.provisional:
+            self.root_results[self.graph.root] = r
+            while len(self.root_results) > 64:
+                self.root_results.pop(next(iter(self.root_results)))
+        return r
 
     def _expand_root(self) -> None:
         """Every legal move at the root once, so that each has a value of its own."""
@@ -652,8 +707,9 @@ class Engine:
         return out
 
     def result(self, t0: float, start_exp: int) -> Result:
-        return Result(len(self.graph.reachable()), self.stats["expanded"] - start_exp, time.perf_counter() - t0,
-                      self.last, self.lines(self.s.lines), dict(self.stats), self.mass(), list(self.history))
+        return Result(len(self.graph.nodes), self.stats["expanded"] - start_exp, time.perf_counter() - t0,
+                      self.last, self.lines(self.s.lines), dict(self.stats), self.mass(), list(self.history),
+                      self.provisional)
 
     # -- lines ----------------------------------------------------------------------------------
 
@@ -672,7 +728,7 @@ class Engine:
                 if g.nodes[c].info.get("stand_in"):
                     continue
                 cost = game.move_cost(g.root, j)
-                net = (W[c](1.0) if c in W else self.V.get(c, g.nodes[c].value)) - res.mu * cost
+                net = (w_at(W[c], 1.0) if c in W else self.V.get(c, g.nodes[c].value)) - res.mu * cost
                 cands.append((net, j))
             for net, j in sorted(cands, key=lambda t: (-t[0], t[1]))[:k]:
                 out.append(self._line(j, net))

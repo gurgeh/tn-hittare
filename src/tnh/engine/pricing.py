@@ -103,6 +103,39 @@ class PL:
         return PL(x[idx], y[idx])
 
 
+def as_pl(w) -> PL:
+    """W of a node: a float is the slope of a line through 0 (a leaf, or a subtree where
+    nothing is worth learning), stored bare because most nodes are leaves."""
+    return PL.line(w) if isinstance(w, float) else w
+
+
+def w_at(w, r: float) -> float:
+    return w * r if isinstance(w, float) else w(r)
+
+
+def combine(W: dict, children: list[int], q) -> PL:
+    """sum_j W_j(q_j r). Children whose W is a line through 0 (most of them: leaves and
+    subtrees where nothing is worth learning) are summed as one slope; only the others go
+    through the piecewise-linear arithmetic."""
+    slope, parts = 0.0, []
+    for j, c in enumerate(children):
+        qj = q[j]
+        if qj <= 0:
+            continue
+        f = W[c]
+        if isinstance(f, float):
+            slope += qj * f
+        elif len(f.x) == 2 and f.y[0] == 0.0:
+            slope += qj * f.y[1]
+        else:
+            parts.append(f.scaled(qj))
+    if not parts:
+        return slope
+    if slope != 0.0:
+        parts.append(PL.line(slope))
+    return PL.add(parts) if len(parts) > 1 else parts[0]
+
+
 # -- the solve ---------------------------------------------------------------------------------
 
 @dataclass
@@ -119,23 +152,20 @@ class Priced:
 def subtree_functions(game: Game, mu: float) -> tuple[dict[int, PL], dict[int, list[tuple[int, PL]]]]:
     """W per node, and per learnable node its learn options (move index, W of the option)."""
     g = game.graph
-    E0 = game.values({})
     W: dict[int, PL] = {}
     opts: dict[int, list[tuple[int, PL]]] = {}
     for i in reversed(game.order):
         n = g.nodes[i]
         if not n.expanded:
-            W[i] = PL.line(E0[i])
+            W[i] = float(game.leaf[i])
             continue
-        d = game.dist[i]
-        parts = [W[c].scaled(d[j]) for j, c in enumerate(n.children) if d[j] > 0]
-        f = PL.add(parts) if parts else PL.line(0.0)
+        f = combine(W, n.children, game.dist[i])
         if game.learnable(i):
             o = []
             for j in game.sound[i]:
-                fa = W[n.children[j]].shifted(mu * game.move_cost(i, int(j)))
+                fa = as_pl(W[n.children[j]]).shifted(mu * game.move_cost(i, int(j)))
                 o.append((int(j), fa))
-                f = f.max(fa)
+                f = as_pl(f).max(fa)
             opts[i] = o
         W[i] = f
     return W, opts
@@ -154,9 +184,8 @@ def decide(game: Game, W: dict[int, PL], opts: dict[int, list[tuple[int, PL]]]) 
         pol = game.dist[i]
         if i in opts and n.key not in learned:
             r = R[i] if len(game.by_key[n.key]) == 1 else sum(R[x] for x in game.by_key[n.key])
-            unl = PL.add([W[c].scaled(pol[j]) for j, c in enumerate(n.children) if pol[j] > 0]) \
-                if np.any(pol > 0) else PL.line(0.0)
-            best_v, best_j = unl(r), None
+            unl = combine(W, n.children, pol)
+            best_v, best_j = w_at(unl, r), None
             for j, fa in opts[i]:
                 v = fa(r)
                 if v > best_v + TOL:
