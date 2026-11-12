@@ -1,6 +1,6 @@
 """Serve the interface on 127.0.0.1.
 
-    uv run python -m tnh.web [--port 8765] [--table full|dev] [--move-model combo-p0.5] [--value-model frontier]
+    uv run python -m tnh.web [--port 8765] [--table full|dev] [--move-model policy-trees] [--value-model frontier]
 
 The position statistics come from `tnh.data.edges.EdgeDB` by table name: `--table`, else
 $TNH_WEB_TABLE, else `full` when `corpus/edges.parquet`, `pos_index.parquet` and
@@ -32,8 +32,8 @@ def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="python -m tnh.web", description=__doc__.split("\n\n")[0])
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--table", default=None, help="EdgeDB table name: full or dev (default: full if it exists)")
-    ap.add_argument("--move-model", default="combo-p0.5",
-                    help="model 1: combo-p0.5, combo, fake, or import:module:Name (any MoveModel)")
+    ap.add_argument("--move-model", default="policy-trees",
+                    help="model 1: policy-trees, combo-p0.5, combo, fake, or import:module:Name (any MoveModel)")
     ap.add_argument("--value-model", default="frontier",
                     help="model 2: frontier, fake, or import:module:Name (any object with .wdl(queries))")
     ap.add_argument("--no-models", action="store_true", help="the database alone: no models and no engine")

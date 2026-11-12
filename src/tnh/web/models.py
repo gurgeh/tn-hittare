@@ -1,7 +1,7 @@
 """The models behind the move table, each loaded once on first use and kept.
 
 - **Model 1**, the move model: any object with the `MoveModel` interface
-  (`.predict(queries) -> list[Prediction]`), e.g. `tnh.models.combo.Combo(prune="p0.5")`.
+  (`.predict(queries) -> list[Prediction]`), by default `tnh.models.default_move_model()`.
 - **Model 2**, the result model: any object with `.wdl(queries)` (an array of win, draw,
   loss for the mover per query), e.g. `tnh.models.combo.FrontierValue()`.
 - Stockfish on demand, as before.
@@ -52,6 +52,7 @@ class Superseded(RuntimeError):
 # --- model specs ------------------------------------------------------------------------
 
 MOVE_MODELS: dict[str, Callable[[], object]] = {
+    "policy-trees": lambda: importlib.import_module("tnh.models").default_move_model(),
     "combo-p0.5": lambda: _combo().Combo(prune="p0.5"),
     "combo": lambda: _combo().Combo(),
     "fake": lambda: _fakes().FakeMoveModel(),
@@ -158,7 +159,7 @@ def terminal_wdl(board: chess.Board) -> tuple[float, float, float] | None:
 class Hub:
     """Model 1, model 2 and Stockfish, created lazily from their specs (or given as objects)."""
 
-    def __init__(self, move_model: str | object = "combo-p0.5", value_model: str | object = "frontier",
+    def __init__(self, move_model: str | object = "policy-trees", value_model: str | object = "frontier",
                  *, stockfish_processes: int = 1, cache_size: int = 20000) -> None:
         self._move_spec, self._value_spec = move_model, value_model
         self._move = None if isinstance(move_model, str) else move_model
