@@ -33,7 +33,6 @@
     <div id="moves" tabindex="-1"></div>
     <textarea id="paste" rows="2" spellcheck="false" placeholder="Paste FEN or PGN, Enter to load (/ to focus, Ctrl+V anywhere)"></textarea>
     <div id="fen" class="dim mono" title="FEN of the position shown (click to copy)"></div>
-    <div id="replines" style="display:none"></div>
   </section>
   <section id="right">
     <div id="totals"></div>
@@ -49,16 +48,11 @@
       <div id="englines"></div>
       <div id="engstrings" class="dim mono"></div>
     </div>
-    <div id="repline" style="display:none"></div>
     <table id="tbl">
       <colgroup id="cols"></colgroup>
       <thead><tr></tr></thead>
       <tbody></tbody>
     </table>
-    <div id="stubs">
-      <button disabled title="Statistics under best play, with shrinkage toward the model: not wired yet (tnh.builder)">Best-play stats</button>
-      <span class="dim">stubs</span>
-    </div>
     <div id="keys" class="dim">←/→ move · Home/End · ↑/↓ row · Enter play row · f flip · e engine on/off · a all legal · Del delete · p promote · / paste</div>
     <div id="status" class="mono"></div>
   </section>

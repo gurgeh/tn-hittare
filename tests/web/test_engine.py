@@ -213,3 +213,17 @@ def test_preppy_fake_over_uci():
         assert s["fen"] == fen and x["flags"][0] not in ("L", "M")   # his move: a probability
     finally:
         m.close()
+
+
+def test_start_up_strings_are_not_shown_errors_are(mgr):
+    mgr.go("fake", *after(), multipv=1)
+    s = wait_lines(mgr, 1)
+    time.sleep(0.1)
+    s = mgr.snapshot()
+    assert not any("Using" in x or "NNUE" in x for x in s["strings"])
+    assert any(x.startswith("tnh root") for x in s["strings"])          # said during the search
+    mgr.go("fake", *after("e2e4"), multipv=1, settings={"Price": "bad"})
+    end = time.monotonic() + 3
+    while time.monotonic() < end and not any("error" in x for x in mgr.snapshot()["strings"]):
+        time.sleep(0.02)
+    assert any("preppy error=" in x for x in mgr.snapshot()["strings"])

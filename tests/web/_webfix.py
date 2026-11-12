@@ -75,33 +75,3 @@ def fake_hub():
 
     return Hub(FakeMoveModel(), RecordingValue())
 
-
-def write_run(directory: Path, name: str = "t"):
-    """A small repertoire run written by `tnh.builder.export` itself, with the builder tests'
-    fake models: (result object, solutions by budget). Root 1.e4 e5, White to play, budgets 1, 3."""
-    import sys
-    sys.path.insert(0, str(Path(__file__).parents[1] / "builder"))
-    from test_builder_expand import FakeEngine, FakeMoves, FakeValue
-    from tnh.builder.expand import Expander
-    from tnh.builder.export import export, pgn_for, write
-    from tnh.builder.game import Game, ObviousCost, Params
-    from tnh.builder.search import solve
-    from tnh.builder.study import forced_curves, sound_root_moves
-
-    params = Params(eps_white=0.08, min_reach=0.01, cost=ObviousCost(0.5), kappa=20)
-    root = ["e2e4", "e7e5"]
-    ex = Expander(FakeMoves({"e7e5": 3.0, "g1f3": 3.0, "b8c6": 2.0, "d2d4": 2.5}), FakeEngine(), params,
-                  me_white=True, me_elo=2200, opp_elo=2200, root_moves=root, value_fn=FakeValue(), tail_p=0.01)
-    ex.grow(expand_reach=0.005, max_expansions=40)
-    game = Game(ex.graph, params)
-    budgets = [1, 3]
-    _, sols = solve(game, 3, improve_at=set(budgets))
-    forced = forced_curves(ex.graph, params, sound_root_moves(game), 3, set(budgets))
-    import chess
-    b = chess.Board()
-    for m in root:
-        b.push_uci(m)
-    meta = {"name": name, "root_fen": b.fen(), "root_moves": root, "me": "white", "me_elo": 2200, "opp_elo": 2200}
-    res = export(game, sols, budgets, root_moves=root, meta=meta, forced=forced, games=lambda n: 7, obvious=0.5)
-    write(directory / name, res, {N: pgn_for(game, sols[N], root) for N in budgets})
-    return res, sols

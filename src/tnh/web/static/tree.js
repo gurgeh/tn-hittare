@@ -115,7 +115,6 @@ export class MoveTree {
                 t.current = parent
                 const c = t.play(it.uci)
                 if (!c) throw new Error("illegal move in PGN: " + it.san)
-                if (it.comment) c.comment = it.comment
                 add(c, it.children)
             }
         }

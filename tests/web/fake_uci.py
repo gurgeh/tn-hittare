@@ -95,6 +95,10 @@ def main():
             if a.die_on_go:
                 sys.stderr.write("fake engine: dying on go\n")
                 sys.exit(3)
+            say("info string Using 4 threads")              # start-up notes, as Stockfish prints
+            say("info string NNUE evaluation using nn-fake.nnue")
+            if state["options"].get("Price") == "bad":
+                say("info string preppy error=Price must be a number")
             stop = threading.Event()
             th = threading.Thread(target=search, args=(stop, state["board"].copy(), state["pos"], state["multipv"]))
             state["stop"], state["thread"] = stop, th

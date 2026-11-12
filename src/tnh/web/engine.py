@@ -5,6 +5,9 @@ engine `tnh.engine.uci`). The page tells it the position, the number of lines an
 engine's settings (`go`); it stops the running search, waits for its `bestmove`, sets up the
 new search and sends `go infinite`. The page polls `snapshot` a few times a second.
 
+Info strings are shown only once the search has reported a line (Stockfish's start-up notes
+come before), and errors always.
+
 Stale results: every search has a generation number. Output is attributed to the generation
 current when it is read, and the generation only moves on after the old search's `bestmove`
 has been read and before the new `go` is sent, so a line of the previous position can never
@@ -272,6 +275,11 @@ class EngineManager:
                     return
                 if s.startswith("preppy root"):
                     self._root = _kv(s) | {"gen": self._gen}
+                # Only what the search says, not start-up notes (Stockfish prints its threads and
+                # network at the first go): a string counts once the search has reported a line;
+                # errors always do.
+                if "error" not in s.lower() and not any(x["gen"] == self._gen for x in self._lines.values()):
+                    return
                 key = " ".join(s.split()[:2])
                 self._strings[key] = s
                 return

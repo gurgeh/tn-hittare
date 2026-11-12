@@ -15,15 +15,12 @@ import argparse
 import socket
 import sys
 import time
-from pathlib import Path
 
 import uvicorn
 
-from tnh.paths import DATA_ROOT
 from tnh.web.app import create_app
 from tnh.web.engine import EngineManager, default_specs
 from tnh.web.models import Hub, NoModels
-from tnh.web.repertoire import Store
 from tnh.web.stats import open_stats
 
 HOST = "127.0.0.1"
@@ -47,8 +44,6 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--preppy-fake", action="store_true",
                     help="run preppy with its fake models (python -m tnh.engine.uci --fake): no GPU, for trying the page")
     ap.add_argument("--engine-idle", type=float, default=60.0, help="quit the engine after this many seconds unasked")
-    ap.add_argument("--repertoires", type=Path, default=DATA_ROOT / "repertoires",
-                    help="directory of the repertoire builder's runs (tnh.builder.export), shown as a layer")
     args = ap.parse_args(argv)
 
     with socket.socket() as s:
@@ -72,7 +67,7 @@ def main(argv: list[str] | None = None) -> None:
         p.cmd, p.gpu_mb, p.label = p.cmd + ["--fake"], 0, "preppy (fake)"
         p.settings = tuple(k for k in p.settings if k != "Tempo")     # the fake has its own tempo
     engines = EngineManager(specs, idle_s=args.engine_idle)
-    app = create_app(stats, hub, runs=Store(args.repertoires), engines=engines)
+    app = create_app(stats, hub, engines=engines)
     print(f"tn-hittare: http://{HOST}:{args.port}/", file=sys.stderr)
     try:
         uvicorn.run(app, host=HOST, port=args.port, log_level="warning")
