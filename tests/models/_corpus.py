@@ -19,13 +19,15 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 @contextlib.contextmanager
 def _corpus_dir(out: Path):
-    """positions.build writes to its module's CORPUS; point it at `out` for the call."""
-    old = positions.CORPUS
-    positions.CORPUS = out
+    """positions.build reads and writes under its module's CORPUS and keeps its work files under
+    DATA_ROOT; point both at `out` for the call, so a test never touches the real data directory.
+    (On 2026-11-12 a run of these tests deleted the work files of a full build.)"""
+    old = positions.CORPUS, positions.DATA_ROOT
+    positions.CORPUS = positions.DATA_ROOT = out
     try:
         yield
     finally:
-        positions.CORPUS = old
+        positions.CORPUS, positions.DATA_ROOT = old
 
 
 def build(out: Path, pgn: Path = FIXTURES / "games.pgn", *, max_ply: int = 80,
