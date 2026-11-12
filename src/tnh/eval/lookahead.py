@@ -70,9 +70,9 @@ class FastMover:
         if s["columns"] != ["m0", "mbest", "lc0pol"]:
             raise ValueError(f"unexpected M+pol columns {s['columns']}")
         self.beta, self.eps = np.array(s["beta"]), float(s["eps"])
-        self.maia = Maia3("79m", batch_size=512)
+        self.policy = Lc0Policy()          # first: the GPU is shared, Lc0's backend wants its memory early
+        self.maia = Maia3("79m", batch_size=64)
         self.elos = [Elo.offset(0.0), Elo.offset(600.0)]
-        self.policy = Lc0Policy()
         self.leaf = ResultModel("cheap")
         self.name = "fast"
 
@@ -284,6 +284,8 @@ def cmd_run(a) -> None:
     g = (pl.scan_parquet(CORPUS / "games.parquet").select("game_id", "moves_uci")
          .join(pl.LazyFrame({"game_id": s.get_column("game_id").unique()}), on="game_id", how="semi").collect())
     s = s.join(g, on="game_id", how="inner", maintain_order="left")
+    from tnh.eval.sample import drop_cache, peak_gb
+    drop_cache(CORPUS / "games.parquet")       # a capped job's memory counts the page cache it causes
     print(f"{s.height} positions to do ({out})", flush=True)
     ev = FastMover() if a.mover == "fast" else ComboMover()
     rng = np.random.default_rng(a.seed)
@@ -318,7 +320,8 @@ def cmd_run(a) -> None:
         rows_all.append(df)
         prev = pl.read_parquet(out) if out.exists() else None
         (df if prev is None else pl.concat([prev, df], how="vertical_relaxed")).write_parquet(out)
-        print(f"{start + c.height}/{s.height}: " + ", ".join(f"{k} {v / len(qs):.3f}" for k, v in stats.items()), flush=True)
+        print(f"{start + c.height}/{s.height}: " + ", ".join(f"{k} {v / len(qs):.3f}" for k, v in stats.items())
+              + f"; peak RSS {peak_gb():.2f} GB", flush=True)
     ev.close()
 
 
@@ -338,6 +341,12 @@ def cmd_analyse(a) -> None:
         cl = cluster_codes(j)
         counts = boot_counts(cl.max() + 1, a.boot, a.seed)
         static = np.array(j.get_column("static").to_list())
+        full = None
+        if a.predictions.exists():
+            pr = pl.read_parquet(a.predictions).select("game_id", pl.col("ply").cast(pl.Int64), pl.col(a.best).alias("_full"))
+            jj = j.select("game_id", "ply").join(pr, on=["game_id", "ply"], how="left", maintain_order="left")
+            if jj.get_column("_full").null_count() == 0:
+                full = np.array(jj.get_column("_full").to_list())
         variants = [c for c in d.columns if c in ("exact1", "exact2") or c.startswith("mc_")]
         ll_s, br_s = losses(static, y)
         w = np.ones(len(y))
@@ -374,7 +383,19 @@ def cmd_analyse(a) -> None:
                 oof[te] = losses((1 - lb) * static[te] + lb * p[te], y[te])[0]
             dob = oof - ll_s
             bo = boot_means(np.column_stack([oof, dob]), w, cl, counts)
-            ev_cols = {"exact1": "exact1", "exact2": "exact2"}
+            # the same out-of-fold blend on top of the best static model (the full result model)
+            blend_full = None
+            if full is not None:
+                ll_f = losses(full, y)[0]
+                oof_f, lams_f = np.zeros(len(y)), []
+                for k in range(5):
+                    tr, te = folds != k, folds == k
+                    lb = min(lam_grid, key=lambda l: losses((1 - l) * full[tr] + l * p[tr], y[tr])[0].mean())
+                    lams_f.append(lb)
+                    oof_f[te] = losses((1 - lb) * full[te] + lb * p[te], y[te])[0]
+                bf = boot_means(np.column_stack([oof_f, oof_f - ll_f]), w, cl, counts)
+                blend_full = {"lambdas_by_fold": lams_f, "oof_logloss": est(oof_f.mean(), bf[:, 0]),
+                              "oof_minus_static": est((oof_f - ll_f).mean(), bf[:, 1])}
             rows[v] = {"logloss": est(X[:, 0].mean(), bm[:, 0]), "brier": est(X[:, 1].mean(), bm[:, 1]),
                        "logloss_minus_static": est(X[:, 2].mean(), bm[:, 2]),
                        "brier_minus_static": est(X[:, 3].mean(), bm[:, 3]),
@@ -383,6 +404,7 @@ def cmd_analyse(a) -> None:
                                       "shift_ci": np.quantile(bc[:, 2], [0.025, 0.975]).tolist()},
                        "blend": {"lambdas_by_fold": lams, "oof_logloss": est(oof.mean(), bo[:, 0]),
                                  "oof_minus_static": est(dob.mean(), bo[:, 1])},
+                       **({"blend_full": blend_full} if blend_full else {}),
                        "shift": {"mean": float(shift.mean()), "sd": float(shift.std()),
                                  "abs_mean": float(np.abs(shift).mean())}}
         # cost: evaluations and seconds per position
@@ -412,6 +434,46 @@ def cmd_analyse(a) -> None:
     write_result(a.results, a.name, {"what": "look-ahead with the move model against the static result model", **res})
 
 
+def cmd_engine(a) -> None:
+    """Look-ahead by search: Lc0's calibrated WDL at 400 and 1600 nodes in place of the 50-node WDL, with the
+    coefficients fitted at 50 nodes (``reports/step1/result.json``: the ``lc0w`` and ``all`` variants), on the
+    test positions that have them; paired against 50 nodes on the same positions."""
+    from tnh.eval.common import boot_counts, boot_means, cluster_codes, est, read_sample, write_result
+    from tnh.eval.result import SOURCES, design, losses, mlogit_probs, table
+    from tnh.paths import FEATURES
+
+    res = json.loads((a.results / "result.json").read_text())["variants"]
+    coef = {"alone": (np.array(res["lc0w"]["coef"]), ["lc0w"]), "full": (np.array(res["all"]["coef"]), res["all"]["sources"])}
+    test = read_sample(a.positions).with_columns(pl.col("ply").cast(pl.Int64))
+    base, _, _ = table(test, SOURCES)
+    out = {}
+    for nodes in (400, 1600):
+        d = FEATURES / "lc0-bt4" / f"nodes{nodes}-wdl-offset+400"
+        if not d.exists():
+            continue
+        w, ctx, y = table(test, {**SOURCES, "lc0w": d})
+        ok = ~np.isnan(w["lc0w"]).any(1)
+        sub = test.filter(pl.Series(ok))
+        cl = cluster_codes(sub)
+        counts = boot_counts(cl.max() + 1, a.boot, a.seed)
+        for name, (th, srcs) in coef.items():
+            p = mlogit_probs(th, design({k: v[ok] for k, v in w.items()}, ctx[ok], srcs))
+            p50 = mlogit_probs(th, design({k: v[ok] for k, v in base.items()}, ctx[ok], srcs))
+            ll, br = losses(p, y[ok])
+            l50, b50 = losses(p50, y[ok])
+            X = np.column_stack([ll, br, ll - l50, br - b50, l50])
+            bm = boot_means(X, np.ones(ok.sum()), cl, counts)
+            key = f"lc0w{nodes} {name}"
+            out[key] = {"nodes": nodes, "positions": int(ok.sum()), "logloss": est(ll.mean(), bm[:, 0]),
+                        "brier": est(br.mean(), bm[:, 1]), "minus_50_nodes": est(X[:, 2].mean(), bm[:, 2]),
+                        "brier_minus_50_nodes": est(X[:, 3].mean(), bm[:, 3]), "logloss_50_same_rows": est(l50.mean(), bm[:, 4]),
+                        "coefficients": "fitted at 50 nodes (no refit)"}
+            print(f"{key}: {ll.mean():.4f} against 50 nodes {l50.mean():.4f}, difference {X[:, 2].mean():+.4f} "
+                  f"[{np.quantile(bm[:, 2], 0.025):+.4f}, {np.quantile(bm[:, 2], 0.975):+.4f}] on {ok.sum()} positions")
+    write_result(a.results, "lookahead_engine", {"what": "Lc0 calibrated WDL at 400 and 1600 nodes in place of 50, "
+                                                 "coefficients fitted at 50 nodes; look-ahead test positions", **out})
+
+
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(prog="python -m tnh.eval.lookahead", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -433,10 +495,18 @@ def main(argv=None) -> None:
     sp.add_argument("--chunk", type=int, default=50)
     sp.add_argument("--seed", type=int, default=5)
     sp.set_defaults(fn=cmd_run)
+    sp = sub.add_parser("engine")
+    sp.add_argument("--positions", type=Path, default=POS_TEST)
+    sp.add_argument("--results", type=Path, default=REPORTS / "step1")
+    sp.add_argument("--boot", type=int, default=1000)
+    sp.add_argument("--seed", type=int, default=7)
+    sp.set_defaults(fn=cmd_engine)
     sp = sub.add_parser("analyse")
     sp.add_argument("--positions", type=Path, default=POS_TEST)
     sp.add_argument("--results", type=Path, default=REPORTS / "step1")
     sp.add_argument("--name", default="lookahead")
+    sp.add_argument("--predictions", type=Path, default=Path.home() / "out/tn-hittare/scratch/eval/result/predictions.parquet")
+    sp.add_argument("--best", default="all", help="the result model's variant to blend on top of")
     sp.add_argument("--boot", type=int, default=1000)
     sp.add_argument("--seed", type=int, default=7)
     sp.set_defaults(fn=cmd_analyse)

@@ -245,6 +245,12 @@ def cmd_fit(a) -> None:
         print(f"{name:>28}: log loss {ll.mean():.4f}  brier {br.mean():.4f}  priority {ll[prio].mean():.4f}", flush=True)
     names = list(P)
     best = min(names, key=lambda k: losses(P[k], yt)[0].mean())
+    # every variant's prediction per test row, for the look-ahead comparison and the speed front
+    pred = test.select("game_id", pl.col("ply").cast(pl.Int64))
+    for k, v in P.items():
+        pred = pred.with_columns(pl.Series(k, v.tolist(), dtype=pl.List(pl.Float64)))
+    a.predictions.parent.mkdir(parents=True, exist_ok=True)
+    pred.write_parquet(a.predictions)
     cols, keys = [], []
     for k in names:
         ll, br = losses(P[k], yt)
@@ -338,7 +344,7 @@ class ResultModel:
         if "maia0" in self.sources or "maia600" in self.sources:
             if self._maia is None:
                 from tnh.models.maia3 import Maia3
-                self._maia = Maia3("79m", batch_size=512)
+                self._maia = Maia3("79m", batch_size=128)
             m0, m6 = self._maia.predict_many(queries, [Elo.offset(0.0), Elo.offset(600.0)])
             out["maia0"] = np.array([p.wdl for p in m0], dtype=np.float64)
             out["maia600"] = np.array([p.wdl for p in m6], dtype=np.float64)
@@ -405,16 +411,24 @@ def cmd_bench(a) -> None:
         out[name] = len(q) / (time.perf_counter() - t)
         print(f"{name}: {out[name]:.1f} positions/s ({len(q)} positions)", flush=True)
 
-    m = Maia3("79m", batch_size=512)
-    timed("maia3-79m one rating", lambda q: m.predict_many(q, [Elo.offset(0.0)]), qs)
-    timed("maia3-79m two ratings", lambda q: m.predict_many(q, [Elo.offset(0.0), Elo.offset(600.0)]), qs)
-    pol = Lc0Policy()
-    timed("lc0 raw value (policy call)", pol.predict, qs)
+    if not a.search_only:
+        pol = Lc0Policy()          # loaded first: Lc0's backend needs its memory in one piece
+        m = Maia3("79m", batch_size=a.maia_batch)
+        timed("maia3-79m one rating", lambda q: m.predict_many(q, [Elo.offset(0.0)]), qs)
+        timed("maia3-79m two ratings", lambda q: m.predict_many(q, [Elo.offset(0.0), Elo.offset(600.0)]), qs)
+        timed("lc0 raw value (policy call)", pol.predict, qs)
+    # the searches run in their own process (an Lc0 engine is about 2 GB of memory beside the networks above)
     for nodes, n in ((50, a.n_search), (400, a.n_search // 2), (1600, a.n_search // 4)):
+        if nodes not in a.search_nodes:
+            continue
         srch = Lc0Search(nodes, wdl_elo=Elo.parse("offset+400"))
         timed(f"lc0 wdl {nodes} nodes", srch.evaluate, qs[:n])
         srch.close()
-    write_result(a.results, "result_bench", {"what": "positions per second, laptop GPU, one process", "rates": out,
+    old = (a.results / "result_bench.json")
+    if old.exists():
+        out = {**json.loads(old.read_text())["rates"], **out}
+    write_result(a.results, "result_bench", {"what": "positions per second, laptop GPU shared with the repertoire "
+                                             "builder and another developer's Lc0 run, one process", "rates": out,
                                              "positions": a.n, "date": time.strftime("%Y-%m-%dT%H:%M:%S")})
 
 
@@ -427,6 +441,7 @@ def main(argv=None) -> None:
     sp.add_argument("--fit", type=Path, default=CORPUS / "samples" / "fit_value20k.parquet")
     sp.add_argument("--results", type=Path, default=RESULTS)
     sp.add_argument("--name", default="result")
+    sp.add_argument("--predictions", type=Path, default=Path.home() / "out/tn-hittare/scratch/eval/result/predictions.parquet")
     sp.add_argument("--boot", type=int, default=1000)
     sp.add_argument("--seed", type=int, default=7)
     sp.set_defaults(fn=cmd_fit)
@@ -439,6 +454,9 @@ def main(argv=None) -> None:
     sp.add_argument("--test", type=Path, default=CORPUS / "samples" / "test_value_all.parquet")
     sp.add_argument("--n", type=int, default=1200)
     sp.add_argument("--n-search", type=int, default=240)
+    sp.add_argument("--maia-batch", type=int, default=128)
+    sp.add_argument("--search-only", action="store_true")
+    sp.add_argument("--search-nodes", type=int, nargs="*", default=[])
     sp.add_argument("--results", type=Path, default=RESULTS)
     sp.set_defaults(fn=cmd_bench)
     sp = sub.add_parser("check-live")
