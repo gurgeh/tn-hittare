@@ -1,0 +1,97 @@
+{
+ "what": "conditional logit over the legal moves, Lc0 children evaluated only for the moves kept by the rule (tnh.models.prune), window rows of the fitting subsample",
+ "columns": [
+  "m0",
+  "mbest",
+  "lc0pol",
+  "lc0ch_eloss",
+  "lc0ch_cploss",
+  "lc0ch_unev"
+ ],
+ "beta": [
+  0.20458764822754608,
+  0.3904203157857842,
+  0.29967760050239395,
+  -4.2750778731614805,
+  -0.29311837806801666,
+  -1.999765561019783
+ ],
+ "eps": 0.0,
+ "newton_iterations": 7,
+ "prune": "p0.5",
+ "fill": "zero",
+ "maia_best": "offset+600",
+ "sources": {
+  "m0": {
+   "dir": "/home/gurgeh/out/tn-hittare/features/maia3-79m/offset+0",
+   "meta": {
+    "amp": true,
+    "elo_clamp": [
+     0.0,
+     5000.0
+    ],
+    "model": "maia3-79m",
+    "mover_offset": 0.0,
+    "opp_offset": 0.0,
+    "oppo_elo": null,
+    "self_elo": null,
+    "variant": "offset+0"
+   }
+  },
+  "mbest": {
+   "dir": "/home/gurgeh/out/tn-hittare/features/maia3-79m/offset+600",
+   "meta": {
+    "amp": true,
+    "elo_clamp": [
+     0.0,
+     5000.0
+    ],
+    "model": "maia3-79m",
+    "mover_offset": 600.0,
+    "opp_offset": 600.0,
+    "oppo_elo": null,
+    "self_elo": null,
+    "variant": "offset+600"
+   }
+  },
+  "lc0pol": {
+   "dir": "/home/gurgeh/out/tn-hittare/features/lc0-bt4/policy",
+   "meta": {
+    "backend": "cuda-auto",
+    "model": "lc0-bt4",
+    "network": "BT4-1024x15x32h-swa-6147500.pb.gz",
+    "variant": "policy"
+   }
+  },
+  "lc0ch": {
+   "dir": "/home/gurgeh/out/tn-hittare/features/lc0-bt4/children",
+   "meta": {
+    "backend": "cuda-auto",
+    "batch_size": 12,
+    "model": "lc0-bt4",
+    "network": "BT4-1024x15x32h-swa-6147500.pb.gz",
+    "variant": "children"
+   }
+  }
+ },
+ "fit": {
+  "sample": "/home/gurgeh/out/tn-hittare/corpus/samples/fit_sub100k.parquet",
+  "window_rows": 100000,
+  "moves": 3609874,
+  "children_kept": 0.2973114851100066
+ },
+ "test": {
+  "sample": "/home/gurgeh/out/tn-hittare/corpus/samples/test_sub100k.parquet",
+  "window_rows": 100000,
+  "mixed": {
+   "est": 1.1475643712233614,
+   "lo": 1.1390865729836628,
+   "hi": 1.156263656714813
+  },
+  "boot": 1000,
+  "children_per_position": 10.6683
+ },
+ "date": "2026-11-12T10:35:14",
+ "commit": "dda7da9d9e8b5368b669135885415ae3dea5bfa7",
+ "refit": "uv run python -m tnh.models.combo fit --prune 'p0.5' --fill zero"
+}
