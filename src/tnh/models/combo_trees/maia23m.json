@@ -1,0 +1,110 @@
+{
+ "config": "maia23m",
+ "spec": {
+  "maia": "23m"
+ },
+ "base_columns": [
+  "m0",
+  "mbest"
+ ],
+ "linear": {
+  "beta": [
+   0.08048310703364195,
+   0.849638831290993
+  ],
+  "eps": 0.00017417444675811567
+ },
+ "trees": {
+  "init_beta": [
+   0.07513697489873368,
+   0.8553860997213364
+  ],
+  "eps": 2.25744609197136e-05,
+  "settings": {
+   "num_leaves": 15,
+   "learning_rate": 0.05,
+   "min_data_in_leaf": 2000,
+   "feature_fraction": 0.9,
+   "lambda_l2": 1.0
+  },
+  "n_trees": 114,
+  "design_names": [
+   "m0",
+   "mbest",
+   "rank_m0",
+   "rank_mbest",
+   "board_capture",
+   "board_check",
+   "board_promotion",
+   "board_castling",
+   "board_piece_N",
+   "board_piece_B",
+   "board_piece_R",
+   "board_piece_Q",
+   "board_piece_K",
+   "ctx_mover_elo",
+   "ctx_opp_elo",
+   "ctx_elo_diff",
+   "ctx_ply",
+   "ctx_n_legal",
+   "ctx_entropy_mbest",
+   "m0*ctx_mover_elo",
+   "m0*ctx_ply",
+   "mbest*ctx_mover_elo",
+   "mbest*ctx_ply"
+  ],
+  "tried": [
+   {
+    "num_leaves": 15,
+    "learning_rate": 0.05,
+    "min_data_in_leaf": 2000,
+    "feature_fraction": 0.9,
+    "lambda_l2": 1.0,
+    "trees": 114,
+    "validation": 1.3537890599278637,
+    "seconds": 40
+   }
+  ]
+ },
+ "sources": {
+  "m0": "/home/gurgeh/out/tn-hittare/features/maia3-23m/offset+0",
+  "mbest": "/home/gurgeh/out/tn-hittare/features/maia3-23m/offset+600"
+ },
+ "fit": {
+  "sample": "/home/gurgeh/out/tn-hittare/corpus/samples/fit_sub100k.parquet",
+  "rows": 99980,
+  "train_rows": 79936,
+  "validation_rows": 20044,
+  "test_sample": "/home/gurgeh/out/tn-hittare/corpus/samples/test_sub100k.parquet",
+  "test_rows": 99972
+ },
+ "test": {
+  "linear": {
+   "test": {
+    "est": 1.3322588947773337,
+    "lo": 1.324469085600311,
+    "hi": 1.3396200387470534
+   },
+   "minus_linear_combo_p0.5": {
+    "est": 0.18475437950149232,
+    "lo": 0.17732537694928674,
+    "hi": 0.1917456364291407
+   }
+  },
+  "trees": {
+   "test": {
+    "est": 1.3267053232480592,
+    "lo": 1.3191027947654206,
+    "hi": 1.3342369286718243
+   },
+   "minus_linear_combo_p0.5": {
+    "est": 0.1792008079722178,
+    "lo": 0.17201223997042533,
+    "hi": 0.1860939398452103
+   }
+  }
+ },
+ "date": "2026-11-12T11:27:45",
+ "commit": "3578342e799beae221605d3e3b13a2179c65e8b4",
+ "refit": "uv run python -m tnh.models.combotrees fit --configs 'maia23m'"
+}

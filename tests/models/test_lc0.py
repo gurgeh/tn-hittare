@@ -92,11 +92,15 @@ def test_transforms_cover_every_kind():
     assert seen == set(range(8))
 
 
-def engine_policy(positions, nodes=1):
+T3 = "t3-512x15x16h-distill2-swa-03477500.pb.gz"
+NETWORKS = ["BT4-1024x15x32h-swa-6147500.pb.gz", T3]
+
+
+def engine_policy(positions, nodes=1, network=lc0.DEFAULT_NETWORK):
     """The engine's own P (percent, 2 decimals) per move, and its Q for the position (ScoreType Q:
     score = 10000 Q, exact to 1e-4) at one node, policy temperature 1."""
     e = lc0._Engine([str(lc0.binary())], {
-        "WeightsFile": str(lc0.network_path()), "Backend": "cuda-auto", "Threads": "1",
+        "WeightsFile": str(lc0.network_path(network)), "Backend": "cuda-auto", "Threads": "1",
         "BackendOptions": f"max_batch={lc0.MAX_BATCH}", "VerboseMoveStats": "true", "PolicyTemperature": "1.0",
         "SmartPruningFactor": "0", "ScoreType": "Q"})
     out = []
@@ -122,12 +126,16 @@ def engine_policy(positions, nodes=1):
 @installed
 @pytest.mark.slow
 @pytest.mark.parametrize("batch_size", [1, lc0.MAX_BATCH])
-def test_policy_agrees_with_engine(batch_size):
+@pytest.mark.parametrize("network", NETWORKS)
+def test_policy_agrees_with_engine(batch_size, network):
+    if not lc0.network_path(network).exists():
+        pytest.skip(f"no {network}")
     positions = all_positions()
-    model = lc0.Lc0Policy(batch_size=batch_size)
+    model = lc0.Lc0Policy(network, batch_size=batch_size)
+    canonical = model.canonical
     preds = model.predict(positions)
     del model
-    ref = engine_policy(positions)
+    ref = engine_policy(positions, network=network)
     dps, dqs, dds = [], [], []
     for q, p, (ep, eq, root) in zip(positions, preds, ref):
         assert set(ep) == set(p.moves)
@@ -136,7 +144,7 @@ def test_policy_agrees_with_engine(batch_size):
         w, d, l = p.wdl
         dqs.append(abs((w - l) - eq))
         dds.append(abs(d - root.d))
-    print(f"\nbatch {batch_size}: {len(positions)} positions, {len(dps)} moves: |P difference| in percentage "
+    print(f"\n{network} (canonical input {canonical}) batch {batch_size}: {len(positions)} positions, {len(dps)} moves: |P difference| in percentage "
           f"points max {max(dps):.4f}, mean {np.mean(dps):.5f}; |Q difference| max {max(dqs):.5f}; "
           f"|D difference| max {max(dds):.4f}")
     # The engine's P comes from FastExp, an approximation, and its displayed D goes through

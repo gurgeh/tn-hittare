@@ -1,0 +1,135 @@
+{
+ "config": "+ch-all",
+ "spec": {
+  "maia": "79m",
+  "pol": "bt4",
+  "ch": "bt4",
+  "rule": "all"
+ },
+ "base_columns": [
+  "m0",
+  "mbest",
+  "lc0pol",
+  "lc0ch_eloss",
+  "lc0ch_cploss"
+ ],
+ "linear": {
+  "beta": [
+   0.20645708017151318,
+   0.39498320815058474,
+   0.3039400054077845,
+   -4.248923679924604,
+   -0.2928083877654648
+  ],
+  "eps": 0.0002628031103813556
+ },
+ "trees": {
+  "init_beta": [
+   0.20583461807946551,
+   0.39507790011713084,
+   0.3076637607111705,
+   -4.163779739148972,
+   -0.28783550145193826
+  ],
+  "eps": 0.0,
+  "settings": {
+   "num_leaves": 15,
+   "learning_rate": 0.05,
+   "min_data_in_leaf": 2000,
+   "feature_fraction": 0.9,
+   "lambda_l2": 1.0
+  },
+  "n_trees": 358,
+  "design_names": [
+   "m0",
+   "mbest",
+   "lc0pol",
+   "lc0ch_eloss",
+   "lc0ch_cploss",
+   "rank_m0",
+   "rank_mbest",
+   "rank_lc0pol",
+   "board_capture",
+   "board_check",
+   "board_promotion",
+   "board_castling",
+   "board_piece_N",
+   "board_piece_B",
+   "board_piece_R",
+   "board_piece_Q",
+   "board_piece_K",
+   "ctx_mover_elo",
+   "ctx_opp_elo",
+   "ctx_elo_diff",
+   "ctx_ply",
+   "ctx_n_legal",
+   "ctx_entropy_mbest",
+   "ctx_entropy_lc0pol",
+   "m0*ctx_mover_elo",
+   "m0*ctx_ply",
+   "mbest*ctx_mover_elo",
+   "mbest*ctx_ply",
+   "lc0pol*ctx_mover_elo",
+   "lc0pol*ctx_ply",
+   "lc0ch_eloss*ctx_mover_elo",
+   "lc0ch_eloss*ctx_ply",
+   "lc0ch_cploss*ctx_mover_elo",
+   "lc0ch_cploss*ctx_ply"
+  ],
+  "tried": [
+   {
+    "num_leaves": 15,
+    "learning_rate": 0.05,
+    "min_data_in_leaf": 2000,
+    "feature_fraction": 0.9,
+    "lambda_l2": 1.0,
+    "trees": 358,
+    "validation": 1.1468334666910531,
+    "seconds": 118
+   }
+  ]
+ },
+ "sources": {
+  "m0": "/home/gurgeh/out/tn-hittare/features/maia3-79m/offset+0",
+  "mbest": "/home/gurgeh/out/tn-hittare/features/maia3-79m/offset+600",
+  "lc0pol": "/home/gurgeh/out/tn-hittare/features/lc0-bt4/policy",
+  "lc0ch": "/home/gurgeh/out/tn-hittare/features/lc0-bt4/children"
+ },
+ "fit": {
+  "sample": "/home/gurgeh/out/tn-hittare/corpus/samples/fit_sub100k.parquet",
+  "rows": 99980,
+  "train_rows": 79936,
+  "validation_rows": 20044,
+  "test_sample": "/home/gurgeh/out/tn-hittare/corpus/samples/test_sub100k.parquet",
+  "test_rows": 99972
+ },
+ "test": {
+  "linear": {
+   "test": {
+    "est": 1.1474901120538616,
+    "lo": 1.1389028075566923,
+    "hi": 1.1561770967581795
+   },
+   "minus_linear_combo_p0.5": {
+    "est": -1.4403221979789914e-05,
+    "lo": -0.0004060723463319928,
+    "hi": 0.00033707273116893773
+   }
+  },
+  "trees": {
+   "test": {
+    "est": 1.1337721139243553,
+    "lo": 1.1250689830207343,
+    "hi": 1.1425302554868215
+   },
+   "minus_linear_combo_p0.5": {
+    "est": -0.013732401351486258,
+    "lo": -0.014844327454431719,
+    "hi": -0.012677739350015241
+   }
+  }
+ },
+ "date": "2026-11-12T11:59:54",
+ "commit": "69b65a354cd1c2bf16c252597f787806650cf1e1",
+ "refit": "uv run python -m tnh.models.combotrees fit --configs '+ch-all'"
+}

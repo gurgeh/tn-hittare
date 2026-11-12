@@ -49,7 +49,8 @@ def done_keys(out: Path) -> pl.DataFrame:
     )
 
 
-def load_todo(positions: Path, games: Path, outs: list[Path], limit: int | None, split: str | None) -> pl.DataFrame:
+def load_todo(positions: Path, games: Path, outs: list[Path], limit: int | None, split: str | None,
+              skip_missing_games: bool = False) -> pl.DataFrame:
     """Rows still missing in at least one of `outs`, in game order, with `moves_uci`.
 
     Column `need_<k>` says whether output `k` still lacks the row.
@@ -73,8 +74,12 @@ def load_todo(positions: Path, games: Path, outs: list[Path], limit: int | None,
     g = (pl.scan_parquet(games).select("game_id", "moves_uci")
          .join(pl.LazyFrame({"game_id": ids}), on="game_id", how="semi").collect())
     missing = ids.len() - g.height
+    if missing and not skip_missing_games:
+        raise SystemExit(f"{missing} game_ids in {positions} are not in {games} (--skip-missing-games drops their rows)")
     if missing:
-        raise SystemExit(f"{missing} game_ids in {positions} are not in {games}")
+        n0 = todo.height
+        todo = todo.join(g.select("game_id"), on="game_id", how="semi")
+        print(f"skipped {n0 - todo.height} rows of {missing} games that are not in {games}", flush=True)
     if g.get_column("game_id").is_duplicated().any():
         raise SystemExit(f"duplicate game_id in {games}")
     return todo.join(g, on="game_id", how="left", maintain_order="left")
@@ -187,6 +192,30 @@ def games_file(positions: Path, games: Path | None) -> Path:
                      f"pass --games")
 
 
+def keep_sets(chunk: pl.DataFrame, dirs: list[Path], rule: str) -> list[set[str]]:
+    """Per row: the moves kept by `rule` (tnh.models.prune) from the max probability over the
+    move models in `dirs` (their feature files must cover the rows)."""
+    from tnh.eval.common import load_features
+    from tnh.models.prune import keep_mask
+
+    keys = chunk.select("game_id", "ply")
+    prob: list[dict[str, float]] = [dict() for _ in range(chunk.height)]
+    for d in dirs:
+        f = load_features(d, ["game_id", "ply", "moves", "logp"], keys)
+        f = keys.join(f, on=["game_id", "ply"], how="left", maintain_order="left")
+        if f.get_column("moves").null_count():
+            raise SystemExit(f"{d}: {f.get_column('moves').null_count()} rows without features")
+        for i, (ms, lp) in enumerate(zip(f.get_column("moves").to_list(), f.get_column("logp").to_list())):
+            for m, x in zip(ms, np.exp(np.asarray(lp, dtype=np.float64))):
+                prob[i][m] = max(prob[i].get(m, 0.0), x)
+    out = []
+    for pr in prob:
+        ms = list(pr)
+        k = keep_mask(np.array([pr[m] for m in ms]), np.array([0, len(ms)]), rule)
+        out.append({m for m, kk in zip(ms, k) if kk})
+    return out
+
+
 def run(a) -> None:
     games = games_file(a.positions, a.games)
     t0 = time.perf_counter()
@@ -223,9 +252,16 @@ def run(a) -> None:
         from tnh.models.lc0 import Lc0Children
 
         model = Lc0Children(a.network)
+        keep_dirs = None
+        if a.prune:
+            if not a.keep_from:
+                raise SystemExit("--prune needs --keep-from: the feature dirs whose probabilities decide the kept moves")
+            keep_dirs = [Path(d) for d in a.keep_from]
+            model.variant = f"children-{a.prune}"
         outs = [(a.out or FEATURES / model.name) / model.variant]
         check_meta(outs[0], {"model": model.name, "variant": model.variant, "network": model.network.name,
-                             "backend": model.backend_name, "batch_size": model.batch_size})
+                             "backend": model.backend_name, "batch_size": model.batch_size,
+                             **({"prune": a.prune, "keep_from": [str(d) for d in keep_dirs]} if a.prune else {})})
     elif a.model == "lc0-search":
         from tnh.models.lc0 import Lc0Search
         from tnh.models.maia3 import Elo
@@ -238,7 +274,7 @@ def run(a) -> None:
     else:
         raise SystemExit(f"unknown model {a.model}")
 
-    todo = load_todo(a.positions, games, outs, a.limit, a.split)
+    todo = load_todo(a.positions, games, outs, a.limit, a.split, a.skip_missing_games)
     n = 0
     try:
         for start in range(0, todo.height, a.chunk):
@@ -253,6 +289,9 @@ def run(a) -> None:
                     write_part(outs[k], chunk[rows], move_model_columns([preds[i] for i in rows]))
             elif a.model == "lc0-policy":
                 write_part(outs[0], chunk, move_model_columns(model.predict(qs)))
+            elif a.model == "lc0-children" and a.prune:
+                vals = model.evaluate(qs, keep_sets(chunk, keep_dirs, a.prune))
+                write_part(outs[0], chunk, value_model_columns(vals))
             else:
                 vals = model.evaluate(qs)
                 write_part(outs[0], chunk, value_model_columns(vals))
@@ -288,6 +327,8 @@ def main(argv=None) -> None:
     p.add_argument("--limit", type=int, help="at most this many positions not yet done")
     p.add_argument("--split", choices=["train", "val", "test"], help="only positions from this split")
     p.add_argument("--chunk", type=int, default=50_000, help="positions per part file")
+    p.add_argument("--skip-missing-games", action="store_true",
+                   help="drop (and count) rows whose game is no longer in the games file")
     g = p.add_argument_group("maia3")
     g.add_argument("--size", default="23m", choices=["5m", "23m", "79m"])
     g.add_argument("--offsets", type=float, nargs="+", help="offsets added to both ratings, one variant each")
@@ -306,6 +347,8 @@ def main(argv=None) -> None:
     g = p.add_argument_group("lc0")
     g.add_argument("--network", default="BT4-1024x15x32h-swa-6147500.pb.gz", help="file under <lc0>/networks, or a path")
     g.add_argument("--wdl-elo", help="lc0-search: calibrate to two players, e.g. offset+0 or fixed2200-2000")
+    g.add_argument("--prune", help="lc0-children: evaluate only the moves this rule keeps (tnh.models.prune)")
+    g.add_argument("--keep-from", nargs="+", help="lc0-children --prune: feature dirs of the move models that decide")
     g.add_argument("--lc0-processes", type=int, default=1,
                    help="lc0-search: engine processes sharing the GPU (about 1 GB each; 4 gave only +25%%)")
     run(p.parse_args(argv))

@@ -125,10 +125,13 @@ class Combo:
     for the calibrated frontier value.
     """
 
-    def __init__(self, coef: Path = COEF_FILE, *, prune: str | None = None, maia_size: str = "79m",
-                 maia_best: str | None = None, maia_batch: int = 512) -> None:
+    def __init__(self, coef: Path = COEF_FILE, *, prune: str | None = None, trees: bool = False,
+                 maia_size: str = "79m", maia_best: str | None = None, maia_batch: int = 512) -> None:
         """`prune`: a rule of `tnh.models.prune` (e.g. "p0.5"); its coefficients come from
-        `combo_coef_<rule>.json` (refit: `python -m tnh.models.combo fit --prune <rule>`)."""
+        `combo_coef_<rule>.json` (refit: `python -m tnh.models.combo fit --prune <rule>`).
+
+        `trees`: score with the stored boosted trees of `tnh.models.combotrees` (configuration
+        `+ch-p0.5`, so `prune` must be "p0.5") instead of the linear logit."""
         from tnh.models.lc0 import Lc0Children, Lc0Policy
         from tnh.models.maia3 import Elo, Maia3
 
@@ -148,6 +151,13 @@ class Combo:
         self.policy = Lc0Policy()
         self.children = Lc0Children()
         self.name = f"combo-maia3-{maia_size}-lc0" + ("" if self.prune is None else f"-{self.prune}")
+        self.front = None
+        if trees:
+            from tnh.models.combotrees import MAIN, FrontModel
+            self.front = FrontModel(MAIN)
+            if self.prune != self.front.cfg["rule"] or maia_size != self.front.cfg["maia"]:
+                raise ValueError(f"the stored trees are for prune={self.front.cfg['rule']!r}, Maia {self.front.cfg['maia']}")
+            self.name += "-trees"
         self.seconds: Counter = Counter()
 
     def features(self, queries: list[Query]) -> tuple[list[list[str]], list[np.ndarray], list[tuple]]:
@@ -174,6 +184,7 @@ class Combo:
         ch = self.children.evaluate(queries, only)
         self.seconds["lc0 children"] += time.perf_counter() - t
         t = time.perf_counter()
+        self._last = (m0, mb, pol, ch, only)
         if self.prune is None:
             eloss, cploss = child_columns(ch)
         else:
@@ -201,6 +212,13 @@ class Combo:
 
     def predict(self, queries: list[Query]) -> list[Prediction]:
         moves, X, wdl = self.features(queries)
+        if self.front is not None:
+            m0, mb, pol, ch, only = self._last
+            t = time.perf_counter()
+            feats = self.front.features(queries, (m0, mb), pol, ch, only)
+            lps = self.front.logp(feats, "trees")
+            self.seconds["trees"] += time.perf_counter() - t
+            return [Prediction(ms, lp, w) for ms, lp, w in zip(feats[0], lps, wdl)]
         out = []
         for ms, x, w in zip(moves, X, wdl):
             out.append(Prediction(ms, self.combine(x) if ms else np.zeros(0, dtype=np.float32), w))
